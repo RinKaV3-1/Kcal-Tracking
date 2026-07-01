@@ -279,6 +279,18 @@ function shortTrend(weights) {
   if (recent.length < 2) return null;
   return linRegTrend(recent);
 }
+function monthTrend(weights) {
+  // Longer-term trend: last 30 days, min 3 entries, linear regression.
+  // Distinct from weeklyTrend (21-day window) so the coach can be given an explicit
+  // "last week" vs "last month" breakdown instead of one ambiguous number — a 21-day
+  // window can show net gain even when the most recent week was a clear loss, and
+  // without separate numbers the coach has no way to tell which the user means.
+  if (weights.length < 2) return null;
+  const cutoffMs = Date.now() - 30*24*3600*1000;
+  let recent = weights.filter(w => new Date(w.date+"T12:00:00").getTime() >= cutoffMs);
+  if (recent.length < 3) return null;
+  return linRegTrend(recent);
+}
 function gCol(goal){return goal==="cut"?C.orange:goal==="bulk"?C.blue:C.lime;}
 
 // ── Dual storage: window.storage (Claude.ai) OR localStorage (standalone) ────
@@ -523,11 +535,36 @@ async function aPrep(imgs, ps, desc, apiKey) {
       + "2. The kcal/protein/carbs/fat fields you return MUST be PER-100g reference values for that ingredient (NOT per-serving, NOT scaled to the weight). If you matched a known product, copy its per-100g values exactly.\n"
       + "3. totalKcal/totalProtein/totalCarbs/totalFat at the top level ARE the meal totals (already scaled): sum of (per-100g × weightG / 100) across all ingredients.\n"
       + "4. estimatedWeightG = sum of all ingredient weightG.\n"
-      + "5. For each ingredient, include a '_scaleRead' field with the literal digits you saw bright on the scale (e.g. '47', '6', '108') — this helps the user verify.\n\n"
+      + "5. For each ingredient, include a '_scaleRead' field with the literal digits you saw bright on the scale (e.g. '47', '6', '108') — this helps the user verify.\n"
+      + "6. CRITICAL — raw vs cooked, generic vs branded: if the description or photo says 'raw' (e.g. 'raw chicken breast'), use the RAW reference value below — do NOT substitute a cooked or breaded branded product even if its name overlaps. The cooking state the user specifies always wins over name similarity to a known product.\n"
+      + "   Generic reference per-100g (use when not clearly a specific known branded product):\n"
+      + "   • Raw chicken breast (skinless): ~110-120 kcal, 22-23g P, 0g C, 1.5-2.5g F\n"
+      + "   • Cooked/grilled chicken breast (no breading): ~160-175 kcal, 30-31g P, 0g C, 3.5-4g F\n"
+      + "   • Raw beef mince (10-15% fat): ~200-220 kcal, 18-19g P, 0g C, 14-16g F\n"
+      + "   • Raw salmon fillet: ~180-210 kcal, 20g P, 0g C, 11-13g F\n"
+      + "   • Raw white fish (cod/hake/pollock): ~75-90 kcal, 17-18g P, 0g C, 0.5-1g F\n"
+      + "   • Dry white/long-grain rice: ~345-360 kcal, 7-8g P, 76-79g C, 0.5-1g F\n"
+      + "   • Raw whole eggs (shelled): ~143-155 kcal, 12-13g P, 0.5-1g C, 9.5-11g F\n\n"
       + "Reply ONLY with JSON, no explanation:\n"
       + '{"totalKcal":0,"totalProtein":0,"totalCarbs":0,"totalFat":0,"estimatedWeightG":0,"notes":"","ingredients":[{"name":"","weightG":0,"_scaleRead":"","kcal":0,"protein":0,"carbs":0,"fat":0}]}' },
     ...iBlks(c),
   ], apiKey, VISION_MODEL, 2500);
+}
+
+// Cheap text-only call: generate a short generic category subtitle for a product name,
+// e.g. "Lidl Smulkinta Jautiena 10%" → "Beef", "ProPud Cookie Dough Bar" → "Protein Bar".
+// Used both as a manual "✨ Auto" button and as a fallback when aLabel's own subtitle is empty.
+async function aSubtitle(name, apiKey) {
+  const res = await callAI([
+    { type:"text", text:"Given this product name: \"" + name + "\"\n"
+      + "Return a short 1-3 word GENERIC food category subtitle — what the product actually IS, not its brand. "
+      + "Examples: 'Lidl Smulkinta Jautiena 10%' → 'Beef'. 'ProPud Cookie Dough Bar' → 'Protein Bar'. "
+      + "'Pilos Liesa Varškė 0.5%' → 'Cottage Cheese'. 'Barebells Caramel Cashew' → 'Protein Bar'. "
+      + "'Lidl Almond Milk' → 'Almond Milk'. 'Crownfield Oats' → 'Oats'. Keep it short and generic.\n"
+      + "Reply ONLY with JSON, no explanation:\n"
+      + '{"subtitle":""}' }
+  ], apiKey, TEXT_MODEL, 100);
+  return res?.subtitle || "";
 }
 
 // Per-ingredient AI estimate: cheap text-only call returning per-100g macros
@@ -543,7 +580,7 @@ async function aEstimateIngredient(name, apiKey) {
 // Free-form coach Q&A. Bundles user context (profile, weight trend, recent meals/activities,
 // products, day-type targets) so the AI can answer with personalization.
 async function aCoach({question, context, history}, apiKey) {
-  const sys = "You are a personal fitness and nutrition coach for the user. You have access to their tracking data below. Give concise, evidence-based, practical advice tailored to THEIR specifics (current weight trend, goal, day type, recent intake/activities, available foods). Avoid generic platitudes. Do NOT include medical disclaimers unless the user asks something genuinely clinical. Use metric units only (grams, kg, km, kcal). Keep responses focused — typically 2-5 short paragraphs or a tight bulleted list. Don't be preachy. If the user's question is unclear, ask one clarifying question.\n\nUSER CONTEXT:\n" + context;
+  const sys = "You are a personal fitness and nutrition coach for the user. You have access to their tracking data below. Give concise, evidence-based, practical advice tailored to THEIR specifics (current weight trend, goal, day type, recent intake/activities, available foods). Avoid generic platitudes. Do NOT include medical disclaimers unless the user asks something genuinely clinical. Use metric units only (grams, kg, km, kcal). Keep responses focused — typically 2-5 short paragraphs or a tight bulleted list. Don't be preachy. If the user's question is unclear, ask one clarifying question.\n\nIMPORTANT: the context below gives SEPARATE weight trend numbers for the last 7 days (WEEK) and last 30 days (MONTH) — they can point in different directions (e.g. lost weight this week but the month is still net positive from an earlier gain). When the user asks about \"this week\" or \"last week\", answer using the WEEK number specifically — do not substitute the month number or a blended figure. When they ask about \"this month\" or overall progress, use the MONTH number. If both are relevant, state both explicitly rather than picking one silently.\n\nUSER CONTEXT:\n" + context;
   const messages = [];
   // Include up to last 3 turns of history
   if (history && history.length) {
@@ -580,12 +617,13 @@ async function aLabel(imgs, apiKey) {
       + "5. Protein row — 'Protein', 'Baltymai', 'Beljakovine', 'Bjelančevine', 'Proteine', 'Eiweiß'.\n"
       + "6. Salt row — IGNORE. Don't put salt anywhere.\n\n"
       + "PRODUCT NAME: brand + descriptive name from the FRONT of the package (e.g. 'Milbona Coconut Flavour Milk Product', 'Pilos Liesa Varškė 0.5%', 'Barebells Caramel Cashew'). Skip slogans like 'High Protein' if it's not part of the official name. Include flavour/variant.\n\n"
+      + "SUBTITLE: a short 1-3 word GENERIC food category for this product, so it's easy to search by what it actually is rather than the brand name. Examples: 'Lidl Smulkinta Jautiena 10%' → 'Beef'. 'ProPud Cookie Dough Bar' → 'Protein Bar'. 'Pilos Liesa Varškė 0.5%' → 'Cottage Cheese'. 'Barebells Caramel Cashew' → 'Protein Bar'. 'Crownfield Oats' → 'Oats'. Keep it generic and short — this is a category tag, not a description.\n\n"
       + "VALIDATION before returning:\n"
       + "  • kcal must be plausible: 0-900 (most foods <500/100g; oils ~900). If you got something outside this, recheck — you probably misread.\n"
       + "  • protein + carbs + fat × 9/4 should roughly equal kcal: kcal ≈ protein×4 + carbs×4 + fat×9. If wildly off, you mixed rows up — recheck.\n"
       + "  • Numbers in the table use comma as decimal separator in many EU countries: '0,6' = 0.6. Convert.\n\n"
       + "Reply with EXACTLY this JSON, nothing else:\n"
-      + '{"name":"","kcal":0,"p":0,"c":0,"f":0}' },
+      + '{"name":"","kcal":0,"p":0,"c":0,"f":0,"subtitle":""}' },
     ...iBlks(c),
   ], apiKey, VISION_MODEL, 600);
 }
@@ -872,7 +910,18 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
       // Preparation mismatch penalty: if one name has prep words like "minced" / "breaded"
       // and the other doesn't share them, the products are likely distinct.
       // Example: "minced breast chicken" should NOT match "Lidl Breaded Chicken Breast".
-      if (ingPrep.length > 0 || prodPrep.length > 0) {
+      // "raw" is treated as a hard opposite of any cooking-state word — if the ingredient
+      // says "raw" and the candidate product implies it's already cooked/prepared (breaded,
+      // cooked, fried, grilled, baked, smoked, marinated, boiled, steamed, roasted), the
+      // penalty must be large enough to fully disqualify the match even with strong word
+      // overlap (e.g. "raw chicken breast" vs "Lidl Breaded Chicken Breast" both contain
+      // "chicken"+"breast" which alone can score >50 — a small penalty wasn't enough).
+      const cookedWords = new Set(["breaded","cooked","fried","grilled","baked","smoked","marinated","boiled","steamed","roasted"]);
+      const ingRaw = ingPrep.includes("raw"), prodCooked = prodPrep.some(w=>cookedWords.has(w));
+      const prodRaw = prodPrep.includes("raw"), ingCooked = ingPrep.some(w=>cookedWords.has(w));
+      if ((ingRaw && prodCooked) || (prodRaw && ingCooked)) {
+        score -= 200; // hard disqualify — raw vs already-prepared can never be the same product
+      } else if (ingPrep.length > 0 || prodPrep.length > 0) {
         const prepOverlap = ingPrep.filter(w => prodPrep.includes(w)).length;
         if (prepOverlap === 0) score -= 30;
       }
@@ -949,7 +998,7 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
   };
 
   const filteredProds = swapSearch.length > 0
-    ? (products || []).filter(p => p.name.toLowerCase().includes(swapSearch.toLowerCase())).slice(0, 12)
+    ? (products || []).filter(p => p.name.toLowerCase().includes(swapSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(swapSearch.toLowerCase())).slice(0, 12)
     : (products || []).slice(0, 12);
 
   const totals = ingredients.reduce((acc, ing) => {
@@ -1099,13 +1148,13 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
           {!addPickedProd?(<>
             <input value={addSearch} onChange={e=>setAddSearch(e.target.value)} placeholder="Search labels…" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:13,outline:"none",marginBottom:7}} autoFocus/>
             <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:200,overflowY:"auto"}}>
-              {(products||[]).filter(p=>!addSearch||p.name.toLowerCase().includes(addSearch.toLowerCase())).slice(0,12).map(prod=>(
-                <button key={prod.name} type="button" onClick={()=>{setAddPickedProd(prod);setAddPickedG((prod.servingG||prod.packageG)?String(prod.servingG||prod.packageG):"100");}} style={{padding:"7px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
+              {(products||[]).filter(p=>!addSearch||p.name.toLowerCase().includes(addSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(addSearch.toLowerCase())).slice(0,12).map(prod=>(
+                <button key={prod.name} type="button" onClick={()=>{setAddPickedProd(prod);setAddPickedG(prod.servingG||prod.packageG?String(prod.servingG||prod.packageG):"100");}} style={{padding:"7px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
                   <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{prod.name}</span>
                   <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
                 </button>
               ))}
-              {(products||[]).filter(p=>!addSearch||p.name.toLowerCase().includes(addSearch.toLowerCase())).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match.</div>}
+              {(products||[]).filter(p=>!addSearch||p.name.toLowerCase().includes(addSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(addSearch.toLowerCase())).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match.</div>}
             </div>
           </>):(<div>
             <div style={{fontSize:12,color:C.lime,marginBottom:5,fontWeight:600}}>{addPickedProd.name}</div>
@@ -1118,7 +1167,7 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
               <button onClick={()=>setAddPickedProd(null)} style={{flex:1,padding:"7px 0",borderRadius:6,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>← Back</button>
               <button onClick={()=>{
                 const g=parseFloat(addPickedG)||0;if(g<=0)return;
-                setIngredients(p=>[...p,{name:addPickedProd.name,weightG:String(g),kcal:addPickedProd.kcal,protein:addPickedProd.p,carbs:addPickedProd.c,fat:addPickedProd.f,_pinned:true}]);
+                setIngredients(p=>[...p,{name:addPickedProd.name,weightG:String(g),kcal:addPickedProd.kcal,protein:addPickedProd.p,carbs:addPickedProd.c,fat:addPickedProd.f,_pinned:true,_kcal100:addPickedProd.kcal,_p100:addPickedProd.p,_c100:addPickedProd.c,_f100:addPickedProd.f}]);
                 setAddMode(null);setAddPickedProd(null);setAddPickedG("");
               }} disabled={!parseFloat(addPickedG)} style={{flex:2,padding:"7px 0",borderRadius:6,background:parseFloat(addPickedG)?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,cursor:parseFloat(addPickedG)?"pointer":"default",fontSize:12}}>+ Add ingredient</button>
             </div>
@@ -1139,7 +1188,7 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
           <Field label="Fat /100g" value={addManual.fat} onChange={v=>setAddManual(p=>({...p,fat:v}))} type="number"/>
           <button onClick={()=>{
             const g=parseFloat(addManual.weightG)||0;if(g<=0||!addManual.name)return;
-            setIngredients(p=>[...p,{name:addManual.name,weightG:String(g),kcal:parseFloat(addManual.kcal)||0,protein:parseFloat(addManual.protein)||0,carbs:parseFloat(addManual.carbs)||0,fat:parseFloat(addManual.fat)||0,_pinned:true,_estimated:true}]);
+            setIngredients(p=>[...p,{name:addManual.name,weightG:String(g),kcal:parseFloat(addManual.kcal)||0,protein:parseFloat(addManual.protein)||0,carbs:parseFloat(addManual.carbs)||0,fat:parseFloat(addManual.fat)||0,_pinned:true,_estimated:true,_kcal100:parseFloat(addManual.kcal)||0,_p100:parseFloat(addManual.protein)||0,_c100:parseFloat(addManual.carbs)||0,_f100:parseFloat(addManual.fat)||0}]);
             setAddMode(null);
           }} disabled={!addManual.name||!parseFloat(addManual.weightG)} style={{width:"100%",marginTop:8,padding:"8px 0",borderRadius:7,background:(addManual.name&&parseFloat(addManual.weightG))?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,cursor:(addManual.name&&parseFloat(addManual.weightG))?"pointer":"default",fontSize:12}}>+ Add ingredient</button>
         </div>}
@@ -1201,7 +1250,6 @@ function AddIngredientRow({onAdd,products}) {
 }
 
 
-// ── PrepEatPanel — gram-based, multi-prep combine ─────────────────────────────
 function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,apiKey}) {
   const [selected,setSelected]=useState({}); // {prepId: gramsString}
   // portionMode tracks whether each selected prep is in "g" or "portions" input mode
@@ -1210,6 +1258,7 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
   const [extras,setExtras]=useState([]);
   const [extrasMode,setExtrasMode]=useState(null); // null | "pick" | "manual" | "photo"
   const [pickSearch,setPickSearch]=useState("");
+  const [pickCat,setPickCat]=useState(null); // category filter id, "uncategorized", or null
   const [pickedProd,setPickedProd]=useState(null); // selected product when in pick mode
   const [pickedG,setPickedG]=useState("");
   const [manualForm,setManualForm]=useState({name:"",kcal:"",protein:"",carbs:"",fat:"",weightG:""});
@@ -1409,14 +1458,18 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
         </div>
         {!pickedProd?(<>
           <input value={pickSearch} onChange={e=>setPickSearch(e.target.value)} placeholder="Search your product labels…" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:13,outline:"none",marginBottom:7}} autoFocus/>
+          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:7}}>
+            <button type="button" onClick={()=>setPickCat(null)} style={{padding:"3px 8px",borderRadius:12,border:`1px solid ${!pickCat?C.lime:C.border}`,background:!pickCat?`${C.lime}18`:C.bg,color:!pickCat?C.lime:C.muted,cursor:"pointer",fontSize:9.5}}>All</button>
+            {PRODUCT_CATEGORIES.filter(cat=>products.some(p=>(p.categories||[]).includes(cat.id))).map(cat=>{const on=pickCat===cat.id;return(<button key={cat.id} type="button" onClick={()=>setPickCat(on?null:cat.id)} style={{padding:"3px 8px",borderRadius:12,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:9.5}}>{cat.emoji}</button>);})}
+          </div>
           <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:240,overflowY:"auto"}}>
-            {(products||[]).filter(p=>!pickSearch||p.name.toLowerCase().includes(pickSearch.toLowerCase())).slice(0,15).map(prod=>(
+            {(products||[]).filter(p=>(!pickSearch||p.name.toLowerCase().includes(pickSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(pickSearch.toLowerCase()))&&(!pickCat||(p.categories||[]).includes(pickCat))).slice(0,15).map(prod=>(
               <button key={prod.name} type="button" onClick={()=>{setPickedProd(prod);setPickedG(prod.servingG||prod.packageG?String(prod.servingG||prod.packageG):"100");}} style={{padding:"8px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
-                <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{prod.name}</span>
+                <span style={{flex:1,minWidth:0,overflow:"hidden"}}><span style={{fontSize:12,color:C.text,display:"block",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>{prod.subtitle&&<span style={{fontSize:9.5,color:C.muted,display:"block"}}>{prod.subtitle}</span>}</span>
                 <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
               </button>
             ))}
-            {(products||[]).filter(p=>!pickSearch||p.name.toLowerCase().includes(pickSearch.toLowerCase())).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match.</div>}
+            {(products||[]).filter(p=>(!pickSearch||p.name.toLowerCase().includes(pickSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(pickSearch.toLowerCase()))&&(!pickCat||(p.categories||[]).includes(pickCat))).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match.</div>}
           </div>
         </>):(<div>
           <div style={{fontSize:12,color:C.lime,marginBottom:4,fontWeight:600}}>{pickedProd.name}</div>
@@ -1598,13 +1651,13 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
           {PRODUCT_CATEGORIES.filter(cat=>products.some(p=>(p.categories||[]).includes(cat.id))).map(cat=>{const on=lblCat===cat.id;return(<button key={cat.id} onClick={()=>setLblCat(on?null:cat.id)} style={{padding:"3px 8px",borderRadius:12,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:9.5}}>{cat.emoji}</button>);})}
         </div>
         <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:260,overflowY:"auto"}}>
-          {(products||[]).filter(p=>(!lblSearch||p.name.toLowerCase().includes(lblSearch.toLowerCase()))&&(!lblCat||(p.categories||[]).includes(lblCat))).slice(0,20).map(prod=>(
+          {(products||[]).filter(p=>(!lblSearch||p.name.toLowerCase().includes(lblSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(lblSearch.toLowerCase()))&&(!lblCat||(p.categories||[]).includes(lblCat))).slice(0,20).map(prod=>(
             <button key={prod.name} type="button" onClick={()=>{setLblPicked(prod);setLblG(prod.servingG||prod.packageG?String(prod.servingG||prod.packageG):"");}} style={{padding:"8px 11px",borderRadius:8,background:C.bg,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
               <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>
               <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
             </button>
           ))}
-          {products.filter(p=>(!lblSearch||p.name.toLowerCase().includes(lblSearch.toLowerCase()))&&(!lblCat||(p.categories||[]).includes(lblCat))).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match.</div>}
+          {products.filter(p=>(!lblSearch||p.name.toLowerCase().includes(lblSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(lblSearch.toLowerCase()))&&(!lblCat||(p.categories||[]).includes(lblCat))).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match.</div>}
         </div>
       </>):(<div style={{background:C.faint,borderRadius:10,padding:"12px 14px"}}>
         <div style={{fontSize:13,fontWeight:700,color:C.lime,marginBottom:3}}>{lblPicked.name}</div>
@@ -1672,13 +1725,13 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
         {!mPickedProd?(<>
           <input value={mPickSearch} onChange={e=>setMPickSearch(e.target.value)} placeholder="Search your product labels…" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:13,outline:"none",marginBottom:7}} autoFocus/>
           <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:240,overflowY:"auto"}}>
-            {(products||[]).filter(p=>!mPickSearch||p.name.toLowerCase().includes(mPickSearch.toLowerCase())).slice(0,15).map(prod=>(
+            {(products||[]).filter(p=>!mPickSearch||p.name.toLowerCase().includes(mPickSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(mPickSearch.toLowerCase())).slice(0,15).map(prod=>(
               <button key={prod.name} type="button" onClick={()=>{setMPickedProd(prod);setMPickedG(prod.servingG||prod.packageG?String(prod.servingG||prod.packageG):"100");}} style={{padding:"8px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
                 <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{prod.name}</span>
                 <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
               </button>
             ))}
-            {(products||[]).filter(p=>!mPickSearch||p.name.toLowerCase().includes(mPickSearch.toLowerCase())).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match.</div>}
+            {(products||[]).filter(p=>!mPickSearch||p.name.toLowerCase().includes(mPickSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(mPickSearch.toLowerCase())).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match.</div>}
           </div>
         </>):(<div>
           <div style={{fontSize:12,color:C.lime,marginBottom:7,fontWeight:600}}>{mPickedProd.name}</div>
@@ -1770,6 +1823,7 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
   // Label-builder: user picks labels manually instead of (or alongside) photos
   const [buildMode,setBuildMode]=useState(null); // null | "labels"
   const [pickSearch,setPickSearch]=useState("");
+  const [pickCat,setPickCat]=useState(null);
   const [pickedProd,setPickedProd]=useState(null);
   const [pickedG,setPickedG]=useState("");
   const [labelIngs,setLabelIngs]=useState([]); // [{id, name, weightG, kcal100, p100, c100, f100}]
@@ -1854,14 +1908,18 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
       </div>}
       {!pickedProd?(<>
         <input value={pickSearch} onChange={e=>setPickSearch(e.target.value)} placeholder="Search labels (chicken, rice, oats…)" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:13,outline:"none",marginBottom:7}}/>
+        <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:7}}>
+          <button type="button" onClick={()=>setPickCat(null)} style={{padding:"3px 8px",borderRadius:12,border:`1px solid ${!pickCat?C.lime:C.border}`,background:!pickCat?`${C.lime}18`:C.bg,color:!pickCat?C.lime:C.muted,cursor:"pointer",fontSize:9.5}}>All</button>
+          {PRODUCT_CATEGORIES.filter(cat=>products.some(p=>(p.categories||[]).includes(cat.id))).map(cat=>{const on=pickCat===cat.id;return(<button key={cat.id} type="button" onClick={()=>setPickCat(on?null:cat.id)} style={{padding:"3px 8px",borderRadius:12,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:9.5}}>{cat.emoji}</button>);})}
+        </div>
         <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:220,overflowY:"auto"}}>
-          {(products||[]).filter(p=>!pickSearch||p.name.toLowerCase().includes(pickSearch.toLowerCase())).slice(0,15).map(prod=>(
+          {(products||[]).filter(p=>(!pickSearch||p.name.toLowerCase().includes(pickSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(pickSearch.toLowerCase()))&&(!pickCat||(p.categories||[]).includes(pickCat))).slice(0,15).map(prod=>(
             <button key={prod.name} type="button" onClick={()=>{setPickedProd(prod);setPickedG(prod.servingG||prod.packageG?String(prod.servingG||prod.packageG):"100");}} style={{padding:"8px 11px",borderRadius:7,background:C.bg,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
-              <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{prod.name}</span>
+              <span style={{flex:1,minWidth:0,overflow:"hidden"}}><span style={{fontSize:12,color:C.text,display:"block",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>{prod.subtitle&&<span style={{fontSize:9.5,color:C.muted,display:"block"}}>{prod.subtitle}</span>}</span>
               <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
             </button>
           ))}
-          {(products||[]).filter(p=>!pickSearch||p.name.toLowerCase().includes(pickSearch.toLowerCase())).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match — add the product in Food tab first.</div>}
+          {(products||[]).filter(p=>(!pickSearch||p.name.toLowerCase().includes(pickSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(pickSearch.toLowerCase()))&&(!pickCat||(p.categories||[]).includes(pickCat))).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match — add the product in Food tab first.</div>}
         </div>
       </>):(<div>
         <div style={{fontSize:12,color:C.lime,marginBottom:4,fontWeight:600}}>{pickedProd.name}</div>
@@ -2097,6 +2155,7 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
 
   // ── Weight phases ──────────────────────────────────────────────────────────
   const [showPhases,setShowPhases]=useState(false);
+  const [confirmDeletePhase,setConfirmDeletePhase]=useState(null); // phase id pending delete confirmation
   const [newPhaseOpen,setNewPhaseOpen]=useState(false);
   const [newPhaseLabel,setNewPhaseLabel]=useState("");
   const [newPhaseGoal,setNewPhaseGoal]=useState(profile?.goal||"cut");
@@ -2135,7 +2194,14 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
     const delta=endW!=null&&phase.startWeight!=null?endW-phase.startWeight:null;
     const dur=phaseDuration(phase.startDate,phase.endDate);
     const gc=phaseGoalColor(phase.goal);
-    return(<div style={{background:C.bg,border:`1px solid ${isCurrent?gc:C.border}`,borderRadius:10,padding:"10px 14px",marginBottom:6}}>
+    return(<div style={{background:C.bg,border:`1px solid ${confirmDeletePhase===phase.id?"#5a1a1a":isCurrent?gc:C.border}`,borderRadius:10,padding:"10px 14px",marginBottom:6}}>
+      {confirmDeletePhase===phase.id&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 11px",marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+        <span style={{fontSize:11,color:"#ff8080",flex:1,minWidth:0}}>Delete <b>{phase.label}</b>? This can't be undone.</span>
+        <div style={{display:"flex",gap:6,flexShrink:0}}>
+          <button onClick={()=>setConfirmDeletePhase(null)} style={{padding:"4px 10px",borderRadius:6,background:C.card,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button>
+          <button onClick={()=>{deletePhase(phase.id);setConfirmDeletePhase(null);}} style={{padding:"4px 10px",borderRadius:6,background:"#3a0a0a",border:"1px solid #ff4040",color:"#ff6060",fontWeight:700,cursor:"pointer",fontSize:11}}>Delete</button>
+        </div>
+      </div>}
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
         <div style={{flex:1,minWidth:0}}>
           <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
@@ -2154,7 +2220,7 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
             {delta!=null&&<div style={{fontFamily:"monospace",fontSize:12,fontWeight:800,color:delta<0?C.lime:C.red}}>{delta<0?"↓":"↑"}{Math.abs(delta).toFixed(2)} kg</div>}
           </div>
         </div>
-        <button onClick={()=>deletePhase(phase.id)} style={{background:"none",border:"none",color:C.faint,fontSize:16,cursor:"pointer",padding:"0 2px",flexShrink:0,marginLeft:6}}>×</button>
+        <button onClick={()=>setConfirmDeletePhase(confirmDeletePhase===phase.id?null:phase.id)} style={{background:"none",border:"none",color:confirmDeletePhase===phase.id?"#ff4040":C.faint,fontSize:16,cursor:"pointer",padding:"0 2px",flexShrink:0,marginLeft:6}}>×</button>
       </div>
     </div>);
   };
@@ -2243,13 +2309,16 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
     {undoEntry&&<div style={{position:"absolute",bottom:80,left:16,right:16,background:C.card,border:`1px solid ${C.lime}`,borderRadius:10,padding:"10px 14px",display:"flex",alignItems:"center",justifyContent:"space-between",zIndex:20,boxShadow:`0 4px 16px rgba(0,0,0,0.4)`}}><div><div style={{fontSize:12,color:C.text,fontWeight:600}}>Deleted {undoEntry.entry.weight.toFixed(2)} kg</div><div style={{fontSize:10,color:C.muted}}>{new Date(undoEntry.entry.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</div></div><button onClick={undoDelete} style={{padding:"6px 12px",borderRadius:7,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>↶ Undo</button></div>}
   </div>);
 }
+
 // ── Food Tab (Preps + Products) ───────────────────────────────────────────────
 function FoodTab({mealPreps,setMealPreps,products,setProducts,profile}){
   const [modal,setModal]=useState(false);const [editPrep,setEditPrep]=useState(null);const [showProd,setShowProd]=useState(false);
   const [search,setSearch]=useState("");const [showAdd,setShowAdd]=useState(false);const [editPIdx,setEditPIdx]=useState(null);
   const formRef=useRef(null); // ref on the add/edit form div — scrolled to on edit
   const savedScrollRef=useRef(0); // saves scroll position before opening edit
-  const [pForm,setPForm]=useState({name:"",kcal:"",p:"",c:"",f:"",servingG:"",categories:[],supermarket:""});const [scanImgs,setScanImgs]=useState([]);const [scanning,setScanning]=useState(false);const [scanErr,setScanErr]=useState(null);
+  const [pForm,setPForm]=useState({name:"",kcal:"",p:"",c:"",f:"",servingG:"",categories:[],supermarkets:[],subtitle:""});const [scanImgs,setScanImgs]=useState([]);const [scanning,setScanning]=useState(false);const [scanErr,setScanErr]=useState(null);
+  const [subtitleLoading,setSubtitleLoading]=useState(false);
+  const [marketInput,setMarketInput]=useState(""); // text field for typing a new supermarket name
   const [saveToast,setSaveToast]=useState(null);
   const [catFilter,setCatFilter]=useState(null); // category id, "uncategorized", or null
   const [martFilter,setMartFilter]=useState(null);
@@ -2257,10 +2326,18 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile}){
   const pff=k=>v=>setPForm(p=>({...p,[k]:v}));
   const active=mealPreps.filter(p=>p.remaining>0);const done=mealPreps.filter(p=>p.remaining===0);
   const [showDone,setShowDone]=useState(false);
-  const clearForm=()=>{setPForm({name:"",kcal:"",p:"",c:"",f:"",servingG:"",categories:[],supermarket:""});setScanImgs([]);};
+  const clearForm=()=>{setPForm({name:"",kcal:"",p:"",c:"",f:"",servingG:"",categories:[],supermarkets:[],subtitle:""});setScanImgs([]);setMarketInput("");};
   const toggleCat=id=>setPForm(p=>({...p,categories:(p.categories||[]).includes(id)?p.categories.filter(c=>c!==id):[...(p.categories||[]),id]}));
+  const toggleMarket=m=>setPForm(p=>({...p,supermarkets:(p.supermarkets||[]).includes(m)?p.supermarkets.filter(x=>x!==m):[...(p.supermarkets||[]),m]}));
+  const addTypedMarket=()=>{const m=marketInput.trim();if(!m)return;setPForm(p=>(p.supermarkets||[]).some(x=>x.toLowerCase()===m.toLowerCase())?p:{...p,supermarkets:[...(p.supermarkets||[]),m]});setMarketInput("");};
+  const genSubtitle=async()=>{
+    if(!pForm.name.trim())return;
+    setSubtitleLoading(true);
+    try{const s=await aSubtitle(pForm.name.trim(),profile.apiKey);if(s)setPForm(p=>({...p,subtitle:s}));}catch(e){/* silent — subtitle is optional */}
+    setSubtitleLoading(false);
+  };
   const addProduct=()=>{
-    const np={name:pForm.name.trim(),kcal:parseFloat(pForm.kcal)||0,p:parseFloat(pForm.p)||0,c:parseFloat(pForm.c)||0,f:parseFloat(pForm.f)||0,packageG:parseFloat(pForm.servingG)||null,categories:pForm.categories||[],supermarket:pForm.supermarket.trim()||null};
+    const np={name:pForm.name.trim(),kcal:parseFloat(pForm.kcal)||0,p:parseFloat(pForm.p)||0,c:parseFloat(pForm.c)||0,f:parseFloat(pForm.f)||0,packageG:parseFloat(pForm.servingG)||null,categories:pForm.categories||[],supermarkets:pForm.supermarkets||[],subtitle:pForm.subtitle.trim()||null};
     if(!np.name)return;
     const dupIdx=products.findIndex(x=>x.name.toLowerCase()===np.name.toLowerCase());
     if(dupIdx>=0){
@@ -2275,13 +2352,15 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile}){
   const startEditP=i=>{
     savedScrollRef.current=window.scrollY||document.documentElement.scrollTop;
     const p=products[i];
-    setPForm({name:p.name,kcal:String(p.kcal),p:String(p.p),c:String(p.c),f:String(p.f),servingG:(p.servingG||p.servingG||p.packageG)?String(p.servingG||p.servingG||p.packageG):"",categories:p.categories||[],supermarket:p.supermarket||""});
-    setEditPIdx(i);setShowAdd(false);setSaveToast(null);
+    // Backward-compat: older products stored a single `supermarket` string instead of an array.
+    const existingMarkets=p.supermarkets||(p.supermarket?[p.supermarket]:[]);
+    setPForm({name:p.name,kcal:String(p.kcal),p:String(p.p),c:String(p.c),f:String(p.f),servingG:(p.servingG||p.packageG)?String(p.servingG||p.packageG):"",categories:p.categories||[],supermarkets:existingMarkets,subtitle:p.subtitle||""});
+    setEditPIdx(i);setShowAdd(false);setSaveToast(null);setMarketInput("");
     // Scroll to form after it renders
     setTimeout(()=>formRef.current?.scrollIntoView({behavior:"smooth",block:"start"}),60);
   };
   const saveEditP=()=>{
-    const np={name:pForm.name.trim(),kcal:parseFloat(pForm.kcal)||0,p:parseFloat(pForm.p)||0,c:parseFloat(pForm.c)||0,f:parseFloat(pForm.f)||0,packageG:parseFloat(pForm.servingG)||null,categories:pForm.categories||[],supermarket:pForm.supermarket.trim()||null};
+    const np={name:pForm.name.trim(),kcal:parseFloat(pForm.kcal)||0,p:parseFloat(pForm.p)||0,c:parseFloat(pForm.c)||0,f:parseFloat(pForm.f)||0,packageG:parseFloat(pForm.servingG)||null,categories:pForm.categories||[],supermarkets:pForm.supermarkets||[],subtitle:pForm.subtitle.trim()||null};
     if(!np.name)return;
     setProducts(prev=>prev.map((x,i)=>i===editPIdx?np:x));
     setSaveToast({type:"updated",name:np.name});
@@ -2309,18 +2388,22 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile}){
     const t=setTimeout(()=>setSaveToast(null),4000);
     return ()=>clearTimeout(t);
   },[saveToast]);
-  const scanLabelFn=async()=>{setScanning(true);setScanErr(null);try{const res=await aLabel(scanImgs,profile.apiKey);if(res._unreadable){setPForm(f=>({...f,name:res.name||f.name}));setScanErr("Label was not clear enough to read — product name detected: \""+res.name+"\". Please enter macros manually.");}else{const name=res.name||"";setPForm(f=>({...f,name,kcal:String(Math.round(res.kcal)||""),p:String(res.p||""),c:String(res.c||""),f:String(res.f||""),packageG:res.packageG?String(res.packageG):f.packageG}));// Check for duplicate immediately so user sees it before filling the form
+  const scanLabelFn=async()=>{setScanning(true);setScanErr(null);try{const res=await aLabel(scanImgs,profile.apiKey);if(res._unreadable){setPForm(f=>({...f,name:res.name||f.name}));setScanErr("Label was not clear enough to read — product name detected: \""+res.name+"\". Please enter macros manually.");}else{const name=res.name||"";setPForm(f=>({...f,name,kcal:String(Math.round(res.kcal)||""),p:String(res.p||""),c:String(res.c||""),f:String(res.f||""),packageG:res.packageG?String(res.packageG):f.packageG,subtitle:res.subtitle||f.subtitle}));// Check for duplicate immediately so user sees it before filling the form
       const dupIdx=products.findIndex(x=>x.name.trim().toLowerCase()===name.trim().toLowerCase());
-      if(dupIdx>=0){const np={name:name.trim(),kcal:Math.round(res.kcal)||0,p:res.p||0,c:res.c||0,f:res.f||0,servingG:res.packageG||null,packageG:res.packageG||null};setSaveToast({type:"duplicate",name:name,dupIdx,np});}
+      if(dupIdx>=0){const np={name:name.trim(),kcal:Math.round(res.kcal)||0,p:res.p||0,c:res.c||0,f:res.f||0,servingG:res.packageG||null,packageG:res.packageG||null,subtitle:res.subtitle||null};setSaveToast({type:"duplicate",name:name,dupIdx,np});}
+      // If the label scan didn't produce a subtitle, generate one in the background so the
+      // field isn't left empty — silently skip on failure, it's a nice-to-have not a blocker.
+      if(!res.subtitle&&name){aSubtitle(name,profile.apiKey).then(s=>{if(s)setPForm(f=>(f.name===name&&!f.subtitle)?{...f,subtitle:s}:f);}).catch(()=>{});}
     }}catch(e){setScanErr(String(e.message||e));}setScanning(false);};
   const filtered=products.filter(p=>{
-    if(search&&!p.name.toLowerCase().includes(search.toLowerCase()))return false;
+    const marketsOf=x=>x.supermarkets||(x.supermarket?[x.supermarket]:[]);
+    if(search&&!p.name.toLowerCase().includes(search.toLowerCase())&&!(p.subtitle||"").toLowerCase().includes(search.toLowerCase()))return false;
     if(catFilter==="uncategorized"&&(p.categories||[]).length>0)return false;
     if(catFilter&&catFilter!=="uncategorized"&&!(p.categories||[]).includes(catFilter))return false;
-    if(martFilter&&(p.supermarket||"")!==martFilter)return false;
+    if(martFilter&&!marketsOf(p).includes(martFilter))return false;
     return true;
   });
-  const supermarkets=[...new Set(products.map(p=>p.supermarket).filter(Boolean))].sort();
+  const supermarkets=[...new Set(products.flatMap(p=>p.supermarkets||(p.supermarket?[p.supermarket]:[])))].sort();
   const uncategorizedCount=products.filter(p=>!(p.categories||[]).length).length;
   const PrepCard=({prep})=>{
     const totalG = prep.totalWeightG || 0;
@@ -2369,7 +2452,40 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile}){
       {showProd&&<div><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}><span style={{fontSize:11,color:C.muted}}>per 100g</span><button onClick={()=>{setShowAdd(p=>!p);setEditPIdx(null);setPForm({name:"",kcal:"",p:"",c:"",f:"",servingG:"",categories:[],supermarket:""});setScanImgs([]);}} style={{padding:"7px 14px",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>+ Add</button></div><input placeholder="Search products…" value={search} onChange={e=>setSearch(e.target.value)} style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"9px 14px",color:C.text,fontSize:13,outline:"none",marginBottom:8}}/>
       {saveToast&&(saveToast.type==="added"||saveToast.type==="updated")&&<div style={{background:`${C.lime}15`,border:`1px solid ${C.lime}66`,borderRadius:10,padding:"9px 13px",marginBottom:10,display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}><div style={{fontSize:12,color:C.lime,fontWeight:600}}>✓ {saveToast.type==="added"?"Added":"Updated"}: <span style={{fontFamily:"monospace"}}>{saveToast.name}</span></div><button onClick={()=>setSaveToast(null)} style={{background:"none",border:"none",color:C.lime,fontSize:16,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button></div>}
       {saveToast&&saveToast.type==="duplicate"&&<div style={{background:`${C.yellow}12`,border:`1px solid ${C.yellow}66`,borderRadius:10,padding:"10px 13px",marginBottom:10}}><div style={{fontSize:12,color:C.yellow,fontWeight:600,marginBottom:7,lineHeight:1.4}}>⚠ A product named <span style={{fontFamily:"monospace"}}>"{saveToast.name}"</span> already exists.</div><div style={{display:"flex",gap:6}}><button onClick={()=>resolveDup("update")} style={{flex:1,padding:"7px 0",borderRadius:7,background:C.yellow,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>Update existing</button><button onClick={()=>resolveDup("new")} style={{flex:1,padding:"7px 0",borderRadius:7,background:C.bg,border:`1px solid ${C.yellow}66`,color:C.yellow,fontWeight:600,cursor:"pointer",fontSize:11}}>Save as new (2)</button><button onClick={()=>setSaveToast(null)} style={{padding:"7px 10px",borderRadius:7,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button></div></div>}
-      {(showAdd||editPIdx!==null)&&<div ref={formRef} style={{background:C.card,border:`1px solid ${editPIdx!==null?C.lime:C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:10}}><div style={{fontSize:11,color:editPIdx!==null?C.lime:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>{editPIdx!==null?"Editing product":"New product"}</div>{showAdd&&editPIdx===null&&<div style={{marginBottom:10}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Scan Nutrition Label</div><ImgZone imgs={scanImgs} setImgs={setScanImgs} compact/>{scanImgs.length>0&&<button onClick={scanLabelFn} disabled={scanning} style={{width:"100%",padding:"9px 0",borderRadius:8,background:scanning?C.faint:C.blue,color:"#000",fontWeight:700,border:"none",cursor:scanning?"default":"pointer",fontSize:13,marginTop:8}}>{scanning?"Reading label…":"Read Label"}</button>}{scanErr&&<div style={{fontSize:11,color:"#ff8080",marginTop:6,wordBreak:"break-word"}}>{scanErr.includes("unreadable")?"Label unreadable — please enter values manually below":scanErr}</div>}</div>}<div style={{display:"flex",flexDirection:"column",gap:8}}><Field label="Product name" value={pForm.name} onChange={pff("name")} placeholder="e.g. Lidl Greek Yogurt"/><div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}><Field label="Kcal/100g" value={pForm.kcal} onChange={pff("kcal")} type="number" placeholder="0"/><Field label="Protein g" value={pForm.p} onChange={pff("p")} type="number" placeholder="0"/><Field label="Carbs g" value={pForm.c} onChange={pff("c")} type="number" placeholder="0"/><Field label="Fat g" value={pForm.f} onChange={pff("f")} type="number" placeholder="0"/></div><div style={{marginTop:4}}><Field label="Usual serving size g (optional — pre-fills when logging)" value={pForm.servingG} onChange={pff("servingG")} type="number" placeholder="e.g. 55 for a protein bar"/>{pForm.servingG&&<div style={{fontSize:10,color:C.lime,marginTop:4,fontStyle:"italic"}}>🍽 Will default to {pForm.servingG}g when you log this item.</div>}</div><div style={{marginTop:4}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Categories (tap to toggle)</div><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{PRODUCT_CATEGORIES.map(cat=>{const on=(pForm.categories||[]).includes(cat.id);return(<button key={cat.id} type="button" onClick={()=>toggleCat(cat.id)} style={{padding:"5px 9px",borderRadius:16,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:10.5,fontWeight:on?600:400}}>{cat.emoji} {cat.label}</button>);})}</div></div><Field label="Supermarket (optional)" value={pForm.supermarket} onChange={pff("supermarket")} placeholder="e.g. Lidl, Rimi, Maxima"/>{supermarkets.length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:5,marginTop:5}}>{supermarkets.map(m=>(<button key={m} type="button" onClick={()=>setPForm(p=>({...p,supermarket:p.supermarket===m?"":m}))} style={{padding:"3px 9px",borderRadius:12,border:`1px solid ${pForm.supermarket===m?C.blue:C.border}`,background:pForm.supermarket===m?`${C.blue}18`:C.bg,color:pForm.supermarket===m?C.blue:C.muted,cursor:"pointer",fontSize:10}}>{m}</button>))}</div>}{(()=>{const k=parseFloat(pForm.kcal)||0,p=parseFloat(pForm.p)||0,c=parseFloat(pForm.c)||0,fv=parseFloat(pForm.f)||0;if(k<10)return null;const calc=Math.round(p*4+c*4+fv*9);const diff=Math.abs(k-calc);const pct=k>0?diff/k:0;if(pct<=0.25)return null;return(<div style={{background:"#1a1400",border:`1px solid ${C.yellow}40`,borderRadius:8,padding:"7px 11px",fontSize:11,color:C.yellow,lineHeight:1.4}}>⚠ Numbers don't add up: macros suggest <span style={{fontFamily:"monospace",fontWeight:700}}>~{calc} kcal</span> but you entered <span style={{fontFamily:"monospace",fontWeight:700}}>{k}</span> ({Math.round(pct*100)}% off). Double-check the label — likely one row was misread.</div>);})()}<div style={{display:"flex",gap:8}}><button onClick={()=>{setShowAdd(false);setEditPIdx(null);setPForm({name:"",kcal:"",p:"",c:"",f:"",servingG:"",categories:[],supermarket:""});setScanImgs([]);setTimeout(()=>window.scrollTo({top:savedScrollRef.current,behavior:"smooth"}),60);}} style={{flex:1,padding:"9px 0",borderRadius:8,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:13}}>Cancel</button><button onClick={editPIdx!==null?saveEditP:addProduct} style={{flex:2,padding:"9px 0",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:13}}>{editPIdx!==null?"Save":"Save Product"}</button></div></div></div>}
+      {(showAdd||editPIdx!==null)&&<div ref={formRef} style={{background:C.card,border:`1px solid ${editPIdx!==null?C.lime:C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:10}}>
+        <div style={{fontSize:11,color:editPIdx!==null?C.lime:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>{editPIdx!==null?"Editing product":"New product"}</div>
+        {showAdd&&editPIdx===null&&<div style={{marginBottom:10}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Scan Nutrition Label</div><ImgZone imgs={scanImgs} setImgs={setScanImgs} compact/>{scanImgs.length>0&&<button onClick={scanLabelFn} disabled={scanning} style={{width:"100%",padding:"9px 0",borderRadius:8,background:scanning?C.faint:C.blue,color:"#000",fontWeight:700,border:"none",cursor:scanning?"default":"pointer",fontSize:13,marginTop:8}}>{scanning?"Reading label…":"Read Label"}</button>}{scanErr&&<div style={{fontSize:11,color:"#ff8080",marginTop:6,wordBreak:"break-word"}}>{scanErr.includes("unreadable")?"Label unreadable — please enter values manually below":scanErr}</div>}</div>}
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          <Field label="Product name" value={pForm.name} onChange={pff("name")} placeholder="e.g. Lidl Greek Yogurt"/>
+          <div>
+            <div style={{display:"flex",gap:8,alignItems:"flex-end"}}>
+              <div style={{flex:1}}><Field label="Subtitle (optional — what it generically is, e.g. 'Beef', 'Protein Bar')" value={pForm.subtitle} onChange={pff("subtitle")} placeholder="e.g. Beef"/></div>
+              <button type="button" onClick={genSubtitle} disabled={subtitleLoading||!pForm.name.trim()} style={{padding:"9px 12px",borderRadius:8,background:subtitleLoading?C.faint:`${C.lime}18`,border:`1px solid ${C.lime}60`,color:C.lime,fontWeight:600,cursor:subtitleLoading||!pForm.name.trim()?"default":"pointer",fontSize:12,whiteSpace:"nowrap"}}>{subtitleLoading?"…":"✨ Auto"}</button>
+            </div>
+            {pForm.subtitle&&<div style={{fontSize:10,color:C.muted,marginTop:4}}>Shown under the name and searchable — e.g. searching "beef" will find this.</div>}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}><Field label="Kcal/100g" value={pForm.kcal} onChange={pff("kcal")} type="number" placeholder="0"/><Field label="Protein g" value={pForm.p} onChange={pff("p")} type="number" placeholder="0"/><Field label="Carbs g" value={pForm.c} onChange={pff("c")} type="number" placeholder="0"/><Field label="Fat g" value={pForm.f} onChange={pff("f")} type="number" placeholder="0"/></div>
+          <div style={{marginTop:4}}><Field label="Usual serving size g (optional — pre-fills when logging)" value={pForm.servingG} onChange={pff("servingG")} type="number" placeholder="e.g. 55 for a protein bar"/>{pForm.servingG&&<div style={{fontSize:10,color:C.lime,marginTop:4,fontStyle:"italic"}}>🍽 Will default to {pForm.servingG}g when you log this item.</div>}</div>
+          <div style={{marginTop:4}}>
+            <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Categories (tap to toggle)</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{PRODUCT_CATEGORIES.map(cat=>{const on=(pForm.categories||[]).includes(cat.id);return(<button key={cat.id} type="button" onClick={()=>toggleCat(cat.id)} style={{padding:"5px 9px",borderRadius:16,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:10.5,fontWeight:on?600:400}}>{cat.emoji} {cat.label}</button>);})}</div>
+          </div>
+          <div style={{marginTop:4}}>
+            <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Supermarkets (optional — pick any that apply)</div>
+            {(pForm.supermarkets||[]).length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:6}}>{pForm.supermarkets.map(m=>(<span key={m} style={{display:"flex",alignItems:"center",gap:5,padding:"4px 8px",borderRadius:12,background:`${C.blue}18`,border:`1px solid ${C.blue}60`,color:C.blue,fontSize:11,fontWeight:600}}>🏪 {m}<button type="button" onClick={()=>toggleMarket(m)} style={{background:"none",border:"none",color:C.blue,cursor:"pointer",fontSize:13,padding:0,lineHeight:1}}>×</button></span>))}</div>}
+            <div style={{display:"flex",gap:6}}>
+              <input value={marketInput} onChange={e=>setMarketInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addTypedMarket();}}} placeholder="Type a supermarket name…" style={{flex:1,boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"7px 10px",color:C.text,fontSize:12,outline:"none"}}/>
+              <button type="button" onClick={addTypedMarket} disabled={!marketInput.trim()} style={{padding:"7px 12px",borderRadius:7,background:marketInput.trim()?C.blue:C.faint,border:"none",color:"#000",fontWeight:700,cursor:marketInput.trim()?"pointer":"default",fontSize:12}}>+ Add</button>
+            </div>
+            {supermarkets.filter(m=>!(pForm.supermarkets||[]).includes(m)).length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:5,marginTop:6}}>{supermarkets.filter(m=>!(pForm.supermarkets||[]).includes(m)).map(m=>(<button key={m} type="button" onClick={()=>toggleMarket(m)} style={{padding:"3px 9px",borderRadius:12,border:`1px solid ${C.border}`,background:C.bg,color:C.muted,cursor:"pointer",fontSize:10}}>{m}</button>))}</div>}
+          </div>
+          {(()=>{const k=parseFloat(pForm.kcal)||0,p=parseFloat(pForm.p)||0,c=parseFloat(pForm.c)||0,fv=parseFloat(pForm.f)||0;if(k<10)return null;const calc=Math.round(p*4+c*4+fv*9);const diff=Math.abs(k-calc);const pct=k>0?diff/k:0;if(pct<=0.25)return null;return(<div style={{background:"#1a1400",border:`1px solid ${C.yellow}40`,borderRadius:8,padding:"7px 11px",fontSize:11,color:C.yellow,lineHeight:1.4}}>⚠ Numbers don't add up: macros suggest <span style={{fontFamily:"monospace",fontWeight:700}}>~{calc} kcal</span> but you entered <span style={{fontFamily:"monospace",fontWeight:700}}>{k}</span> ({Math.round(pct*100)}% off). Double-check the label — likely one row was misread.</div>);})()}
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={()=>{setShowAdd(false);setEditPIdx(null);setPForm({name:"",kcal:"",p:"",c:"",f:"",servingG:"",categories:[],supermarkets:[],subtitle:""});setScanImgs([]);setMarketInput("");setTimeout(()=>window.scrollTo({top:savedScrollRef.current,behavior:"smooth"}),60);}} style={{flex:1,padding:"9px 0",borderRadius:8,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:13}}>Cancel</button>
+            <button onClick={editPIdx!==null?saveEditP:addProduct} style={{flex:2,padding:"9px 0",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:13}}>{editPIdx!==null?"Save":"Save Product"}</button>
+          </div>
+        </div>
+      </div>}
       <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:8}}>
         <button onClick={()=>setCatFilter(null)} style={{padding:"4px 9px",borderRadius:14,border:`1px solid ${!catFilter?C.lime:C.border}`,background:!catFilter?`${C.lime}18`:C.bg,color:!catFilter?C.lime:C.muted,cursor:"pointer",fontSize:10,fontWeight:!catFilter?600:400}}>All</button>
         {PRODUCT_CATEGORIES.filter(cat=>products.some(p=>(p.categories||[]).includes(cat.id))).map(cat=>{const on=catFilter===cat.id;return(<button key={cat.id} onClick={()=>setCatFilter(on?null:cat.id)} style={{padding:"4px 9px",borderRadius:14,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:10,fontWeight:on?600:400}}>{cat.emoji} {cat.label}</button>);})}
@@ -2383,7 +2499,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile}){
           <button onClick={()=>{setProducts(prev=>prev.filter((_,j)=>j!==confirmDelete));if(editPIdx===confirmDelete){clearForm();setEditPIdx(null);}setConfirmDelete(null);}} style={{padding:"5px 11px",borderRadius:6,background:"#3a0a0a",border:"1px solid #ff4040",color:"#ff6060",fontWeight:700,cursor:"pointer",fontSize:12}}>Delete</button>
         </div>
       </div>}
-      <div style={{display:"flex",flexDirection:"column",gap:5}}>{filtered.map((p,i)=>{const ri=products.indexOf(p);return(<div key={i} style={{background:C.card,border:`1px solid ${editPIdx===ri?C.lime:confirmDelete===ri?"#5a1a1a":C.border}`,borderRadius:10,padding:"9px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div style={{flex:1,marginRight:8,minWidth:0}}><span style={{fontSize:12,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",display:"block"}}>{p.name}</span><div style={{display:"flex",gap:5,alignItems:"center",marginTop:2,flexWrap:"wrap"}}>{(p.servingG||p.packageG)&&<span style={{fontSize:9,color:C.lime,fontFamily:"monospace"}}>🍽{p.servingG||p.packageG}g</span>}{(p.categories||[]).map(cid=>{const cat=catById(cid);return cat?<span key={cid} style={{fontSize:9}} title={cat.label}>{cat.emoji}</span>:null;})}{p.supermarket&&<span style={{fontSize:8.5,color:C.blue,fontFamily:"monospace"}}>🏪{p.supermarket}</span>}</div></div><div style={{display:"flex",gap:5,alignItems:"center",flexShrink:0}}><div style={{display:"flex",gap:6}}><Chip val={p.kcal} label="k" color={C.lime}/><Chip val={p.p} label="P" color={C.blue}/><Chip val={p.c} label="C" color={C.orange}/><Chip val={p.f} label="F" color={C.purple}/></div><button onClick={()=>startEditP(ri)} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:11,cursor:"pointer",padding:"3px 6px",borderRadius:5,marginLeft:3}}>✎</button><button onClick={()=>setConfirmDelete(confirmDelete===ri?null:ri)} style={{background:"none",border:"none",color:confirmDelete===ri?"#ff4040":C.faint,fontSize:14,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div></div>);})}</div></div>}
+      <div style={{display:"flex",flexDirection:"column",gap:5}}>{filtered.map((p,i)=>{const ri=products.indexOf(p);const pMarkets=p.supermarkets||(p.supermarket?[p.supermarket]:[]);return(<div key={i} style={{background:C.card,border:`1px solid ${editPIdx===ri?C.lime:confirmDelete===ri?"#5a1a1a":C.border}`,borderRadius:10,padding:"9px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div style={{flex:1,marginRight:8,minWidth:0}}><span style={{fontSize:12,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",display:"block"}}>{p.name}</span>{p.subtitle&&<span style={{fontSize:10,color:C.muted,display:"block",marginTop:1}}>{p.subtitle}</span>}<div style={{display:"flex",gap:5,alignItems:"center",marginTop:2,flexWrap:"wrap"}}>{(p.servingG||p.packageG)&&<span style={{fontSize:9,color:C.lime,fontFamily:"monospace"}}>🍽{p.servingG||p.packageG}g</span>}{(p.categories||[]).map(cid=>{const cat=catById(cid);return cat?<span key={cid} style={{fontSize:9}} title={cat.label}>{cat.emoji}</span>:null;})}{pMarkets.map(m=>(<span key={m} style={{fontSize:8.5,color:C.blue,fontFamily:"monospace"}}>🏪{m}</span>))}</div></div><div style={{display:"flex",gap:5,alignItems:"center",flexShrink:0}}><div style={{display:"flex",gap:6}}><Chip val={p.kcal} label="k" color={C.lime}/><Chip val={p.p} label="P" color={C.blue}/><Chip val={p.c} label="C" color={C.orange}/><Chip val={p.f} label="F" color={C.purple}/></div><button onClick={()=>startEditP(ri)} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:11,cursor:"pointer",padding:"3px 6px",borderRadius:5,marginLeft:3}}>✎</button><button onClick={()=>setConfirmDelete(confirmDelete===ri?null:ri)} style={{background:"none",border:"none",color:confirmDelete===ri?"#ff4040":C.faint,fontSize:14,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div></div>);})}</div></div>}
     </div>
     <button onClick={()=>setModal(true)} style={{position:"absolute",bottom:16,right:16,width:54,height:54,borderRadius:"50%",background:C.lime,border:"none",cursor:"pointer",fontSize:28,color:"#000",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 0 20px ${C.lime}55`,zIndex:10}}>+</button>
     {modal&&<CreatePrepSheet products={products} onSave={prep=>{setMealPreps(p=>[prep,...p]);setModal(false);}} onClose={()=>setModal(false)} apiKey={profile.apiKey}/>}
@@ -2396,11 +2512,22 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile}){
 function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
   const [question, setQuestion] = useState("");
   const [history, setHistory] = useState([]); // [{role, content}]
+  const [historyLoaded, setHistoryLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState(null);
   const [recentLogs, setRecentLogs] = useState({});
   const scrollRef = useRef(null);
+  const inputRef = useRef(null);
   const apiKey = profile?.apiKey;
+
+  // Persist chat history across tab switches / app reloads — without this the whole
+  // conversation vanished the moment CoachPanel unmounted (e.g. switching tabs).
+  useEffect(() => {
+    store.get("fit_coach_history", []).then(h => { setHistory(Array.isArray(h)?h:[]); setHistoryLoaded(true); });
+  }, []);
+  useEffect(() => {
+    if (historyLoaded) store.set("fit_coach_history", history);
+  }, [history, historyLoaded]);
 
   // Load recent logs on mount — also refreshed before each question so coach
   // always sees meals logged earlier in the same session.
@@ -2425,7 +2552,9 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
   // Build the context string the coach sees with every question.
   const buildContext = () => {
     const latest = weights[0]?.weight;
-    const trend = weeklyTrend(weights);
+    const tWeek = shortTrend(weights);   // 7-day linear regression
+    const tMonth = monthTrend(weights);  // 30-day linear regression
+    const tMed = weeklyTrend(weights);   // 21-day linear regression (fallback when above unavailable)
     const today = TODAY();
     const todayLog = recentLogs[today];
     const tdee = latest ? getTDEE(profile, latest) : null;
@@ -2435,7 +2564,21 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
     ctx += "Goal mode: " + (profile?.goal||"cut") + (profile?.goalNote?" — \""+profile.goalNote+"\"":"") + ".\n";
     if (profile?.targetWeightKg) ctx += "Target weight: " + profile.targetWeightKg + "kg.\n";
     if (tdee) ctx += "Estimated TDEE: " + tdee + " kcal/day.\n";
-    if (trend !== null) ctx += "Recent weekly trend: " + (trend<0?"-":"+") + Math.abs(trend).toFixed(2) + "kg/week.\n";
+    // CRITICAL: give explicit, separately-labeled trend windows. A single ambiguous
+    // "recent trend" number caused the coach to answer "last week" questions using a
+    // ~3-week blended slope that could show net gain even when the most recent week
+    // was a clear loss. Each window below is computed independently — use the one that
+    // matches what the user is actually asking about (their wording, e.g. "this week",
+    // "last week" → WEEK; "this month", "last month", "overall" → MONTH).
+    ctx += "WEIGHT TREND (use the window that matches the user's question — don't blend them):\n";
+    ctx += "  • Last 7 days (WEEK): " + (tWeek!==null ? (tWeek<0?"-":"+") + Math.abs(tWeek).toFixed(2) + "kg/week (" + (tWeek<0?"losing":tWeek>0?"gaining":"flat") + ")" : "not enough recent data") + "\n";
+    ctx += "  • Last 30 days (MONTH): " + (tMonth!==null ? (tMonth<0?"-":"+") + Math.abs(tMonth).toFixed(2) + "kg/week (" + (tMonth<0?"losing":tMonth>0?"gaining":"flat") + ")" : "not enough data") + "\n";
+    if (tWeek===null && tMonth===null && tMed!==null) {
+      ctx += "  • Best available (~3wk): " + (tMed<0?"-":"+") + Math.abs(tMed).toFixed(2) + "kg/week (" + (tMed<0?"losing":"gaining") + ")\n";
+    }
+    if (tWeek!==null && tMonth!==null && Math.sign(tWeek)!==Math.sign(tMonth) && tWeek!==0 && tMonth!==0) {
+      ctx += "  NOTE: week and month trends point in OPPOSITE directions (e.g. lost this week but net gained over the month, or vice versa) — when answering, be explicit about which window you're citing.\n";
+    }
     // Day type targets
     ctx += "Day-type targets (kcal): ";
     ctx += Object.entries(DAY_TYPES).map(([k,v]) => v.label + " " + getDT(profile,k,latest,0,false).kcal).join(", ") + ".\n";
@@ -2525,13 +2668,16 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
   return(<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:"14px 16px",marginBottom:12}}>
     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
       <div style={{fontSize:14,fontWeight:600,color:C.text}}>💬 Ask Coach</div>
-      {history.length>0&&<button onClick={()=>setHistory([])} style={{fontSize:10,color:C.muted,background:"none",border:`1px solid ${C.border}`,borderRadius:5,padding:"3px 8px",cursor:"pointer"}}>Clear</button>}
+      {history.length>0&&<button onClick={()=>{setHistory([]);store.set("fit_coach_history",[]);}} style={{fontSize:10,color:C.muted,background:"none",border:`1px solid ${C.border}`,borderRadius:5,padding:"3px 8px",cursor:"pointer"}}>Clear</button>}
     </div>
-    <div style={{fontSize:11,color:C.muted,marginBottom:10}}>Free-form questions about training, nutrition, recovery. The coach sees your weight trend, recent meals, activities, and pantry.</div>
+    <div style={{fontSize:11,color:C.muted,marginBottom:10}}>Free-form questions about training, nutrition, recovery. The coach sees your weight trend, recent meals, activities, and pantry. Tap any of your past questions to ask it again.</div>
     {history.length>0&&<div ref={scrollRef} style={{maxHeight:380,overflowY:"auto",display:"flex",flexDirection:"column",gap:8,marginBottom:10,padding:"4px 2px"}}>
       {history.map((m,i)=>(
         <div key={i} style={{alignSelf:m.role==="user"?"flex-end":"flex-start",maxWidth:"85%"}}>
-          <div style={{
+          <div
+            onClick={m.role==="user"?()=>{setQuestion(m.content);inputRef.current?.focus();}:undefined}
+            title={m.role==="user"?"Tap to ask this again":undefined}
+            style={{
             background: m.role==="user"?C.lime+"18":C.bg,
             border: `1px solid ${m.role==="user"?C.lime+"40":C.border}`,
             borderRadius: 10,
@@ -2540,7 +2686,8 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
             lineHeight: 1.5,
             color: C.text,
             whiteSpace: "pre-wrap",
-            wordBreak: "break-word"
+            wordBreak: "break-word",
+            cursor: m.role==="user"?"pointer":"default"
           }}>{m.content}</div>
         </div>
       ))}
@@ -2553,7 +2700,7 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
     </div>}
     {err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"7px 10px",fontSize:11,color:"#ff8080",marginBottom:8,wordBreak:"break-word"}}>{err}</div>}
     <div style={{display:"flex",gap:6}}>
-      <textarea value={question} onChange={e=>setQuestion(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();ask(question);}}} placeholder="Ask anything…" rows={1} style={{flex:1,boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:13,outline:"none",resize:"none",fontFamily:"inherit",lineHeight:1.4}}/>
+      <textarea ref={inputRef} value={question} onChange={e=>setQuestion(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();ask(question);}}} placeholder="Ask anything…" rows={1} style={{flex:1,boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:13,outline:"none",resize:"none",fontFamily:"inherit",lineHeight:1.4}}/>
       <button onClick={()=>ask(question)} disabled={!question.trim()||loading} style={{padding:"0 16px",borderRadius:8,background:question.trim()&&!loading?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,cursor:question.trim()&&!loading?"pointer":"default",fontSize:13}}>{loading?"…":"Ask"}</button>
     </div>
   </div>);

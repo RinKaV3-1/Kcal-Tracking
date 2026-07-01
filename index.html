@@ -2023,6 +2023,7 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
       {!profileOK&&<button onClick={onGoToSettings} style={{width:"100%",marginBottom:10,background:"#1a1400",border:`1px solid ${C.yellow}40`,borderRadius:10,padding:"9px 14px",display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}}><span style={{fontSize:12,color:C.yellow}}>Complete profile for personalized targets</span><span style={{color:C.muted,fontSize:12}}>→</span></button>}
 
       {/* Maintenance */}
+      {profile.temporaryGoal&&(()=>{const daysLeft=Math.max(0,Math.round((new Date(profile.temporaryGoal.revertDate+"T12:00:00")-Date.now())/(24*3600*1000)));return(<div style={{marginBottom:10,background:`${C.orange}10`,border:`1px solid ${C.orange}40`,borderRadius:10,padding:"8px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontSize:11,color:C.orange,fontWeight:600}}>🔄 {profile.temporaryGoal.label}</div><div style={{fontSize:10,color:C.muted,marginTop:1}}>Reverts to <b>{profile.temporaryGoal.originalGoal}</b> {daysLeft===0?"today":`in ${daysLeft} day${daysLeft!==1?"s":""}`}</div></div><span style={{fontFamily:"monospace",fontSize:18,fontWeight:900,color:C.orange}}>{daysLeft}d</span></div>);})()}
       {maint&&<div style={{marginBottom:10,background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"7px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{fontSize:11,color:C.muted}}>Maintenance {maint} kcal</span><span style={{fontFamily:"monospace",fontSize:12,color:C.text,fontWeight:600}}>Target: {dt.kcal}{profile.goal==="cut"?` (−${maint-dt.kcal})`:profile.goal==="bulk"?` (+${dt.kcal-maint})`:""}</span></div>}
 
       {/* Activity pills */}
@@ -2709,17 +2710,25 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
 function AnalysisTab({weights,profile,setProfile,progressPhotos,setProgressPhotos,products,mealPreps,weightPhases}){
   const [imgs,setImgs]=useState([]);const [analyzing,setAnalyzing]=useState(false);const [result,setResult]=useState(null);const [err,setErr]=useState(null);const [expanded,setExpanded]=useState(null);
   const latestWeight=weights[0]?.weight;
-  const trend=weeklyTrend(weights);       // 21-day linear regression
-  const trendShort=shortTrend(weights);   // 7-day linear regression
+  const trend=weeklyTrend(weights);       // 21-day linear regression (full history)
+  const trendShort=shortTrend(weights);   // 7-day linear regression (full history)
+  // Phase-scoped trends: use only weights logged since this phase started, so starting
+  // a new goal (e.g. cut→maintain) resets the trend to reflect current phase only.
+  // Falls back to full-history trend when < 2 phase weights available.
+  const currentPhaseStart=(weightPhases||[]).find(p=>!p.endDate)?.startDate;
+  const phaseWeights=currentPhaseStart
+    ?weights.filter(w=>w.date>=currentPhaseStart)
+    :weights;
+  const tWeek = phaseWeights.length>=2 ? shortTrend(phaseWeights) : trendShort;
+  const tMonth = phaseWeights.length>=3 ? weeklyTrend(phaseWeights) : trend;
+  const phaseScoped = phaseWeights.length>=2 && currentPhaseStart; // true = showing phase-only trend
   const gc=gCol(profile.goal);
   const spark=[...weights].reverse().slice(-20);const W=300,H=60;const vals=spark.map(w=>w.weight);const hasT=profile.targetWeightKg&&spark.length>1;const sMin=vals.length?Math.min(...vals,(hasT?profile.targetWeightKg:Infinity))-0.5:65;const sMax=vals.length?Math.max(...vals)+0.5:70;const px=i=>spark.length>1?(i/(spark.length-1))*W:W/2;const py=v=>H-((v-sMin)/(sMax-sMin))*(H-8)-4;
-  // ETA: prefer 7-day trend when it exists (most recent pace), fall back to 21-day.
-  // weeksETA only meaningful when trend moves TOWARD goal (opposite signs).
   const startW=weights[weights.length-1]?.weight||latestWeight;
   const totalLost=startW&&latestWeight?startW-latestWeight:null;
   const kgToGoal=profile.targetWeightKg&&latestWeight?latestWeight-profile.targetWeightKg:null;
-  // Use short trend for ETA if available and moving toward goal, else fall back to medium trend
-  const etaTrend=(trendShort&&kgToGoal&&Math.sign(kgToGoal)!==Math.sign(trendShort))?trendShort:trend;
+  // ETA: use phase-scoped 7d trend first (most relevant), fall back to phase 21d, then full history
+  const etaTrend=(tWeek&&kgToGoal&&Math.sign(kgToGoal)!==Math.sign(tWeek))?tWeek:(tMonth&&kgToGoal&&Math.sign(kgToGoal)!==Math.sign(tMonth))?tMonth:null;
   const weeksETA=etaTrend&&kgToGoal&&Math.sign(kgToGoal)!==Math.sign(etaTrend)?Math.abs(kgToGoal/etaTrend):null;
   const goalDate=weeksETA?new Date(Date.now()+weeksETA*7*24*3600*1000):null;
   const tdee=latestWeight?getTDEE(profile,latestWeight):null;
@@ -2737,8 +2746,9 @@ function AnalysisTab({weights,profile,setProfile,progressPhotos,setProgressPhoto
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
         <div><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>{profile.goal==="cut"?"Cutting":profile.goal==="bulk"?"Bulking":"Maintaining"}</div><div style={{display:"flex",alignItems:"baseline",gap:5,marginTop:4}}><span style={{fontSize:36,fontWeight:900,fontFamily:"monospace",color:C.text,letterSpacing:"-0.03em",lineHeight:1}}>{latestWeight.toFixed(2)}</span><span style={{fontSize:14,color:C.muted}}>kg</span></div>
           <div style={{display:"flex",gap:10,marginTop:4,flexWrap:"wrap"}}>
-            {trendShort!==null&&<span style={{fontSize:11,color:trendShort<0?C.lime:C.red,fontFamily:"monospace"}}>{trendShort<0?"↓":"↑"}{Math.abs(trendShort).toFixed(2)}/wk <span style={{color:C.muted,fontSize:9}}>7d</span></span>}
-            {trend!==null&&<span style={{fontSize:11,color:trend<0?C.lime+"99":C.red+"99",fontFamily:"monospace"}}>{trend<0?"↓":"↑"}{Math.abs(trend).toFixed(2)}/wk <span style={{color:C.muted,fontSize:9}}>21d</span></span>}
+            {tWeek!==null&&<span style={{fontSize:11,color:tWeek<0?C.lime:C.red,fontFamily:"monospace"}}>{tWeek<0?"↓":"↑"}{Math.abs(tWeek).toFixed(2)}/wk <span style={{color:C.muted,fontSize:9}}>{phaseScoped?"this phase · 7d":"7d"}</span></span>}
+            {tMonth!==null&&<span style={{fontSize:11,color:tMonth<0?C.lime+"99":C.red+"99",fontFamily:"monospace"}}>{tMonth<0?"↓":"↑"}{Math.abs(tMonth).toFixed(2)}/wk <span style={{color:C.muted,fontSize:9}}>{phaseScoped?"this phase · 21d":"21d"}</span></span>}
+            {phaseScoped&&phaseWeights.length<2&&<span style={{fontSize:10,color:C.yellow,fontFamily:"monospace"}}>new phase — log a few weights for trend</span>}
           </div>
         </div>
         <div style={{textAlign:"right"}}>{totalLost!==null&&<div><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>Total {profile.goal==="bulk"?(totalLost<0?"gained":"lost"):(totalLost>0?"lost":"gained")}</div><div style={{fontSize:18,fontWeight:800,fontFamily:"monospace",color:(profile.goal==="bulk"?totalLost<0:totalLost>0)?C.lime:C.red}}>{(profile.goal==="bulk"?totalLost<0:totalLost>0)?"-":""}{Math.abs(totalLost).toFixed(2)}kg</div></div>}{tdee&&<div style={{marginTop:4}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>TDEE</div><div style={{fontSize:14,fontWeight:700,fontFamily:"monospace",color:C.blue}}>{tdee} kcal</div></div>}</div>
@@ -2749,7 +2759,7 @@ function AnalysisTab({weights,profile,setProfile,progressPhotos,setProgressPhoto
         <polyline points={spark.map((d,i)=>px(i)+","+py(d.weight)).join(" ")} fill="none" stroke={C.lime} strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round"/>
         <circle cx={px(spark.length-1)} cy={py(spark[spark.length-1].weight)} r={4} fill={C.lime}/>
       </svg>}
-      <div style={{display:"flex",gap:8}}>{kgToGoal!==null&&<div style={{flex:1,background:C.bg,borderRadius:8,padding:"8px 10px"}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>To goal</div><div style={{fontSize:18,fontWeight:800,fontFamily:"monospace",color:gc}}>{Math.abs(kgToGoal).toFixed(1)}kg</div></div>}{weeksETA&&goalDate?<div style={{flex:2,background:C.bg,borderRadius:8,padding:"8px 10px"}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>ETA</div><div style={{fontSize:14,fontWeight:700,color:gc}}>{goalDate.toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</div><div style={{fontSize:10,color:C.muted}}>~{Math.round(weeksETA)} weeks · {etaTrend===trendShort?"7d":"21d"} pace ({etaTrend<0?"↓":"↑"}{Math.abs(etaTrend).toFixed(2)}/wk)</div></div>:profile.targetWeightKg?(()=>{
+      <div style={{display:"flex",gap:8}}>{kgToGoal!==null&&<div style={{flex:1,background:C.bg,borderRadius:8,padding:"8px 10px"}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>To goal</div><div style={{fontSize:18,fontWeight:800,fontFamily:"monospace",color:gc}}>{Math.abs(kgToGoal).toFixed(1)}kg</div></div>}{weeksETA&&goalDate?<div style={{flex:2,background:C.bg,borderRadius:8,padding:"8px 10px"}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>ETA</div><div style={{fontSize:14,fontWeight:700,color:gc}}>{goalDate.toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</div><div style={{fontSize:10,color:C.muted}}>~{Math.round(weeksETA)} weeks · {etaTrend===tWeek?"7d":"21d"} pace ({phaseScoped?"this phase · ":""}{etaTrend<0?"↓":"↑"}{Math.abs(etaTrend).toFixed(2)}/wk)</div></div>:profile.targetWeightKg?(()=>{
         // Fallback messages, in priority order
         const atGoal = kgToGoal !== null && Math.abs(kgToGoal) < 0.3;
         const notEnoughData = trend === null;
@@ -2930,6 +2940,84 @@ function HistoryTab({weights,products,profile}){
   </div>);
 }
 
+// ── Goal Transition Sheet ──────────────────────────────────────────────────────
+// Appears when user taps a new goal in Settings. Two paths:
+//   temp  — changes goal for X days then auto-reverts
+//   phase — permanently moves to new goal, auto-closes current weight phase
+function GoalTransitionSheet({currentGoal,newGoal,currentPhase,latestWeight,onConfirm,onCancel}){
+  const [step,setStep]=useState("type");
+  const [transType,setTransType]=useState(null);
+  const [tempDays,setTempDays]=useState("14");
+  const [tempLabel,setTempLabel]=useState("");
+  const goalLabels={cut:"Cut",maintain:"Maintenance",bulk:"Bulk"};
+  const goalEmoji={cut:"✂️",maintain:"⚖️",bulk:"💪"};
+  const defaultNames={cut:"Cutting Phase",maintain:"Maintenance",bulk:"Lean Bulk"};
+  const [phaseName,setPhaseName]=useState(defaultNames[newGoal]||newGoal);
+  const [phaseNote,setPhaseNote]=useState("");
+  const [targetWeight,setTargetWeight]=useState(()=>{
+    if(!latestWeight)return"";
+    if(newGoal==="bulk")return String(Math.round((latestWeight+7)*2)/2);
+    if(newGoal==="cut")return String(Math.round((latestWeight-5)*2)/2);
+    return"";
+  });
+  const gc=gCol(newGoal);const currentGc=gCol(currentGoal);
+  const phaseDays=currentPhase?.startDate?Math.round((new Date(TODAY()+"T12:00:00")-new Date(currentPhase.startDate+"T12:00:00"))/(24*3600*1000)):null;
+  const phaseDelta=(currentPhase?.startWeight!=null&&latestWeight!=null)?(latestWeight-currentPhase.startWeight):null;
+  const handleConfirm=()=>{
+    if(transType==="temp"){
+      const days=parseInt(tempDays)||14;
+      const revertDate=new Date(Date.now()+days*24*3600*1000).toISOString().split("T")[0];
+      onConfirm({type:"temp",goal:newGoal,revertDate,label:tempLabel||`Temporary ${goalLabels[newGoal]}`,originalGoal:currentGoal});
+    }else{
+      onConfirm({type:"phase",goal:newGoal,phaseName,phaseNote,targetWeight:parseFloat(targetWeight)||null,latestWeight});
+    }
+  };
+  return(<Sheet onClose={onCancel} title="Changing Goal">
+    {step==="type"&&(<>
+      {currentPhase&&<div style={{background:currentGc+"10",border:`1px solid ${currentGc}40`,borderRadius:10,padding:"10px 14px",marginBottom:12}}>
+        <div style={{fontSize:11,color:currentGc,fontWeight:600,marginBottom:3}}>{goalEmoji[currentGoal]||"●"} Currently: {currentPhase.label||goalLabels[currentGoal]||currentGoal}</div>
+        <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+          {phaseDays!==null&&<span style={{fontSize:11,color:C.muted}}>{phaseDays} day{phaseDays!==1?"s":""}</span>}
+          {currentPhase.startWeight!=null&&<span style={{fontSize:11,color:C.muted}}>{currentPhase.startWeight.toFixed(1)}kg → {latestWeight?.toFixed(1)}kg</span>}
+          {phaseDelta!=null&&<span style={{fontSize:11,fontWeight:700,color:phaseDelta<0?C.lime:C.red}}>{phaseDelta<0?"↓":"↑"}{Math.abs(phaseDelta).toFixed(2)}kg</span>}
+        </div>
+      </div>}
+      <div style={{fontSize:13,color:C.text,marginBottom:10}}>Switching to <span style={{color:gc,fontWeight:700}}>{goalEmoji[newGoal]||"●"} {goalLabels[newGoal]||newGoal}</span> — is this:</div>
+      {[{id:"temp",icon:"🔄",title:"Temporary switch",desc:"I'll revert back after a set number of days — e.g. a diet break, vacation, deload"},{id:"phase",icon:"🏁",title:"New phase / new goal",desc:"Permanently changing direction — previous phase wraps up and becomes history"}].map(opt=>(<button key={opt.id} onClick={()=>setTransType(opt.id)} style={{width:"100%",padding:"12px 14px",borderRadius:10,border:`1px solid ${transType===opt.id?gc:C.border}`,background:transType===opt.id?gc+"15":C.bg,cursor:"pointer",textAlign:"left",marginBottom:8,display:"flex",alignItems:"flex-start",gap:10}}><span style={{fontSize:20,flexShrink:0}}>{opt.icon}</span><div><div style={{fontSize:13,fontWeight:transType===opt.id?700:500,color:transType===opt.id?gc:C.text}}>{opt.title}</div><div style={{fontSize:11,color:C.muted,marginTop:2,lineHeight:1.4}}>{opt.desc}</div></div></button>))}
+      <div style={{display:"flex",gap:8,marginTop:4}}>
+        <button onClick={onCancel} style={{flex:1,padding:"11px 0",borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer"}}>Cancel</button>
+        <button onClick={()=>setStep("details")} disabled={!transType} style={{flex:2,padding:"11px 0",borderRadius:10,background:transType?gc:C.faint,color:"#000",fontWeight:700,border:"none",cursor:transType?"pointer":"default",fontSize:14}}>Next →</button>
+      </div>
+    </>)}
+    {step==="details"&&transType==="temp"&&(<>
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px",marginBottom:12}}><div style={{fontSize:11,color:C.muted}}>Current goal <span style={{color:currentGc,fontWeight:600}}>{goalLabels[currentGoal]||currentGoal}</span> will auto-restore on the revert date</div></div>
+      <Field label="Label (optional)" value={tempLabel} onChange={setTempLabel} placeholder="e.g. Summer vacation, Diet break"/>
+      <div style={{marginTop:8}}><Field label="How many days?" value={tempDays} onChange={setTempDays} type="number" placeholder="14"/></div>
+      {parseInt(tempDays)>0&&<div style={{background:gc+"10",border:`1px solid ${gc}40`,borderRadius:8,padding:"8px 12px",marginTop:8,fontSize:11,color:C.muted}}>Reverts to <span style={{color:currentGc,fontWeight:700}}>{goalLabels[currentGoal]}</span> on {new Date(Date.now()+(parseInt(tempDays)||14)*24*3600*1000).toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</div>}
+      <div style={{display:"flex",gap:8,marginTop:12}}>
+        <button onClick={()=>setStep("type")} style={{flex:1,padding:"11px 0",borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer"}}>← Back</button>
+        <button onClick={handleConfirm} disabled={!parseInt(tempDays)} style={{flex:2,padding:"11px 0",borderRadius:10,background:parseInt(tempDays)?gc:C.faint,color:"#000",fontWeight:700,border:"none",cursor:parseInt(tempDays)?"pointer":"default",fontSize:14}}>Confirm Temp Switch</button>
+      </div>
+    </>)}
+    {step==="details"&&transType==="phase"&&(<>
+      {currentPhase&&phaseDays>0&&<div style={{background:"#0e0e0e",border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px",marginBottom:12}}>
+        <div style={{fontSize:11,color:C.muted,marginBottom:4}}>Closing: <span style={{color:currentGc,fontWeight:600}}>{currentPhase.label||goalLabels[currentGoal]||currentGoal}</span></div>
+        <div style={{fontSize:11,color:C.muted,lineHeight:1.6}}>Duration: <b style={{color:C.text}}>{phaseDays} days</b>{currentPhase.startWeight!=null&&<> · {currentPhase.startWeight.toFixed(2)}kg → {latestWeight?.toFixed(2)}kg</>}{phaseDelta!=null&&<> · <b style={{color:phaseDelta<0?C.lime:C.red}}>{phaseDelta<0?"Lost↓":"Gained↑"}{Math.abs(phaseDelta).toFixed(2)}kg</b></>}</div>
+      </div>}
+      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+        <Field label="Name this new phase" value={phaseName} onChange={setPhaseName} placeholder={defaultNames[newGoal]}/>
+        <Field label="Goal / what you're aiming for" value={phaseNote} onChange={setPhaseNote} placeholder={newGoal==="bulk"?"Lean bulk to 70-72kg, ~0.5kg/wk":newGoal==="cut"?"Cut to visible abs":"Maintain weight, let body normalise"}/>
+        {newGoal!=="maintain"&&<div><Field label="Target weight kg (optional)" value={targetWeight} onChange={setTargetWeight} type="number" placeholder={newGoal==="bulk"?"e.g. 71":"e.g. 63"}/>{targetWeight&&latestWeight&&<div style={{fontSize:10,color:C.muted,marginTop:3}}>{Math.abs(parseFloat(targetWeight)-latestWeight).toFixed(1)}kg {parseFloat(targetWeight)>latestWeight?"to gain":"to lose"} from current {latestWeight.toFixed(1)}kg</div>}</div>}
+      </div>
+      <div style={{background:gc+"10",border:`1px solid ${gc}40`,borderRadius:8,padding:"8px 12px",marginTop:10,fontSize:11,color:C.muted,lineHeight:1.5}}>✓ Current phase closes today · New phase starts today · Weight trend resets to this phase only</div>
+      <div style={{display:"flex",gap:8,marginTop:12}}>
+        <button onClick={()=>setStep("type")} style={{flex:1,padding:"11px 0",borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer"}}>← Back</button>
+        <button onClick={handleConfirm} style={{flex:2,padding:"11px 0",borderRadius:10,background:gc,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14}}>Start {goalLabels[newGoal]||newGoal}</button>
+      </div>
+    </>)}
+  </Sheet>);
+}
+
 // ── Settings Tab ──────────────────────────────────────────────────────────────
 // ── Test API Button ───────────────────────────────────────────────────────────
 function TestAPIButton({apiKey}) {
@@ -2959,9 +3047,10 @@ function TestAPIButton({apiKey}) {
   </div>);
 }
 
-function SettingsTab({profile,setProfile,weights,setWeights}){
+function SettingsTab({profile,setProfile,weights,setWeights,weightPhases,setWeightPhases,latestWeight}){
   const [editProf,setEditProf]=useState(false);const [pf,setPf]=useState({...profile});
   const [exportMsg,setExportMsg]=useState("");const [editWIdx,setEditWIdx]=useState(null);const [editWVal,setEditWVal]=useState("");const [showAllW,setShowAllW]=useState(false);
+  const [pendingGoal,setPendingGoal]=useState(null); // goal being transitioned to
   const AGE=calcAge(profile.birthday);
   const saveProfile=()=>{setProfile({...pf,heightCm:parseFloat(pf.heightCm)||null,apiKey:pf.apiKey||""});setEditProf(false);};
   const exportData=async()=>{
@@ -3022,8 +3111,35 @@ function SettingsTab({profile,setProfile,weights,setWeights}){
     </div>
     <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:12}}>
       <div style={{fontSize:14,fontWeight:600,color:C.text,marginBottom:10}}>Goal Mode</div>
+      {pendingGoal&&<GoalTransitionSheet
+        currentGoal={profile.goal}
+        newGoal={pendingGoal}
+        currentPhase={(weightPhases||[]).find(p=>!p.endDate)||null}
+        latestWeight={latestWeight||weights[0]?.weight||null}
+        onCancel={()=>setPendingGoal(null)}
+        onConfirm={result=>{
+          const today=TODAY();
+          if(result.type==="temp"){
+            setProfile(p=>({...p,goal:result.goal,temporaryGoal:{originalGoal:result.originalGoal,revertDate:result.revertDate,label:result.label},goalNote:result.label||p.goalNote}));
+          }else{
+            const closingWeight=latestWeight||weights[0]?.weight||null;
+            setWeightPhases(prev=>{
+              const updated=prev.map(ph=>!ph.endDate?{...ph,endDate:today,endWeight:closingWeight}:ph);
+              const newPhase={id:Date.now(),label:result.phaseName,goal:result.goal,startDate:today,startWeight:closingWeight,endDate:null,endWeight:null,notes:result.phaseNote};
+              return[...updated,newPhase];
+            });
+            setProfile(p=>({...p,goal:result.goal,goalSubmode:result.goal,goalNote:result.phaseNote||p.goalNote,targetWeightKg:result.targetWeight||p.targetWeightKg,temporaryGoal:null}));
+          }
+          setPendingGoal(null);
+        }}
+      />}
       {(!profile.birthday||!profile.heightCm)?<div style={{fontSize:13,color:C.muted}}>Complete Personal Info to enable personalized targets.</div>:(<>
-        <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:12}}>{GOALS.map(g=>{const active=profile.goal===g.id;const col=g.col;return(<div key={g.id}><button onClick={()=>setProfile(p=>({...p,goal:g.id,goalSubmode:g.submodes?g.submodes[1]?.id||g.id:g.id}))} style={{width:"100%",padding:"12px 14px",borderRadius:10,border:`1px solid ${active?col:C.border}`,background:active?col+"15":C.bg,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontSize:14,fontWeight:active?700:500,color:active?col:C.text}}>{g.emoji} {g.label}</div><div style={{fontSize:11,color:C.muted,marginTop:2}}>{g.desc||g.submodes?.[1]?.desc}</div></div>{active&&<span style={{color:col,fontSize:18}}>✓</span>}</button>{active&&g.submodes&&(<div style={{display:"flex",flexDirection:"column",gap:4,marginTop:4,marginLeft:10}}>{g.submodes.map(sub=>(<button key={sub.id} onClick={()=>setProfile(p=>({...p,goalSubmode:sub.id}))} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${profile.goalSubmode===sub.id?col:C.border}`,background:profile.goalSubmode===sub.id?col+"22":C.bg,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontSize:12,fontWeight:profile.goalSubmode===sub.id?700:400,color:profile.goalSubmode===sub.id?col:C.muted}}>{sub.label}</div><div style={{fontSize:10,color:C.muted}}>{sub.desc}</div></div>{profile.goalSubmode===sub.id&&<span style={{color:col,fontSize:13}}>✓</span>}</button>))}</div>)}</div>);})}</div>
+        <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:12}}>{GOALS.map(g=>{const active=profile.goal===g.id;const col=g.col;return(<div key={g.id}><button onClick={()=>{if(!active)setPendingGoal(g.id);}} style={{width:"100%",padding:"12px 14px",borderRadius:10,border:`1px solid ${active?col:C.border}`,background:active?col+"15":C.bg,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontSize:14,fontWeight:active?700:500,color:active?col:C.text}}>{g.emoji} {g.label}</div><div style={{fontSize:11,color:C.muted,marginTop:2}}>{g.desc||g.submodes?.[1]?.desc}</div></div>{active&&<span style={{color:col,fontSize:18}}>✓</span>}</button>{active&&g.submodes&&(<div style={{display:"flex",flexDirection:"column",gap:4,marginTop:4,marginLeft:10}}>{g.submodes.map(sub=>(<button key={sub.id} onClick={()=>setProfile(p=>({...p,goalSubmode:sub.id}))} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${profile.goalSubmode===sub.id?col:C.border}`,background:profile.goalSubmode===sub.id?col+"22":C.bg,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontSize:12,fontWeight:profile.goalSubmode===sub.id?700:400,color:profile.goalSubmode===sub.id?col:C.muted}}>{sub.label}</div><div style={{fontSize:10,color:C.muted}}>{sub.desc}</div></div>{profile.goalSubmode===sub.id&&<span style={{color:col,fontSize:13}}>✓</span>}</button>))}</div>)}</div>);})}</div>
+        {profile.temporaryGoal&&<div style={{background:"#141414",border:`1px solid ${C.orange}40`,borderRadius:10,padding:"10px 14px",marginBottom:10}}>
+          <div style={{fontSize:12,color:C.orange,fontWeight:600,marginBottom:3}}>🔄 Temporary {profile.goal} active</div>
+          <div style={{fontSize:11,color:C.muted}}>Reverts to <b>{profile.temporaryGoal.originalGoal}</b> on {new Date(profile.temporaryGoal.revertDate+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</div>
+          <button onClick={()=>setProfile(p=>({...p,goal:p.temporaryGoal.originalGoal,temporaryGoal:null}))} style={{marginTop:6,padding:"5px 10px",borderRadius:6,background:"none",border:`1px solid ${C.orange}60`,color:C.orange,fontSize:11,cursor:"pointer",fontWeight:600}}>Cancel temporary switch</button>
+        </div>}
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9}}><Field label="Target weight kg" value={String(profile.targetWeightKg||"")} onChange={v=>setProfile(p=>({...p,targetWeightKg:parseFloat(v.replace(",","."))||null}))} placeholder="65"/><Field label="Goal note" value={profile.goalNote||""} onChange={v=>setProfile(p=>({...p,goalNote:v}))} placeholder="e.g. Visible abs for summer"/></div>
       </>)}
     </div>
@@ -3266,6 +3382,14 @@ function App(){
   const setProgressPhotos=useCallback(upd=>{setProgressPhotos_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_photos",n);return n;});},[]);
   const setWeightPhases=useCallback(upd=>{setWeightPhases_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_weight_phases",n);return n;});},[]);
   const latestWeight=weights[0]?.weight;
+  // Auto-revert temporary goal when its revert date arrives
+  useEffect(()=>{
+    if(!profile?.temporaryGoal)return;
+    const today=TODAY();
+    if(profile.temporaryGoal.revertDate<=today){
+      setProfile(p=>({...p,goal:p.temporaryGoal.originalGoal,temporaryGoal:null}));
+    }
+  },[profile?.temporaryGoal,today]);
   const needsOnboarding=!profile?.birthday||!profile?.heightCm;
   const [showImport,setShowImport]=useState(null); // null=loading, true=show, false=skip
   // On first mount: if no profile exists at all, offer import before onboarding
@@ -3287,7 +3411,7 @@ function App(){
       {tab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile}/>}
       {tab==="analysis"&&<AnalysisTab weights={weights} profile={profile} setProfile={setProfile} progressPhotos={progressPhotos} setProgressPhotos={setProgressPhotos} products={products} mealPreps={mealPreps} weightPhases={weightPhases}/>}
       {tab==="history"&&<HistoryTab weights={weights} products={products} profile={profile}/>}
-      {tab==="settings"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} setWeights={setWeights}/>}
+      {tab==="settings"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight}/>}
     </div>
     <Nav tab={tab} setTab={setTab}/>
   </div>);

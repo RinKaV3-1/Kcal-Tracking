@@ -854,6 +854,8 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
   const [expandedIdx, setExpandedIdx] = useState(null);
   const [swapIdx, setSwapIdx] = useState(null);
   const [swapSearch, setSwapSearch] = useState("");
+  const [swapDescMode, setSwapDescMode] = useState(false); // true = show "describe it" input
+  const [swapDescText, setSwapDescText] = useState(""); // user-provided description for AI estimate
   const [estimatingIdx, setEstimatingIdx] = useState(null);
   const [rowErr, setRowErr] = useState({});
   // Add-ingredient state: pick a label OR enter manually
@@ -970,15 +972,18 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
     setSwapIdx(null); setSwapSearch("");
   };
 
-  const estimateForRow = async (idx) => {
+  const estimateForRow = async (idx, descOverride) => {
     const ing = ingredients[idx];
-    if (!ing?.name) return;
+    if (!ing?.name && !descOverride) return;
     setEstimatingIdx(idx);
     setRowErr(prev => ({...prev, [idx]: null}));
     try {
-      const res = await aEstimateIngredient(ing.name, apiKey);
+      const queryName = descOverride || ing.name;
+      const res = await aEstimateIngredient(queryName, apiKey);
       setIngredients(p => p.map((x, j) => j !== idx ? x : {
         ...x,
+        // If user provided a description, also update the ingredient name to match
+        name: descOverride || x.name,
         _pinned: true, _estimated: true,
         _kcal100: res.kcal||0, _p100: res.p||0, _c100: res.c||0, _f100: res.f||0,
         kcal: res.kcal||0, protein: res.p||0, carbs: res.c||0, fat: res.f||0,
@@ -1064,7 +1069,7 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
                 <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" value={ing.weightG} onChange={e => setIngredients(p => p.map((x, j) => j !== i ? x : {...x, weightG: e.target.value}))}
                   style={{width:58,background:C.card,border:`1px solid ${C.lime}`,borderRadius:6,padding:"5px 6px",color:C.lime,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none",textAlign:"right"}}/>
                 <span style={{fontSize:11,color:C.muted}}>g</span>
-                <button onClick={()=>{setSwapIdx(isSwapping?null:i);setSwapSearch("");setExpandedIdx(null);}}
+                <button onClick={()=>{setSwapIdx(isSwapping?null:i);setSwapSearch("");setSwapDescMode(false);setSwapDescText("");setExpandedIdx(null);}}
                   style={{padding:"5px 8px",borderRadius:6,background:isSwapping?C.orange+"25":"none",border:`1px solid ${isSwapping?C.orange:C.border}`,color:isSwapping?C.orange:C.muted,fontSize:11,cursor:"pointer",flexShrink:0,lineHeight:1}}>⇄</button>
                 <button onClick={()=>{setExpandedIdx(isExpanded?null:i);setSwapIdx(null);}}
                   style={{padding:"5px 8px",borderRadius:6,background:isExpanded?C.blue+"25":"none",border:`1px solid ${isExpanded?C.blue:C.border}`,color:isExpanded?C.blue:C.muted,fontSize:11,cursor:"pointer",flexShrink:0,lineHeight:1}}>{isExpanded?"▾":"▸"}</button>
@@ -1081,6 +1086,14 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
               {/* Expanded macro view + manual edit */}
               {isExpanded && (
                 <div style={{padding:"9px 12px 11px",borderTop:`1px solid ${C.border}`}}>
+                  {/* Editable name — fixes the case where AI mismatched the product (e.g. picked
+                      "frozen blueberries" when it was actually fresh). Editing this and then
+                      tapping "AI estimate" below will re-estimate using the corrected name. */}
+                  <div style={{marginBottom:8}}>
+                    <div style={{fontSize:9,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:3}}>Name (edit if AI got it wrong)</div>
+                    <input type="text" value={ing.name} onChange={e=>setIngredients(p=>p.map((x,j)=>j!==i?x:{...x,name:e.target.value}))}
+                      style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 9px",color:C.text,fontSize:13,outline:"none"}}/>
+                  </div>
                   <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:8}}>
                     <span style={{fontFamily:"monospace",fontSize:11,color:C.lime}}>{m.kcal} kcal</span>
                     <span style={{fontFamily:"monospace",fontSize:11,color:C.blue}}>{m.protein}g P</span>
@@ -1090,8 +1103,8 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
                   </div>
                   {/* Action buttons row — always visible in expanded view */}
                   <div style={{display:"flex",gap:6,marginBottom:9,flexWrap:"wrap"}}>
-                    <button onClick={()=>estimateForRow(i)} disabled={isEstimating} style={{flex:1,padding:"6px 8px",borderRadius:6,background:isEstimating?C.faint:C.blue+"22",border:`1px solid ${C.blue}50`,color:C.blue,fontWeight:600,cursor:isEstimating?"default":"pointer",fontSize:10,whiteSpace:"nowrap"}}>{isEstimating?"🤖 estimating…":"🤖 AI estimate"}</button>
-                    <button onClick={()=>{setSwapIdx(i);setSwapSearch("");setExpandedIdx(null);}} style={{flex:1,padding:"6px 8px",borderRadius:6,background:C.orange+"15",border:`1px solid ${C.orange}40`,color:C.orange,fontWeight:600,cursor:"pointer",fontSize:10,whiteSpace:"nowrap"}}>⇄ Swap label</button>
+                    <button onClick={()=>estimateForRow(i)} disabled={isEstimating} style={{flex:1,padding:"6px 8px",borderRadius:6,background:isEstimating?C.faint:C.blue+"22",border:`1px solid ${C.blue}50`,color:C.blue,fontWeight:600,cursor:isEstimating?"default":"pointer",fontSize:10,whiteSpace:"nowrap"}}>{isEstimating?"🤖 estimating…":"🤖 AI estimate (uses name above)"}</button>
+                    <button onClick={()=>{setSwapIdx(i);setSwapSearch("");setSwapDescMode(false);setSwapDescText("");setExpandedIdx(null);}} style={{flex:1,padding:"6px 8px",borderRadius:6,background:C.orange+"15",border:`1px solid ${C.orange}40`,color:C.orange,fontWeight:600,cursor:"pointer",fontSize:10,whiteSpace:"nowrap"}}>⇄ Swap label</button>
                     {(ing._pinned||m.matched) && <button onClick={()=>setIngredients(p=>p.map((x,j)=>j!==i?x:{...x,_pinned:false,_estimated:false,_kcal100:undefined,_p100:undefined,_c100:undefined,_f100:undefined,kcal:0,protein:0,carbs:0,fat:0}))} style={{flex:1,padding:"6px 8px",borderRadius:6,background:"none",border:`1px solid ${C.border}`,color:C.muted,fontWeight:500,cursor:"pointer",fontSize:10,whiteSpace:"nowrap"}}>🔄 Reset</button>}
                   </div>
                   <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:5}}>per-100g (edit to override)</div>
@@ -1110,24 +1123,59 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
               {/* Swap panel */}
               {isSwapping && (
                 <div style={{padding:"8px 10px 10px",borderTop:`1px solid ${C.border}`}}>
-                  <div style={{fontSize:10,color:C.orange,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Pick a label:</div>
-                  <input value={swapSearch} onChange={e => setSwapSearch(e.target.value)} placeholder="Search your product labels…"
-                    style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:13,outline:"none",marginBottom:7}}
-                    autoFocus/>
-                  <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:240,overflowY:"auto"}}>
-                    {filteredProds.map(prod => (
-                      <button key={prod.name} type="button" onClick={() => swapWith(i, prod)}
-                        style={{padding:"9px 12px",borderRadius:8,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",userSelect:"none",textAlign:"left"}}>
-                        <span style={{fontSize:13,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{prod.name}</span>
-                        <span style={{fontFamily:"monospace",fontSize:11,color:C.muted,flexShrink:0,marginLeft:10}}>{prod.kcal}k {prod.p}P</span>
+                  {swapDescMode && swapIdx === i ? (<>
+                    {/* Describe-and-estimate mode: user can type what this actually is */}
+                    <div style={{fontSize:10,color:C.blue,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>🤖 Describe what this actually is:</div>
+                    <input
+                      value={swapDescText}
+                      onChange={e=>setSwapDescText(e.target.value)}
+                      placeholder="e.g. fresh blueberries, raw oats, boiled egg…"
+                      autoFocus
+                      style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.blue}`,borderRadius:6,padding:"8px 10px",color:C.text,fontSize:13,outline:"none",marginBottom:7}}
+                    />
+                    <div style={{fontSize:10,color:C.muted,marginBottom:8,lineHeight:1.4}}>The AI will estimate per-100g macros for what you type and update the name. Be specific — "fresh blueberries" vs "frozen blueberries" gives different values.</div>
+                    <div style={{display:"flex",gap:6}}>
+                      <button
+                        onClick={()=>{setSwapDescMode(false);}}
+                        style={{flex:1,padding:"8px",borderRadius:6,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>← Back</button>
+                      <button
+                        onClick={()=>{
+                          if(!swapDescText.trim())return;
+                          setSwapIdx(null);setSwapSearch("");setSwapDescMode(false);
+                          estimateForRow(i, swapDescText.trim());
+                          setSwapDescText("");
+                        }}
+                        disabled={!swapDescText.trim()||isEstimating}
+                        style={{flex:2,padding:"8px",borderRadius:6,background:swapDescText.trim()&&!isEstimating?C.blue:C.faint,border:"none",color:swapDescText.trim()?"#000":C.muted,fontWeight:700,cursor:swapDescText.trim()&&!isEstimating?"pointer":"default",fontSize:12}}>
+                        {isEstimating?"Estimating…":"🤖 Estimate →"}
                       </button>
-                    ))}
-                    {filteredProds.length === 0 && <div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match. Add it via Food tab → Product Labels, or use 🤖 AI estimate below.</div>}
-                  </div>
-                  <div style={{display:"flex",gap:6,marginTop:8}}>
-                    <button onClick={()=>{setSwapIdx(null);setSwapSearch("");estimateForRow(i);}} disabled={isEstimating} style={{flex:1,padding:"8px",borderRadius:6,background:C.blue+"22",border:`1px solid ${C.blue}50`,color:C.blue,fontWeight:600,cursor:"pointer",fontSize:11}}>🤖 Use AI estimate instead</button>
-                    <button onClick={()=>{setSwapIdx(null);setSwapSearch("");}} style={{padding:"8px 12px",borderRadius:6,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button>
-                  </div>
+                    </div>
+                  </>) : (<>
+                    {/* Default: label search + describe option */}
+                    <div style={{fontSize:10,color:C.orange,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Pick a label:</div>
+                    <input value={swapSearch} onChange={e => setSwapSearch(e.target.value)} placeholder="Search your product labels…"
+                      style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:13,outline:"none",marginBottom:7}}
+                      autoFocus/>
+                    <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:200,overflowY:"auto",marginBottom:8}}>
+                      {filteredProds.map(prod => (
+                        <button key={prod.name} type="button" onClick={() => swapWith(i, prod)}
+                          style={{padding:"9px 12px",borderRadius:8,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",userSelect:"none",textAlign:"left"}}>
+                          <span style={{fontSize:13,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{prod.name}</span>
+                          <span style={{fontFamily:"monospace",fontSize:11,color:C.muted,flexShrink:0,marginLeft:10}}>{prod.kcal}k {prod.p}P</span>
+                        </button>
+                      ))}
+                      {filteredProds.length === 0 && <div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match.</div>}
+                    </div>
+                    {/* Separator */}
+                    <div style={{borderTop:`1px dashed ${C.border}`,paddingTop:8,display:"flex",gap:6}}>
+                      <button
+                        onClick={()=>{setSwapDescMode(true);setSwapDescText(ingredients[i]?.name||"");setSwapSearch("");}}
+                        style={{flex:2,padding:"8px",borderRadius:6,background:C.blue+"15",border:`1px solid ${C.blue}50`,color:C.blue,fontWeight:600,cursor:"pointer",fontSize:11}}>
+                        🤖 It's something else — describe & estimate
+                      </button>
+                      <button onClick={()=>{setSwapIdx(null);setSwapSearch("");setSwapDescMode(false);}} style={{flex:1,padding:"8px",borderRadius:6,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button>
+                    </div>
+                  </>)}
                 </div>
               )}
             </div>
@@ -1990,8 +2038,8 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
   const wDelta=todayW&&prevW?todayW.weight-prevW.weight:null;
   const logWeight=()=>{const w=parseNum(wInput);if(!w)return;const e={date:TODAY(),weight:w};setWeights(p=>[e,...p.filter(x=>x.date!==e.date)].sort((a,b)=>b.date.localeCompare(a.date)));setWInput("");};
   const handleAdd=entry=>{
-    if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal}));}
-    else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal}));if(newProduct)setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,newProduct]);}
+    if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode}));}
+    else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}));if(newProduct)setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,newProduct]);}
     setModal(null);
   };
   const updateMeal=updated=>{setDayData(p=>({...p,meals:p.meals.map(m=>m.id===updated.id?updated:m)}));setEditingMealId(null);};
@@ -2039,7 +2087,7 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
       {/* Day type */}
       <div style={{marginBottom:10}}>
         <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:7}}>Day Type</div>
-        <div style={{display:"flex",gap:5}}>{Object.entries(DAY_TYPES).map(([key,val])=>{const active=dayData.dayType===key;const tKcal=getDT(profile,key,latestWeight,0,false,dailySteps).kcal;return(<button key={key} onClick={()=>setDayData(p=>({...p,dayType:key,goalMode:profile.goal}))} style={{flex:1,padding:"7px 3px",borderRadius:10,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.card,color:active?C.lime:C.muted,fontWeight:active?700:400,cursor:"pointer",fontSize:9.5,lineHeight:1.4,textAlign:"center"}}><div style={{fontSize:14}}>{val.icon}</div><div>{val.label}</div><div style={{fontFamily:"monospace",fontSize:10,opacity:0.75,marginTop:1}}>{tKcal}</div></button>);})}</div>
+        <div style={{display:"flex",gap:5}}>{Object.entries(DAY_TYPES).map(([key,val])=>{const active=dayData.dayType===key;const tKcal=getDT(profile,key,latestWeight,0,false,dailySteps).kcal;return(<button key={key} onClick={()=>setDayData(p=>({...p,dayType:key,goalMode:profile.goal,goalSubmode:profile.goalSubmode}))} style={{flex:1,padding:"7px 3px",borderRadius:10,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.card,color:active?C.lime:C.muted,fontWeight:active?700:400,cursor:"pointer",fontSize:9.5,lineHeight:1.4,textAlign:"center"}}><div style={{fontSize:14}}>{val.icon}</div><div>{val.label}</div><div style={{fontFamily:"monospace",fontSize:10,opacity:0.75,marginTop:1}}>{tKcal}</div></button>);})}</div>
       </div>
 
       {/* Daily steps — optional but recalculates target when set */}
@@ -2100,7 +2148,10 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
                 <span style={{color:C.muted,fontSize:11,alignSelf:"center"}}>{isExp?"▲":"▼"}</span>
               </button>
               {isExp&&<div style={{padding:"0 14px 12px",borderTop:`1px solid ${C.border}`}}>
-                {m.notes?<div style={{fontSize:11,color:C.muted,lineHeight:1.5,marginTop:9,marginBottom:9,wordBreak:"break-word"}}>{isCanteen?"🍴 ":"📋 "}<span style={{color:C.text}}>{m.notes}</span></div>:<div style={{fontSize:11,color:C.muted,marginTop:9,marginBottom:9,fontStyle:"italic"}}>No ingredient breakdown saved.</div>}
+                {/* Full name — the collapsed header truncates long names with an ellipsis,
+                    so show the complete, wrapped name here once expanded. */}
+                <div style={{fontSize:13,fontWeight:600,color:C.text,lineHeight:1.4,marginTop:9,wordBreak:"break-word"}}>{mealEmoji} {m.name}</div>
+                {m.notes?<div style={{fontSize:11,color:C.muted,lineHeight:1.5,marginTop:7,marginBottom:9,wordBreak:"break-word"}}>{isCanteen?"🍴 ":"📋 "}<span style={{color:C.text}}>{m.notes}</span></div>:<div style={{fontSize:11,color:C.muted,marginTop:7,marginBottom:9,fontStyle:"italic"}}>No ingredient breakdown saved.</div>}
                 <div style={{display:"flex",gap:6,marginTop:6}}>
                   <button onClick={()=>setEditingMealId(m.id)} style={{flex:1,padding:"7px 0",borderRadius:7,background:C.bg,border:`1px solid ${C.border}`,color:C.text,fontWeight:500,cursor:"pointer",fontSize:12}}>✎ Edit</button>
                   <button onClick={()=>deleteMeal(m.id)} style={{padding:"7px 14px",borderRadius:7,background:"none",border:`1px solid ${C.red}40`,color:C.red,fontWeight:500,cursor:"pointer",fontSize:12}}>Delete</button>
@@ -2725,7 +2776,19 @@ function AnalysisTab({weights,profile,setProfile,progressPhotos,setProgressPhoto
   const gc=gCol(profile.goal);
   const spark=[...weights].reverse().slice(-20);const W=300,H=60;const vals=spark.map(w=>w.weight);const hasT=profile.targetWeightKg&&spark.length>1;const sMin=vals.length?Math.min(...vals,(hasT?profile.targetWeightKg:Infinity))-0.5:65;const sMax=vals.length?Math.max(...vals)+0.5:70;const px=i=>spark.length>1?(i/(spark.length-1))*W:W/2;const py=v=>H-((v-sMin)/(sMax-sMin))*(H-8)-4;
   const startW=weights[weights.length-1]?.weight||latestWeight;
-  const totalLost=startW&&latestWeight?startW-latestWeight:null;
+  // BUG FIX: "Total lost/gained" was always computed from the oldest weight ever logged
+  // (all-time), so switching to maintenance still showed the full historical cut total
+  // (-8.35kg) instead of the near-zero change expected while maintaining. Scope this to
+  // the current phase instead — use the oldest weight logged *within* this phase.
+  const phaseStartW = phaseScoped ? (phaseWeights[phaseWeights.length-1]?.weight ?? startW) : startW;
+  const phaseDelta = (phaseStartW!=null && latestWeight!=null) ? (phaseStartW-latestWeight) : null;
+  const totalLost = phaseDelta; // kept as `totalLost` for the ETA/kgToGoal logic below, now phase-scoped
+  // Historical extremes: biggest single-phase loss and biggest single-phase gain across all
+  // CLOSED phases (completed transformations only — the active phase is shown separately above).
+  const closedPhases = (weightPhases||[]).filter(p=>p.endDate&&p.startWeight!=null&&p.endWeight!=null);
+  const phaseDeltas = closedPhases.map(p=>({delta:p.endWeight-p.startWeight, phase:p}));
+  const maxLostPhase = phaseDeltas.filter(d=>d.delta>0).sort((a,b)=>b.delta-a.delta)[0]||null;   // startW>endW → weight dropped
+  const maxGainedPhase = phaseDeltas.filter(d=>d.delta<0).sort((a,b)=>a.delta-b.delta)[0]||null; // endW>startW → weight rose
   const kgToGoal=profile.targetWeightKg&&latestWeight?latestWeight-profile.targetWeightKg:null;
   // ETA: use phase-scoped 7d trend first (most relevant), fall back to phase 21d, then full history
   const etaTrend=(tWeek&&kgToGoal&&Math.sign(kgToGoal)!==Math.sign(tWeek))?tWeek:(tMonth&&kgToGoal&&Math.sign(kgToGoal)!==Math.sign(tMonth))?tMonth:null;
@@ -2751,8 +2814,18 @@ function AnalysisTab({weights,profile,setProfile,progressPhotos,setProgressPhoto
             {phaseScoped&&phaseWeights.length<2&&<span style={{fontSize:10,color:C.yellow,fontFamily:"monospace"}}>new phase — log a few weights for trend</span>}
           </div>
         </div>
-        <div style={{textAlign:"right"}}>{totalLost!==null&&<div><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>Total {profile.goal==="bulk"?(totalLost<0?"gained":"lost"):(totalLost>0?"lost":"gained")}</div><div style={{fontSize:18,fontWeight:800,fontFamily:"monospace",color:(profile.goal==="bulk"?totalLost<0:totalLost>0)?C.lime:C.red}}>{(profile.goal==="bulk"?totalLost<0:totalLost>0)?"-":""}{Math.abs(totalLost).toFixed(2)}kg</div></div>}{tdee&&<div style={{marginTop:4}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>TDEE</div><div style={{fontSize:14,fontWeight:700,fontFamily:"monospace",color:C.blue}}>{tdee} kcal</div></div>}</div>
+        <div style={{textAlign:"right"}}>{totalLost!==null&&<div>{profile.goal==="maintain"?(<>
+          <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>Δ this phase</div>
+          <div style={{fontSize:18,fontWeight:800,fontFamily:"monospace",color:Math.abs(totalLost)<0.5?C.lime:C.yellow}}>{totalLost>0?"-":totalLost<0?"+":""}{Math.abs(totalLost).toFixed(2)}kg</div>
+        </>):(<>
+          <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>{phaseScoped?"This phase":"Total"} {profile.goal==="bulk"?(totalLost<0?"gained":"lost"):(totalLost>0?"lost":"gained")}</div>
+          <div style={{fontSize:18,fontWeight:800,fontFamily:"monospace",color:(profile.goal==="bulk"?totalLost<0:totalLost>0)?C.lime:C.red}}>{(profile.goal==="bulk"?totalLost<0:totalLost>0)?"-":""}{Math.abs(totalLost).toFixed(2)}kg</div>
+        </>)}</div>}{tdee&&<div style={{marginTop:4}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>TDEE</div><div style={{fontSize:14,fontWeight:700,fontFamily:"monospace",color:C.blue}}>{tdee} kcal</div></div>}</div>
       </div>
+      {(maxLostPhase||maxGainedPhase)&&<div style={{display:"flex",gap:8,marginBottom:8,flexWrap:"wrap"}}>
+        {maxLostPhase&&<div style={{flex:1,minWidth:120,background:C.bg,borderRadius:8,padding:"6px 10px"}}><div style={{fontSize:9,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>📉 Max lost (all-time)</div><div style={{fontSize:13,fontWeight:700,fontFamily:"monospace",color:C.lime}}>{Math.abs(maxLostPhase.delta).toFixed(2)}kg</div><div style={{fontSize:9,color:C.muted,marginTop:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{maxLostPhase.phase.label||maxLostPhase.phase.goal}</div></div>}
+        {maxGainedPhase&&<div style={{flex:1,minWidth:120,background:C.bg,borderRadius:8,padding:"6px 10px"}}><div style={{fontSize:9,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>📈 Max gained (all-time)</div><div style={{fontSize:13,fontWeight:700,fontFamily:"monospace",color:C.blue}}>{Math.abs(maxGainedPhase.delta).toFixed(2)}kg</div><div style={{fontSize:9,color:C.muted,marginTop:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{maxGainedPhase.phase.label||maxGainedPhase.phase.goal}</div></div>}
+      </div>}
       {spark.length>=3&&<svg width="100%" viewBox={"0 0 "+W+" "+H} style={{display:"block",marginBottom:8}}>
         {hasT&&<line x1={0} y1={py(profile.targetWeightKg)} x2={W} y2={py(profile.targetWeightKg)} stroke={gc+"50"} strokeWidth={1} strokeDasharray="4 4"/>}
         <polyline points={spark.map((d,i)=>px(i)+","+py(d.weight)).join(" ")} fill="none" stroke={C.lime+"40"} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round"/>
@@ -2858,7 +2931,15 @@ function HistoryTab({weights,products,profile}){
         // Without this, switching goal retroactively recomputes all history targets with the new
         // deficit (e.g. switching to cut makes old maintain days look like failed cut targets).
         const historicalGoal = log.goalMode || profile?.goal || "cut";
-        const histProfile = {...(profile||{}), goal: historicalGoal};
+        // BUG FIX: getDT looks up the deficit via profile.goalSubmode FIRST, falling back to
+        // profile.goal only if goalSubmode is unset. Spreading the current profile into
+        // histProfile carried over the CURRENT goalSubmode (e.g. "maintain") even though we'd
+        // correctly locked `goal` to the historical value (e.g. "cut") — so a cut day would
+        // silently get the maintenance deficit (0) instead of the cut deficit (-400) the moment
+        // the user switched modes. Lock goalSubmode too: prefer the day's own stored submode if
+        // we have one (future days, once stamped below), else fall back to the historical goal
+        // itself so GOAL_DEFICIT[historicalGoal] is used rather than today's submode.
+        const histProfile = {...(profile||{}), goal: historicalGoal, goalSubmode: log.goalSubmode || historicalGoal};
         const dayTarget = getDT(histProfile, log.dayType||"rest", wForDay, fullActBurn, (log.activities||[]).length>0, log.dailySteps||0);
         const targetKcal = dayTarget?.kcal || 0;
         // Status: how does today's intake compare to target, given the goal?
@@ -2875,9 +2956,11 @@ function HistoryTab({weights,products,profile}){
           } else if (goal === "bulk") {
             if (diff >= -MARGIN) { status = "✓"; statusColor = C.lime; }
             else { status = "✗"; statusColor = C.red; }
-          } else { // maintain — ±150 kcal counts as green
-            if (Math.abs(diff) <= MARGIN) { status = "✓"; statusColor = C.lime; }
-            else { status = diff > 0 ? "↑" : "↓"; statusColor = C.red; }
+          } else { // maintain — under or at target is fine (green, same logic as cut);
+                   // only significantly OVER target (real risk of unintended gain) gets flagged
+            if (diff <= 0) { status = "✓"; statusColor = C.lime; }
+            else if (diff <= MARGIN) { status = "~"; statusColor = C.yellow; }
+            else { status = "✗"; statusColor = C.red; }
           }
         } else if (totals.kcal > 0) {
           // No target available (no weight logged) — fall back to old behavior
@@ -2929,7 +3012,7 @@ function HistoryTab({weights,products,profile}){
             <div style={{marginBottom:10}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Tags</div><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{DAY_TAGS.map(tag=>{const active=(log.tags||[]).includes(tag.id);return(<button key={tag.id} onClick={()=>toggleTag(date,tag.id)} style={{padding:"5px 10px",borderRadius:20,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,cursor:"pointer",fontSize:11}}>{tag.emoji} {tag.label}</button>);})}</div></div>
             <div style={{marginBottom:10}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}><span style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Meals ({log.meals?.length||0})</span><button onClick={()=>setAddMealDate(addMealDate===date?null:date)} style={{fontSize:11,color:C.lime,background:"none",border:`1px solid ${C.lime}`,borderRadius:6,padding:"3px 10px",cursor:"pointer",fontWeight:600}}>+ Add</button></div>{addMealDate===date&&<div style={{marginBottom:8}}><AddMealManual onAdd={meal=>addMeal(date,meal)} onCancel={()=>setAddMealDate(null)}/></div>}<div style={{display:"flex",flexDirection:"column",gap:6}}>{log.meals?.map(m=>{
               const mtEmoji=["🌅","☀️","🌙","🍎","🥤"][["breakfast","lunch","dinner","snack","drink"].indexOf(m.mealType)]||"";
-              return(<div key={m.id}>{editMeal?.date===date&&editMeal?.id===m.id?<EditMealInline meal={m} onSave={meal=>updateMeal(date,meal)} onCancel={()=>setEditMeal(null)} products={products} apiKey={profile?.apiKey}/>:<div style={{background:C.bg,borderRadius:10,padding:"9px 12px"}}><div style={{display:"flex",alignItems:"center",gap:8}}><div style={{flex:1,minWidth:0}}><div style={{display:"flex",alignItems:"baseline",gap:6,marginBottom:3}}><span style={{fontSize:13,fontWeight:600,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{mtEmoji} {m.name}</span><span style={{fontSize:10,color:C.muted,fontFamily:"monospace",flexShrink:0}}>{m.time}</span></div><div style={{display:"flex",gap:8}}><Chip val={m.kcal} label="k" color={C.lime}/><Chip val={m.protein} label="P" color={C.blue}/><Chip val={m.carbs} label="C" color={C.orange}/><Chip val={m.fat} label="F" color={C.purple}/></div></div><button onClick={()=>setEditMeal({date,id:m.id})} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12,cursor:"pointer",padding:"4px 7px",borderRadius:6,lineHeight:1}}>✎</button><button onClick={()=>deleteMeal(date,m.id)} style={{background:"none",border:"none",color:C.faint,fontSize:16,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div>{m.notes&&<div style={{fontSize:10,color:C.muted,marginTop:5,lineHeight:1.4,wordBreak:"break-word"}}>📋 {m.notes}</div>}</div>}</div>);
+              return(<div key={m.id}>{editMeal?.date===date&&editMeal?.id===m.id?<EditMealInline meal={m} onSave={meal=>updateMeal(date,meal)} onCancel={()=>setEditMeal(null)} products={products} apiKey={profile?.apiKey}/>:<div style={{background:C.bg,borderRadius:10,padding:"9px 12px"}}><div style={{display:"flex",alignItems:"center",gap:8}}><div style={{flex:1,minWidth:0}}><div style={{display:"flex",alignItems:"baseline",gap:6,marginBottom:3,flexWrap:"wrap"}}><span style={{fontSize:13,fontWeight:600,color:C.text,wordBreak:"break-word"}}>{mtEmoji} {m.name}</span><span style={{fontSize:10,color:C.muted,fontFamily:"monospace",flexShrink:0}}>{m.time}</span></div><div style={{display:"flex",gap:8}}><Chip val={m.kcal} label="k" color={C.lime}/><Chip val={m.protein} label="P" color={C.blue}/><Chip val={m.carbs} label="C" color={C.orange}/><Chip val={m.fat} label="F" color={C.purple}/></div></div><button onClick={()=>setEditMeal({date,id:m.id})} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12,cursor:"pointer",padding:"4px 7px",borderRadius:6,lineHeight:1}}>✎</button><button onClick={()=>deleteMeal(date,m.id)} style={{background:"none",border:"none",color:C.faint,fontSize:16,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div>{m.notes&&<div style={{fontSize:10,color:C.muted,marginTop:5,lineHeight:1.4,wordBreak:"break-word"}}>📋 {m.notes}</div>}</div>}</div>);
             })}{!log.meals?.length&&<div style={{fontSize:12,color:C.muted,padding:"4px 0"}}>No meals.</div>}</div></div>
             <div><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}><span style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Activities{actKcal>0&&<span style={{color:C.orange,marginLeft:6}}>+{Math.round(actKcal)}kcal</span>}</span><button onClick={()=>setAddActDate(addActDate===date?null:date)} style={{fontSize:11,color:C.orange,background:"none",border:`1px solid ${C.orange}`,borderRadius:6,padding:"3px 10px",cursor:"pointer",fontWeight:600}}>+ Add</button></div>{addActDate===date&&<div style={{marginBottom:8}}><AddActManual onAdd={act=>addAct(date,act)} onCancel={()=>setAddActDate(null)}/></div>}<div style={{display:"flex",flexDirection:"column",gap:6}}>{(log.activities||[]).map(a=><div key={a.id}>{editAct?.date===date&&editAct?.id===a.id?<EditActInline act={a} onSave={act=>updateAct(date,act)} onCancel={()=>setEditAct(null)}/>:<div style={{background:C.bg,borderRadius:10,padding:"9px 12px",display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:18}}>{a.type==="gym"?"🏋️":a.type==="run"?"🏃":"🚶"}</span><div style={{flex:1}}><span style={{fontSize:13,color:C.text}}>{a.label}</span><div style={{display:"flex",gap:8,marginTop:2}}><span style={{fontFamily:"monospace",fontSize:11,color:C.orange}}>{Math.round(a.kcal)}kcal</span>{a.distanceKm&&<span style={{fontFamily:"monospace",fontSize:10,color:C.muted}}>{a.distanceKm}km</span>}{a.durationMin&&<span style={{fontFamily:"monospace",fontSize:10,color:C.muted}}>{a.durationMin}min</span>}</div></div><button onClick={()=>setEditAct({date,id:a.id})} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12,cursor:"pointer",padding:"4px 7px",borderRadius:6,lineHeight:1}}>✎</button><button onClick={()=>deleteAct(date,a.id)} style={{background:"none",border:"none",color:C.faint,fontSize:16,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div>}</div>)}{!(log.activities||[]).length&&<div style={{fontSize:12,color:C.muted,padding:"4px 0"}}>No activities.</div>}</div></div>
           </div>}

@@ -61,6 +61,15 @@ const PRODUCT_CATEGORIES = [
   { id:"frozen",    label:"Frozen",             emoji:"🧊" },
 ];
 const catById=id=>PRODUCT_CATEGORIES.find(c=>c.id===id);
+// Recipe categories — shown as a dedicated icon on each recipe card even before opening it.
+const RECIPE_CATEGORIES = [
+  { id:"breakfast", label:"Breakfast",   emoji:"🥞" },
+  { id:"main",      label:"Main Dishes", emoji:"🍽️" },
+  { id:"dessert",   label:"Desserts",    emoji:"🍰" },
+  { id:"snack",     label:"Snacks",      emoji:"🍿" },
+  { id:"drink",     label:"Drinks",      emoji:"🥤" },
+];
+const recipeCatById=id=>RECIPE_CATEGORIES.find(c=>c.id===id)||RECIPE_CATEGORIES[1];
 const MEAL_TYPES = [
   { id:"breakfast", label:"Breakfast", emoji:"🌅" },
   { id:"lunch",     label:"Lunch",     emoji:"☀️"  },
@@ -176,6 +185,170 @@ const C = {
   lime:"#c4f135",orange:"#ff6b35",blue:"#5aacff",purple:"#a87bff",red:"#ff4545",yellow:"#ffc107",
   text:"#ececec",muted:"#55556e",
 };
+
+// ── Gym tracking ─────────────────────────────────────────────────────────────
+const WEEKDAYS = [
+  {id:0,label:"Sun",full:"Sunday"},{id:1,label:"Mon",full:"Monday"},{id:2,label:"Tue",full:"Tuesday"},
+  {id:3,label:"Wed",full:"Wednesday"},{id:4,label:"Thu",full:"Thursday"},{id:5,label:"Fri",full:"Friday"},
+  {id:6,label:"Sat",full:"Saturday"},
+];
+// Display/sort order for weekdays, Monday-first (WEEKDAYS itself stays indexed 0=Sun..6=Sat
+// to match Date.getDay(), which is what gymSchedule/gymTemplates are keyed by).
+const WEEKDAY_ORDER = [1,2,3,4,5,6,0];
+// Cardio machine types for warmup — each has type-appropriate fields. "other" falls back to free text.
+const CARDIO_MACHINES = [
+  {id:"treadmill",label:"Treadmill",emoji:"🏃",fields:["speed","incline","distanceKm"]},
+  {id:"bike",label:"Bike",emoji:"🚴",fields:["resistance","distanceKm"]},
+  {id:"rower",label:"Rower",emoji:"🚣",fields:["resistance","distanceKm"]},
+  {id:"elliptical",label:"Elliptical",emoji:"🏋️",fields:["resistance","distanceKm"]},
+  {id:"stairmaster",label:"StairMaster",emoji:"🪜",fields:["level"]},
+  {id:"other",label:"Other",emoji:"✏️",fields:[]}, // free text only
+];
+const TRAINING_METHODS = [
+  {id:"progressive_overload",label:"Progressive Overload",emoji:"📈",desc:"Suggests weight increases once you're consistently hitting your rep targets"},
+  {id:"maintain",label:"Maintain",emoji:"⚖️",desc:"Keep the same weights — just tracks what you did, no suggestions"},
+  {id:"custom",label:"Custom",emoji:"✏️",desc:"Your own approach — add a note for context"},
+];
+// Exercise library: broad training-split category + specific muscle group, used for
+// organizing exercises and for the "swap for an alternative" feature (same muscle group).
+const EXERCISE_CATEGORIES = ["Push","Pull","Legs","Abs","Cardio","Other"];
+const MUSCLE_GROUPS = ["Chest","Lats","Upper Back","Front Delts","Side Delts","Rear Delts","Traps","Biceps","Triceps","Forearms","Quads","Hamstrings","Glutes","Calves","Abs","Obliques","Full Body"];
+// Pre-populated exercise database — common gym staples across all categories, plus every
+// exercise this user has specifically mentioned. Custom exercises the user adds later get
+// merged in alongside these (see App bootstrap) with custom:true.
+const DEFAULT_EXERCISES = [
+  // Push — Chest
+  {name:"Barbell Bench Press",category:"Push",muscleGroup:"Chest"},
+  {name:"DB Bench Press",category:"Push",muscleGroup:"Chest"},
+  {name:"Incline Dumbbell Press",category:"Push",muscleGroup:"Chest"},
+  {name:"Incline Barbell Press",category:"Push",muscleGroup:"Chest"},
+  {name:"Decline Bench Press",category:"Push",muscleGroup:"Chest"},
+  {name:"Chest Press Machine",category:"Push",muscleGroup:"Chest"},
+  {name:"Pec Deck / Chest Fly Machine",category:"Push",muscleGroup:"Chest"},
+  {name:"Cable Chest Fly",category:"Push",muscleGroup:"Chest"},
+  {name:"Push-Ups",category:"Push",muscleGroup:"Chest"},
+  // Push — Shoulders
+  {name:"Overhead Barbell Press",category:"Push",muscleGroup:"Front Delts"},
+  {name:"Overhead Dumbbell Shoulder Press",category:"Push",muscleGroup:"Front Delts"},
+  {name:"Arnold Press",category:"Push",muscleGroup:"Front Delts"},
+  {name:"Dumbbell Side Raises",category:"Push",muscleGroup:"Side Delts"},
+  {name:"Cable Lateral Raise",category:"Push",muscleGroup:"Side Delts"},
+  {name:"Front Raise",category:"Push",muscleGroup:"Front Delts"},
+  // Push — Triceps
+  {name:"Triceps Pushdown (Cable)",category:"Push",muscleGroup:"Triceps"},
+  {name:"Overhead Triceps Extension (Cable)",category:"Push",muscleGroup:"Triceps"},
+  {name:"Skull Crushers",category:"Push",muscleGroup:"Triceps"},
+  {name:"Close-Grip Bench Press",category:"Push",muscleGroup:"Triceps"},
+  {name:"Dips",category:"Push",muscleGroup:"Triceps"},
+  // Pull — Back/Lats
+  {name:"Lat Pulldown",category:"Pull",muscleGroup:"Lats"},
+  {name:"Pull-Ups",category:"Pull",muscleGroup:"Lats"},
+  {name:"Chin-Ups",category:"Pull",muscleGroup:"Lats"},
+  {name:"Seated Row (Cable)",category:"Pull",muscleGroup:"Upper Back"},
+  {name:"One-Arm Dumbbell Row",category:"Pull",muscleGroup:"Upper Back"},
+  {name:"Barbell Row",category:"Pull",muscleGroup:"Upper Back"},
+  {name:"T-Bar Row",category:"Pull",muscleGroup:"Upper Back"},
+  {name:"Shrugs",category:"Pull",muscleGroup:"Traps"},
+  // Pull — Rear delts
+  {name:"Face Pulls (Cable)",category:"Pull",muscleGroup:"Rear Delts"},
+  {name:"Rear Delt Fly (Cable)",category:"Pull",muscleGroup:"Rear Delts"},
+  {name:"Reverse Pec Deck",category:"Pull",muscleGroup:"Rear Delts"},
+  // Pull — Biceps/Forearms
+  {name:"Dumbbell Biceps Curls",category:"Pull",muscleGroup:"Biceps"},
+  {name:"Barbell Curl",category:"Pull",muscleGroup:"Biceps"},
+  {name:"Hammer Curls",category:"Pull",muscleGroup:"Biceps"},
+  {name:"Preacher Curl",category:"Pull",muscleGroup:"Biceps"},
+  {name:"Cable Curl",category:"Pull",muscleGroup:"Biceps"},
+  {name:"Wrist Curls (palms up)",category:"Pull",muscleGroup:"Forearms"},
+  {name:"Reverse Wrist Curls (palms down)",category:"Pull",muscleGroup:"Forearms"},
+  // Legs
+  {name:"Barbell Squat",category:"Legs",muscleGroup:"Quads"},
+  {name:"Leg Press",category:"Legs",muscleGroup:"Quads"},
+  {name:"Reverse Lunges (DBs)",category:"Legs",muscleGroup:"Quads"},
+  {name:"Walking Lunges",category:"Legs",muscleGroup:"Quads"},
+  {name:"Bulgarian Split Squat",category:"Legs",muscleGroup:"Quads"},
+  {name:"Romanian Deadlift (DBs)",category:"Legs",muscleGroup:"Hamstrings"},
+  {name:"Conventional Deadlift",category:"Legs",muscleGroup:"Hamstrings"},
+  {name:"Leg Extension Machine",category:"Legs",muscleGroup:"Quads"},
+  {name:"Leg Curl Machine",category:"Legs",muscleGroup:"Hamstrings"},
+  {name:"Hip Thrust",category:"Legs",muscleGroup:"Glutes"},
+  {name:"Glute Bridge",category:"Legs",muscleGroup:"Glutes"},
+  {name:"Calf Raise",category:"Legs",muscleGroup:"Calves"},
+  // Abs
+  {name:"Abs Hanging Leg Raises",category:"Abs",muscleGroup:"Abs"},
+  {name:"ABS Weighted Sit Ups",category:"Abs",muscleGroup:"Abs"},
+  {name:"ABS Heel Touches",category:"Abs",muscleGroup:"Obliques"},
+  {name:"Plank",category:"Abs",muscleGroup:"Abs"},
+  {name:"Cable Woodchopper",category:"Abs",muscleGroup:"Obliques"},
+  {name:"Russian Twists",category:"Abs",muscleGroup:"Obliques"},
+  {name:"Ab Wheel Rollout",category:"Abs",muscleGroup:"Abs"},
+  {name:"Cable Crunch",category:"Abs",muscleGroup:"Abs"},
+];
+// Estimate active kcal burned during a gym session from duration alone, when the user doesn't
+// enter a manual figure. Resistance training with typical rest periods between sets averages
+// out to roughly 5 METs (vigorous during the working sets, near-zero during rest) — this is a
+// commonly cited blended average for weight-training sessions (ACSM figures put straight lifting
+// at 3.5-6 METs depending on rest length; 5 is a reasonable session-wide midpoint).
+// kcal = METs × 3.5 × weight(kg) / 200 × minutes
+function estimateGymKcal(durationSec, bodyWeightKg) {
+  const minutes = (durationSec||0) / 60;
+  const weight = bodyWeightKg || 75;
+  const METS = 5;
+  return Math.round(METS * 3.5 * weight / 200 * minutes);
+}
+// Normalize an exercise name for matching across sessions (case/whitespace/accent insensitive).
+const normExName = s => (s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/\s+/g," ").trim();
+// Find the most recent completed performance of a named exercise across past sessions.
+// Returns {date, weight, unit, sets:[{reps}]} or null if never logged before.
+function getLastPerformance(exerciseName, gymSessions) {
+  const nl = normExName(exerciseName);
+  if (!nl || !gymSessions?.length) return null;
+  // Sessions are stored newest-first (unshifted on save)
+  for (const sess of gymSessions) {
+    for (const combo of (sess.combos||[])) {
+      for (const ex of (combo.exercises||[])) {
+        if (normExName(ex.name) === nl && ex.sets?.length) {
+          return {date: sess.date, weight: ex.weight, unit: ex.unit||"kg", sets: ex.sets};
+        }
+      }
+    }
+  }
+  return null;
+}
+// Simple heuristic progression suggestion (no AI call — instant, local).
+// Progressive overload: if the last 2 sessions both show the top set at >= a solid rep count
+// (>=10) across all sets at the same weight, suggest a small increase. Otherwise hold steady.
+function suggestProgression(exerciseName, gymSessions, method) {
+  if (method !== "progressive_overload") return null;
+  const nl = normExName(exerciseName);
+  if (!nl || !gymSessions?.length) return null;
+  const recent = [];
+  for (const sess of gymSessions) {
+    for (const combo of (sess.combos||[])) {
+      for (const ex of (combo.exercises||[])) {
+        if (normExName(ex.name) === nl && ex.sets?.length) { recent.push({date:sess.date, weight:ex.weight, sets:ex.sets}); }
+      }
+    }
+    if (recent.length >= 2) break;
+  }
+  if (recent.length < 2) return null;
+  const [last, prev] = recent;
+  const lastAllStrong = last.sets.every(s => (s.reps||0) >= 10);
+  const sameWeight = last.weight === prev.weight;
+  if (lastAllStrong && sameWeight) {
+    const step = last.weight >= 30 ? 2.5 : last.weight >= 10 ? 1.25 : 0.5;
+    return `Last 2 sessions all cleared 10+ reps at ${last.weight}kg — try ${(last.weight+step).toFixed(2).replace(/\.?0+$/,"")}kg next time.`;
+  }
+  return null;
+}
+// Alternatives for the "swap this exercise" feature — same muscle group, excluding itself,
+// sorted with custom (user-added) exercises first since those are most likely relevant.
+function findAlternatives(muscleGroup, exerciseLibrary, excludeName) {
+  const nl = normExName(excludeName);
+  return (exerciseLibrary||[])
+    .filter(e => e.muscleGroup === muscleGroup && normExName(e.name) !== nl)
+    .sort((a,b) => (b.custom?1:0)-(a.custom?1:0));
+}
 const DEFAULT_PROFILE = {
   name:"", birthday:"", heightCm:null, sex:"male",
   activityLevel:"light", goal:"cut", targetWeightKg:null, goalNote:"",
@@ -511,7 +684,8 @@ async function aPrep(imgs, ps, desc, apiKey) {
     { type:"text", text:"You are analyzing photos of a meal prep build.\n"
       + "PHOTO TYPES YOU MAY SEE:\n"
       + "  • SCALE PHOTO — a kitchen scale display showing a gram number. The number on the display IS THE EXACT WEIGHT THE USER ACTUALLY USED. The scale is zeroed between ingredients.\n"
-      + "  • PACKAGE PHOTO — a product label/wrapper, used ONLY to identify what the ingredient is.\n"
+      + "  • PACKAGE PHOTO (no scale visible) — a product label/wrapper on its own, with NO scale reading anywhere in that photo. This is STILL A SEPARATE INGREDIENT the user is using — do NOT treat it as identification-only or skip it. See rule 1 below for how to handle its weight.\n"
+      + "  • PACKAGE + SCALE TOGETHER — a label photo that also shows a scale reading (either in the same shot or the very next photo of the same item). Use the scale reading as weightG and the package to identify the product.\n"
       + "  • FINISHED CONTAINER — context only, NOT a separate ingredient.\n"
       + (desc ? "Description: " + desc + "\n" : "")
       + "Known products per 100g: " + pCtx(ps) + "\n\n"
@@ -527,15 +701,15 @@ async function aPrep(imgs, ps, desc, apiKey) {
       + "🚫 ABSOLUTELY FORBIDDEN: setting weightG to 100 as a guess; identical round numbers across multiple ingredients; concatenating ghost digits with the real reading.\n\n"
       + "OTHER WEIGHT RULES:\n"
       + "  • Each scale photo = one ingredient. The scale is zeroed between ingredients.\n"
-      + "  • If you genuinely cannot read the bright digits, set 'weightUncertain': true and estimate from visible portion — do NOT silently use 100.\n"
-      + "  • PACKAGE WEIGHT (e.g. '180g pack', '450g net weight') = package SIZE, NOT what was used. Don't copy that into weightG when a scale exists.\n"
-      + "  • Use printed package weight as consumed amount only when there's no scale AND it's a single-serve item.\n\n"
+      + "  • If you genuinely cannot read the bright digits on a scale photo, set 'weightUncertain': true and estimate from visible portion — do NOT silently use 100.\n"
+      + "  • PACKAGE WEIGHT PRINTED ON THE LABEL (e.g. '180g pack', '450g net weight', '5 porcijos') = the package SIZE, NOT what was used. Never copy that number into weightG.\n"
+      + "  • Use printed package weight as consumed amount only when the item is explicitly a single-serve item eaten whole with no scale (e.g. one protein bar).\n\n"
       + "OTHER RULES:\n"
-      + "1. List EVERY ingredient that appears on a scale across ALL " + c.length + " photos. You may have up to 15 ingredients — count them carefully. Small additions like syrups, oils, sweeteners, nuts, seeds, sauces still count. Do not skip any.\n"
+      + "1. List EVERY ingredient shown across ALL " + c.length + " photos — this means BOTH scale-photographed ingredients AND package-only photos with no scale reading. Never silently omit an ingredient just because its photo has no scale in it. For a package-only item: (a) if the description mentions a weight/amount for it (e.g. \"200g pasta\"), use that as weightG; (b) otherwise set weightG to a single reasonable serving-size estimate for that product type (not 0) AND set 'weightUncertain': true so the user sees it needs verifying — this way the item still appears in the list with editable macros instead of vanishing. You may have up to 15 ingredients — count them carefully. Small additions like syrups, oils, sweeteners, nuts, seeds, sauces still count.\n"
       + "2. The kcal/protein/carbs/fat fields you return MUST be PER-100g reference values for that ingredient (NOT per-serving, NOT scaled to the weight). If you matched a known product, copy its per-100g values exactly.\n"
       + "3. totalKcal/totalProtein/totalCarbs/totalFat at the top level ARE the meal totals (already scaled): sum of (per-100g × weightG / 100) across all ingredients.\n"
       + "4. estimatedWeightG = sum of all ingredient weightG.\n"
-      + "5. For each ingredient, include a '_scaleRead' field with the literal digits you saw bright on the scale (e.g. '47', '6', '108') — this helps the user verify.\n"
+      + "5. For each ingredient FROM A SCALE PHOTO, include a '_scaleRead' field with the literal digits you saw bright on the scale (e.g. '47', '6', '108'). For a package-only ingredient with no scale, omit _scaleRead or leave it empty — do not invent a scale reading that was never shown.\n"
       + "6. CRITICAL — raw vs cooked, generic vs branded: if the description or photo says 'raw' (e.g. 'raw chicken breast'), use the RAW reference value below — do NOT substitute a cooked or breaded branded product even if its name overlaps. The cooking state the user specifies always wins over name similarity to a known product.\n"
       + "   Generic reference per-100g (use when not clearly a specific known branded product):\n"
       + "   • Raw chicken breast (skinless): ~110-120 kcal, 22-23g P, 0g C, 1.5-2.5g F\n"
@@ -544,9 +718,11 @@ async function aPrep(imgs, ps, desc, apiKey) {
       + "   • Raw salmon fillet: ~180-210 kcal, 20g P, 0g C, 11-13g F\n"
       + "   • Raw white fish (cod/hake/pollock): ~75-90 kcal, 17-18g P, 0g C, 0.5-1g F\n"
       + "   • Dry white/long-grain rice: ~345-360 kcal, 7-8g P, 76-79g C, 0.5-1g F\n"
+      + "   • Dry pasta (any shape): ~350-360 kcal, 12-13g P, 70-72g C, 1.5-2.5g F\n"
+      + "   • Tomato-based pasta sauce (jarred): ~35-55 kcal, 1-2g P, 6-9g C, 0.5-2g F\n"
       + "   • Raw whole eggs (shelled): ~143-155 kcal, 12-13g P, 0.5-1g C, 9.5-11g F\n\n"
       + "Reply ONLY with JSON, no explanation:\n"
-      + '{"totalKcal":0,"totalProtein":0,"totalCarbs":0,"totalFat":0,"estimatedWeightG":0,"notes":"","ingredients":[{"name":"","weightG":0,"_scaleRead":"","kcal":0,"protein":0,"carbs":0,"fat":0}]}' },
+      + '{"totalKcal":0,"totalProtein":0,"totalCarbs":0,"totalFat":0,"estimatedWeightG":0,"notes":"","ingredients":[{"name":"","weightG":0,"_scaleRead":"","weightUncertain":false,"kcal":0,"protein":0,"carbs":0,"fat":0}]}' },
     ...iBlks(c),
   ], apiKey, VISION_MODEL, 2500);
 }
@@ -626,6 +802,52 @@ async function aLabel(imgs, apiKey) {
       + '{"name":"","kcal":0,"p":0,"c":0,"f":0,"subtitle":""}' },
     ...iBlks(c),
   ], apiKey, VISION_MODEL, 600);
+}
+
+// Parse a pasted recipe text and/or photo(s) of a recipe (cookbook page, screenshot, note)
+// into structured ingredients + instructions. Used by the "auto-fill" flow in RecipeEditSheet.
+async function aParseRecipe(text, imgs, apiKey) {
+  const hasImgs = imgs && imgs.length>0;
+  const c = hasImgs ? await prepImgs(imgs.slice(0,3)) : [];
+  const prompt = "Extract a structured recipe from the following" + (hasImgs?" photo(s)":"") + (text?.trim()?" and text":"") + ".\n\n"
+    + (text?.trim() ? "TEXT:\n" + text.trim() + "\n\n" : "")
+    + "Return:\n"
+    + "  • name: the recipe's name/title if identifiable, else a short descriptive name based on the main dish\n"
+    + "  • category: one of breakfast, main, dessert, snack, drink — best fit\n"
+    + "  • ingredients: array of short lines, one per ingredient, keeping quantities as written (e.g. '200g flour', '2 large eggs', 'a pinch of salt')\n"
+    + "  • instructions: array of clear numbered steps IN ORDER. Split run-on paragraphs into separate logical steps. For any step that explicitly requires waiting/baking/resting/chilling for a specific duration, set timerMin to that duration in minutes (integer); otherwise timerMin: null.\n\n"
+    + "Reply ONLY with JSON, no explanation:\n"
+    + '{"name":"","category":"main","ingredients":[{"text":""}],"instructions":[{"text":"","timerMin":null}]}';
+  return callAI([{ type:"text", text:prompt }, ...iBlks(c)], apiKey, hasImgs?VISION_MODEL:TEXT_MODEL, 2000);
+}
+
+// Generate a brand-new recipe from a description, optionally constrained to the user's own
+// pantry (product labels) and/or a nutritional focus. Used by the "Suggest a Recipe" flow.
+async function aGenerateRecipe({description, fromPantry, focus, products, profile}, apiKey) {
+  let prompt = "Generate a complete, realistic, cookable recipe based on this request: \"" + (description||"a tasty meal").trim() + "\"\n\n";
+  if (fromPantry && (products||[]).length) {
+    prompt += "CONSTRAINT: Use ONLY ingredients from this list of products the user already has (with per-100g macros for reference — you don't need to use all of them, just don't introduce ingredients outside this list, common staples like water/salt/pepper/oil are OK if needed):\n"
+      + pCtx(products) + "\n\n";
+  } else {
+    prompt += "You may use any common, realistically available ingredients.\n\n";
+  }
+  const focusText = {
+    high_protein: "Prioritize a high-protein result — favor lean proteins and generous protein-dense ingredients.",
+    high_carb: "Prioritize a high-carb result — good for pre-workout fueling or a bulk.",
+    low_cal: "Keep it lower-calorie and cutting-friendly — lean ingredients, controlled portions, minimal added fats/sugars.",
+    high_cal: "Make it calorie-dense and bulking-friendly — don't shy away from healthy fats and larger portions.",
+    balanced: "Keep macros reasonably balanced — no strong bias toward any one macro.",
+  }[focus] || "Keep macros reasonably balanced.";
+  prompt += "NUTRITIONAL FOCUS: " + focusText + "\n";
+  if (profile?.goal) prompt += "Context: the user is currently in a \"" + profile.goal + "\" phase.\n";
+  prompt += "\nReturn:\n"
+    + "  • name: a natural, appetizing recipe name\n"
+    + "  • category: one of breakfast, main, dessert, snack, drink — best fit\n"
+    + "  • ingredients: array of short lines with realistic quantities (e.g. '200g chicken breast', '1 tbsp olive oil')\n"
+    + "  • instructions: array of clear numbered steps IN ORDER, each a single actionable instruction. For any step requiring waiting/baking/resting/chilling for a specific duration, set timerMin to that duration in minutes (integer); otherwise timerMin: null.\n\n"
+    + "Reply ONLY with JSON, no explanation:\n"
+    + '{"name":"","category":"main","ingredients":[{"text":""}],"instructions":[{"text":"","timerMin":null}]}';
+  return callAI([{ type:"text", text:prompt }], apiKey, TEXT_MODEL, 2000);
 }
 
 async function aAnalysis(imgs, profile, weight, trend, apiKey) {
@@ -734,6 +956,8 @@ function Sheet({onClose,title,children}){
 }
 function MacroFields({form,setForm}){
   const f=k=>v=>setForm(p=>({...p,[k]:v}));
+  // Sanity check: kcal should roughly equal P×4 + C×4 + F×9. If it's way off, the AI or
+  // the user likely misread a label digit (e.g. PROPUD fat 22 read as 2.2).
   const macroCheck=(()=>{
     const k=parseFloat(form.kcal)||0,p=parseFloat(form.protein)||0,c=parseFloat(form.carbs)||0,fv=parseFloat(form.fat)||0;
     if(k<30||(p+c+fv)<3)return null;
@@ -833,16 +1057,29 @@ const STOP_WORDS = new Set([
   "frozen","fresh","raw","cooked","natural","organic","light","skinless","sliced","whole","reduced",
   "free","with","and","the","plain","style","mix","ice","cream","sour","mild","spicy","grilled","baked",
   "lean","brand","new","of","for","large","small","medium","extra",
+  // Cut/texture modifiers — describe HOW the food is prepared, not WHAT it is. Without these,
+  // words like "chopped" scored as full-weight distinguishing terms, letting e.g. "Red Onion
+  // (chopped)" match "Red Cabbage ... Chopped" purely on the shared prep-style word.
+  "chopped","diced","grated","shredded","crushed","cubed","minced","julienned","halved","quartered",
+  // Colors — weak descriptors, not food-identifying nouns. Without these, "Red Onion" vs
+  // "Red Cabbage" scored a false match purely on the shared color word.
+  "red","white","green","yellow","black","purple","orange","brown","pink",
   // Brand names from this user's product set
   "lidl","pilos","kania","kikkoman","nixe","crownfield","insanefits","julian","bakery","barebells",
   "propud","prowhey","hellmann","hellmanns","kedainiu","baresa","pikon","della","sante","freshona",
-  "rimi","malsena","fitspo","selected","vemondo","bio",
+  "rimi","malsena","fitspo","selected","vemondo","bio","milbona",
 ]);
 // Preparation-state words: when ONE name has these but the other doesn't, the foods are
 // different products (e.g. "minced chicken" ≠ "breaded chicken"). Strong score penalty.
 const PREP_WORDS = new Set([
   "breaded","minced","ground","raw","cooked","fried","grilled","baked","smoked","marinated",
   "pickled","cured","boiled","steamed","roasted","mashed","crispy","crunchy","dried",
+]);
+// Product-form words: signal a processed derivative rather than the whole/raw food itself.
+// e.g. "cherry tomatoes" (whole fruit) should never match "tomato sauce" (processed derivative)
+// just because "tomato" overlaps — the form mismatch is the stronger signal here.
+const FORM_WORDS = new Set([
+  "sauce","juice","paste","puree","soup","syrup","jam","dressing","pudding","dessert","concentrate","broth","stock",
 ]);
 // Strip parens, punctuation, accents — produce comparable tokens
 const normName = s => (s||"").toLowerCase()
@@ -926,6 +1163,15 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
       } else if (ingPrep.length > 0 || prodPrep.length > 0) {
         const prepOverlap = ingPrep.filter(w => prodPrep.includes(w)).length;
         if (prepOverlap === 0) score -= 30;
+      }
+      // Form mismatch penalty: whole/raw food vs a processed derivative (sauce, puree, pudding,
+      // jam, etc). "Cherry Tomatoes" and "Tomato Sauce" share the noun "tomato" but are not
+      // interchangeable — one is fresh produce, the other a cooked/processed product with very
+      // different macros. If exactly one side names a form word the other lacks, disqualify.
+      const ingForm = ingToks.filter(w => FORM_WORDS.has(w));
+      const prodForm = prodToks.filter(w => FORM_WORDS.has(w));
+      if ((ingForm.length > 0) !== (prodForm.length > 0)) {
+        score -= 180;
       }
       if (score > bestScore) { bestScore = score; best = p; }
     }
@@ -1298,6 +1544,7 @@ function AddIngredientRow({onAdd,products}) {
 }
 
 
+// ── PrepEatPanel — gram-based, multi-prep combine ─────────────────────────────
 function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,apiKey}) {
   const [selected,setSelected]=useState({}); // {prepId: gramsString}
   // portionMode tracks whether each selected prep is in "g" or "portions" input mode
@@ -2169,13 +2416,652 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
 }
 
 // ── Activity Tab ──────────────────────────────────────────────────────────────
-function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases,setWeightPhases}){
+// ── Gym Template Editor ────────────────────────────────────────────────────────
+// Edits the exercise plan for one weekday: an optional warmup default + an ordered list of
+// combos (supersets — exercises done back-to-back). Templates are a starting point only —
+// fully editable live during a session too, so nothing here is locked in.
+function GymTemplateEditor({weekday, template, setTemplate, gymExerciseLibrary, setGymExerciseLibrary, onClose}){
+  const t = template || {warmup:null, cooldown:null, combos:[]};
+  const [warmupOn, setWarmupOn] = useState(!!t.warmup);
+  const [warmupType, setWarmupType] = useState(t.warmup?.type||"treadmill");
+  const [warmupFields, setWarmupFields] = useState(t.warmup?.fields||{});
+  const [warmupNotes, setWarmupNotes] = useState(t.warmup?.notes||"");
+  const [cooldownOn, setCooldownOn] = useState(!!t.cooldown);
+  const [cooldownType, setCooldownType] = useState(t.cooldown?.type||"other");
+  const [cooldownFields, setCooldownFields] = useState(t.cooldown?.fields||{});
+  const [cooldownNotes, setCooldownNotes] = useState(t.cooldown?.notes||"");
+  const [combos, setCombos] = useState(t.combos?.length ? t.combos : [{id:Date.now(),exercises:[]}]);
+  const [pickerOpen, setPickerOpen] = useState(null); // comboId currently showing the add-exercise picker
+  const [pickerSearch, setPickerSearch] = useState("");
+  const [newExCat, setNewExCat] = useState("Push");
+  const [newExMuscle, setNewExMuscle] = useState("Chest");
+  const [editingNoteFor, setEditingNoteFor] = useState(null); // exercise id currently editing its note
+  const [noteDraft, setNoteDraft] = useState("");
+  const [swapOpenFor, setSwapOpenFor] = useState(null); // exercise id currently showing swap alternatives
+  const warmupMachine = CARDIO_MACHINES.find(m=>m.id===warmupType)||CARDIO_MACHINES[0];
+  const cooldownMachine = CARDIO_MACHINES.find(m=>m.id===cooldownType)||CARDIO_MACHINES[CARDIO_MACHINES.length-1];
+
+  const libFor = name => (gymExerciseLibrary||[]).find(e=>normExName(e.name)===normExName(name));
+
+  const addExerciseFromLib = (comboId, libEx) => {
+    setCombos(p => p.map(c => c.id===comboId ? {...c, exercises:[...c.exercises,{id:Date.now()+Math.random(),name:libEx.name,type:"weighted"}]} : c));
+    setPickerOpen(null); setPickerSearch("");
+  };
+  const addNewCustomExercise = (comboId) => {
+    const name = pickerSearch.trim();
+    if (!name) return;
+    const newLibEx = {id:normExName(name)+Date.now(), name, category:newExCat, muscleGroup:newExMuscle, note:"", custom:true};
+    setGymExerciseLibrary(prev => [...(prev||[]), newLibEx]);
+    addExerciseFromLib(comboId, newLibEx);
+  };
+  const removeExercise = (comboId, exId) => setCombos(p => p.map(c => c.id===comboId ? {...c, exercises:c.exercises.filter(e=>e.id!==exId)} : c));
+  const moveExercise = (comboId, idx, dir) => setCombos(p => p.map(c => {
+    if (c.id!==comboId) return c;
+    const arr=[...c.exercises]; const j=idx+dir; if(j<0||j>=arr.length) return c;
+    [arr[idx],arr[j]]=[arr[j],arr[idx]]; return {...c, exercises:arr};
+  }));
+  const addCombo = () => setCombos(p => [...p, {id:Date.now(),exercises:[]}]);
+  const removeCombo = (comboId) => setCombos(p => p.filter(c=>c.id!==comboId));
+  const saveNote = (exId) => {
+    const ex = combos.flatMap(c=>c.exercises).find(e=>e.id===exId);
+    if (!ex) return;
+    setGymExerciseLibrary(prev => {
+      const found = prev.find(e=>normExName(e.name)===normExName(ex.name));
+      if (found) return prev.map(e=>normExName(e.name)===normExName(ex.name)?{...e,note:noteDraft}:e);
+      return [...prev, {id:normExName(ex.name)+Date.now(), name:ex.name, category:"Other", muscleGroup:"Full Body", note:noteDraft, custom:true}];
+    });
+    setEditingNoteFor(null);
+  };
+  const swapExercise = (comboId, exId, alt) => {
+    setCombos(p => p.map(c => c.id===comboId ? {...c, exercises:c.exercises.map(e=>e.id===exId?{...e,name:alt.name}:e)} : c));
+    setSwapOpenFor(null);
+  };
+
+  const save = () => {
+    setTemplate({
+      warmup: warmupOn ? {type:warmupType, fields:warmupFields, notes:warmupNotes} : null,
+      cooldown: cooldownOn ? {type:cooldownType, fields:cooldownFields, notes:cooldownNotes} : null,
+      combos: combos.filter(c=>c.exercises.length>0),
+    });
+    onClose();
+  };
+
+  const filteredLib = (gymExerciseLibrary||[]).filter(e=>!pickerSearch||e.name.toLowerCase().includes(pickerSearch.toLowerCase())).slice(0,20);
+
+  return(<Sheet onClose={onClose} title={`${WEEKDAYS[weekday].full} Plan`}>
+    <div style={{fontSize:11,color:C.muted,marginBottom:12,lineHeight:1.4}}>This is your starting point for {WEEKDAYS[weekday].full}s — you can still add, remove, or change anything live during the session.</div>
+
+    {/* Warmup */}
+    <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"11px 14px",marginBottom:9}}>
+      <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginBottom:warmupOn?10:0}}>
+        <input type="checkbox" checked={warmupOn} onChange={e=>setWarmupOn(e.target.checked)} style={{accentColor:C.lime,cursor:"pointer"}}/>
+        <span style={{fontSize:13,fontWeight:600,color:C.text}}>🔥 Include warmup</span>
+      </label>
+      {warmupOn&&(<>
+        <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:9}}>{CARDIO_MACHINES.map(m=>(<button key={m.id} onClick={()=>setWarmupType(m.id)} style={{padding:"6px 10px",borderRadius:8,border:`1px solid ${warmupType===m.id?C.orange:C.border}`,background:warmupType===m.id?`${C.orange}18`:C.bg,color:warmupType===m.id?C.orange:C.muted,cursor:"pointer",fontSize:11,fontWeight:warmupType===m.id?600:400}}>{m.emoji} {m.label}</button>))}</div>
+        {warmupMachine.fields.length>0&&<div style={{display:"grid",gridTemplateColumns:warmupMachine.fields.length===3?"1fr 1fr 1fr":"1fr 1fr",gap:8,marginBottom:9}}>
+          {warmupMachine.fields.map(f=>(<Field key={f} label={f==="distanceKm"?"Distance km":f==="incline"?"Incline":f==="speed"?"Speed":f==="resistance"?"Resistance":"Level"} value={warmupFields[f]||""} onChange={v=>setWarmupFields(p=>({...p,[f]:v}))} placeholder="—"/>))}
+        </div>}
+        <Field label="Notes (optional)" value={warmupNotes} onChange={setWarmupNotes} placeholder={warmupType==="other"?"e.g. mobility drills, foam rolling":"e.g. easy pace to warm up"}/>
+      </>)}
+    </div>
+
+    {/* Cooldown */}
+    <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"11px 14px",marginBottom:12}}>
+      <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginBottom:cooldownOn?10:0}}>
+        <input type="checkbox" checked={cooldownOn} onChange={e=>setCooldownOn(e.target.checked)} style={{accentColor:C.blue,cursor:"pointer"}}/>
+        <span style={{fontSize:13,fontWeight:600,color:C.text}}>❄️ Include cooldown</span>
+      </label>
+      {cooldownOn&&(<>
+        <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:9}}>{CARDIO_MACHINES.map(m=>(<button key={m.id} onClick={()=>setCooldownType(m.id)} style={{padding:"6px 10px",borderRadius:8,border:`1px solid ${cooldownType===m.id?C.blue:C.border}`,background:cooldownType===m.id?`${C.blue}18`:C.bg,color:cooldownType===m.id?C.blue:C.muted,cursor:"pointer",fontSize:11,fontWeight:cooldownType===m.id?600:400}}>{m.emoji} {m.label}</button>))}</div>
+        {cooldownMachine.fields.length>0&&<div style={{display:"grid",gridTemplateColumns:cooldownMachine.fields.length===3?"1fr 1fr 1fr":"1fr 1fr",gap:8,marginBottom:9}}>
+          {cooldownMachine.fields.map(f=>(<Field key={f} label={f==="distanceKm"?"Distance km":f==="incline"?"Incline":f==="speed"?"Speed":f==="resistance"?"Resistance":"Level"} value={cooldownFields[f]||""} onChange={v=>setCooldownFields(p=>({...p,[f]:v}))} placeholder="—"/>))}
+        </div>}
+        <Field label="Notes (optional)" value={cooldownNotes} onChange={setCooldownNotes} placeholder="e.g. static stretching, easy walk to bring heart rate down"/>
+      </>)}
+    </div>
+
+    {combos.map((combo,ci)=>(
+      <div key={combo.id} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"11px 14px",marginBottom:9}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+          <span style={{fontSize:12,fontWeight:700,color:C.orange}}>Combo {ci+1}{combo.exercises.length>1?` (${combo.exercises.length} exercises)`:""}</span>
+          <button onClick={()=>removeCombo(combo.id)} style={{background:"none",border:"none",color:C.faint,fontSize:14,cursor:"pointer"}}>✕ remove</button>
+        </div>
+        {combo.exercises.map((ex,ei)=>{
+          const lib = libFor(ex.name);
+          return(<div key={ex.id} style={{background:C.bg,borderRadius:7,padding:"7px 9px",marginBottom:5}}>
+            <div style={{display:"flex",alignItems:"center",gap:6}}>
+              <div style={{flex:1,minWidth:0}}>
+                <span style={{fontSize:12,color:C.text,display:"block",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ex.name}</span>
+                {lib&&<span style={{fontSize:9,color:C.muted}}>{lib.category} · {lib.muscleGroup}</span>}
+              </div>
+              <button onClick={()=>moveExercise(combo.id,ei,-1)} disabled={ei===0} style={{background:"none",border:"none",color:ei===0?C.faint:C.muted,cursor:ei===0?"default":"pointer",fontSize:12,padding:"0 3px"}}>▲</button>
+              <button onClick={()=>moveExercise(combo.id,ei,1)} disabled={ei===combo.exercises.length-1} style={{background:"none",border:"none",color:ei===combo.exercises.length-1?C.faint:C.muted,cursor:ei===combo.exercises.length-1?"default":"pointer",fontSize:12,padding:"0 3px"}}>▼</button>
+              <button onClick={()=>removeExercise(combo.id,ex.id)} style={{background:"none",border:"none",color:C.faint,fontSize:15,cursor:"pointer",padding:"0 2px"}}>×</button>
+            </div>
+            {editingNoteFor===ex.id ? (
+              <div style={{display:"flex",gap:5,marginTop:6}}>
+                <input value={noteDraft} onChange={e=>setNoteDraft(e.target.value)} placeholder="e.g. seat position 5" autoFocus style={{flex:1,boxSizing:"border-box",background:C.card,border:`1px solid ${C.lime}`,borderRadius:6,padding:"5px 8px",color:C.text,fontSize:11,outline:"none"}}/>
+                <button onClick={()=>saveNote(ex.id)} style={{padding:"5px 9px",borderRadius:6,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>✓</button>
+              </div>
+            ) : (
+              <div style={{display:"flex",alignItems:"center",gap:8,marginTop:5,flexWrap:"wrap"}}>
+                {lib?.note&&<span style={{fontSize:10,color:C.yellow,fontStyle:"italic"}}>📌 {lib.note}</span>}
+                <button onClick={()=>{setEditingNoteFor(ex.id);setNoteDraft(lib?.note||"");}} style={{fontSize:9.5,color:C.muted,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>{lib?.note?"edit note":"+ add note"}</button>
+                {lib&&<button onClick={()=>setSwapOpenFor(swapOpenFor===ex.id?null:ex.id)} style={{fontSize:9.5,color:C.blue,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>⇄ swap</button>}
+              </div>
+            )}
+            {swapOpenFor===ex.id&&lib&&(()=>{
+              const alts = findAlternatives(lib.muscleGroup, gymExerciseLibrary, ex.name);
+              return(<div style={{marginTop:6,background:C.card,border:`1px solid ${C.blue}40`,borderRadius:7,padding:"7px 9px"}}>
+                <div style={{fontSize:9.5,color:C.muted,marginBottom:5}}>Same muscle group ({lib.muscleGroup}):</div>
+                {alts.length===0&&<div style={{fontSize:10.5,color:C.muted}}>No alternatives found for this muscle group yet.</div>}
+                <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{alts.map(a=>(<button key={a.name} onClick={()=>swapExercise(combo.id,ex.id,a)} style={{padding:"4px 9px",borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,color:C.text,cursor:"pointer",fontSize:10.5}}>{a.name}</button>))}</div>
+              </div>);
+            })()}
+          </div>);
+        })}
+        {pickerOpen===combo.id ? (
+          <div style={{background:C.bg,border:`1px dashed ${C.border}`,borderRadius:8,padding:"8px 10px",marginTop:6}}>
+            <input value={pickerSearch} onChange={e=>setPickerSearch(e.target.value)} placeholder="Search or type new exercise…" autoFocus style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 9px",color:C.text,fontSize:12,outline:"none",marginBottom:7}}/>
+            <div style={{display:"flex",flexDirection:"column",gap:4,maxHeight:160,overflowY:"auto",marginBottom:7}}>
+              {filteredLib.map(libEx=>(<button key={libEx.id} onClick={()=>addExerciseFromLib(combo.id,libEx)} style={{padding:"6px 9px",borderRadius:6,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between"}}>
+                <span style={{fontSize:11.5,color:C.text}}>{libEx.name}</span><span style={{fontSize:9.5,color:C.muted}}>{libEx.muscleGroup}</span>
+              </button>))}
+              {filteredLib.length===0&&<div style={{fontSize:10.5,color:C.muted,padding:"3px 0"}}>No matches — add it as new below.</div>}
+            </div>
+            {pickerSearch.trim()&&!filteredLib.some(e=>normExName(e.name)===normExName(pickerSearch))&&(<div style={{borderTop:`1px dashed ${C.border}`,paddingTop:8}}>
+              <div style={{fontSize:10,color:C.muted,marginBottom:6}}>+ Add "{pickerSearch.trim()}" as a new exercise:</div>
+              <div style={{display:"flex",gap:5,marginBottom:6,flexWrap:"wrap"}}>{EXERCISE_CATEGORIES.map(c=>(<button key={c} onClick={()=>setNewExCat(c)} style={{padding:"3px 8px",borderRadius:10,border:`1px solid ${newExCat===c?C.orange:C.border}`,background:newExCat===c?`${C.orange}18`:C.card,color:newExCat===c?C.orange:C.muted,cursor:"pointer",fontSize:10}}>{c}</button>))}</div>
+              <div style={{display:"flex",gap:5,marginBottom:8,flexWrap:"wrap"}}>{MUSCLE_GROUPS.map(m=>(<button key={m} onClick={()=>setNewExMuscle(m)} style={{padding:"3px 8px",borderRadius:10,border:`1px solid ${newExMuscle===m?C.blue:C.border}`,background:newExMuscle===m?`${C.blue}18`:C.card,color:newExMuscle===m?C.blue:C.muted,cursor:"pointer",fontSize:10}}>{m}</button>))}</div>
+              <button onClick={()=>addNewCustomExercise(combo.id)} style={{width:"100%",padding:"7px 0",borderRadius:6,background:C.orange,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>+ Add to Combo</button>
+            </div>)}
+            <button onClick={()=>{setPickerOpen(null);setPickerSearch("");}} style={{width:"100%",padding:"6px 0",marginTop:7,background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:10.5}}>Cancel</button>
+          </div>
+        ) : (
+          <button onClick={()=>{setPickerOpen(combo.id);setPickerSearch("");}} style={{width:"100%",padding:"7px 0",borderRadius:7,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11.5,marginTop:6}}>+ Add exercise</button>
+        )}
+      </div>
+    ))}
+    <button onClick={addCombo} style={{width:"100%",padding:"10px 0",borderRadius:10,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12,marginBottom:14}}>+ New Combo</button>
+    <div style={{display:"flex",gap:8}}>
+      <button onClick={onClose} style={{flex:1,padding:"11px 0",borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer"}}>Cancel</button>
+      <button onClick={save} style={{flex:2,padding:"11px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14}}>Save Plan</button>
+    </div>
+  </Sheet>);
+}
+
+// ── Gym Session Panel (live tracker) ───────────────────────────────────────────
+// Drives one active gym session end-to-end: warmup → combos (round-by-round, with an
+// auto rest timer between rounds) → finish (kcal entry/estimate → feeds into daily target).
+function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestWeight, gymExerciseLibrary, setGymExerciseLibrary, onFinish, onCancel}){
+  const [restElapsed, setRestElapsed] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
+  const [showFinish, setShowFinish] = useState(false);
+  const [finishKcal, setFinishKcal] = useState("");
+  const [addExMode, setAddExMode] = useState(false);
+  const [newExName, setNewExName] = useState("");
+  const [swapOpenFor, setSwapOpenFor] = useState(null); // exercise id showing swap alternatives
+
+  useEffect(() => {
+    if (showFinish) return; // frozen once Finish is tapped — don't keep ticking while confirming
+    const id = setInterval(() => setElapsed(Math.floor((Date.now()-session.startedAt)/1000)), 1000);
+    return () => clearInterval(id);
+  }, [session.startedAt, showFinish]);
+  useEffect(() => {
+    if (!session.resting) { setRestElapsed(0); return; }
+    const tick = () => setRestElapsed(Math.floor((Date.now()-session.restStartedAt)/1000));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [session.resting, session.restStartedAt]);
+
+  const fmtTime = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
+  const update = fn => setSession(prev => fn({...prev}));
+  const libFor = name => (gymExerciseLibrary||[]).find(e=>normExName(e.name)===normExName(name));
+
+  // Route "done with lifting" through cooldown if the plan has one and it isn't done yet;
+  // otherwise go straight to the finish confirmation.
+  const goToFinishOrCooldown = () => {
+    if (session.cooldown && !session.cooldown.done) {
+      update(s=>({...s, cooldownStarted:true}));
+    } else {
+      setElapsed(Math.floor((Date.now()-session.startedAt)/1000));
+      setShowFinish(true);
+    }
+  };
+  const goToFinish = () => { setElapsed(Math.floor((Date.now()-session.startedAt)/1000)); setShowFinish(true); };
+
+  // ── Warmup step ──
+  if (session.warmup && !session.warmup.done) {
+    const machine = CARDIO_MACHINES.find(m=>m.id===session.warmup.type)||CARDIO_MACHINES[0];
+    const fields = session.warmup.fields||{};
+    return(<div style={{background:C.card,border:`1px solid ${C.orange}`,borderRadius:14,padding:"16px 18px",marginBottom:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+        <span style={{fontSize:13,fontWeight:700,color:C.orange}}>{machine.emoji} Warmup</span>
+        <span style={{fontFamily:"monospace",fontSize:12,color:C.muted}}>{fmtTime(elapsed)}</span>
+      </div>
+      {machine.fields.length>0?(<div style={{display:"grid",gridTemplateColumns:machine.fields.length===3?"1fr 1fr 1fr":"1fr 1fr",gap:8,marginBottom:9}}>
+        {machine.fields.map(f=>(<Field key={f} label={f==="distanceKm"?"Distance km":f==="incline"?"Incline":f==="speed"?"Speed":f==="resistance"?"Resistance":"Level"} value={fields[f]||""} onChange={v=>update(s=>({...s,warmup:{...s.warmup,fields:{...s.warmup.fields,[f]:v}}}))} placeholder="—"/>))}
+      </div>):(
+        <textarea value={session.warmup.notes||""} onChange={e=>update(s=>({...s,warmup:{...s.warmup,notes:e.target.value}}))} placeholder="Describe your warmup…" rows={2} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:13,outline:"none",resize:"none",fontFamily:"inherit",marginBottom:9}}/>
+      )}
+      <button onClick={()=>update(s=>({...s,warmup:{...s.warmup,done:true}}))} style={{width:"100%",padding:"11px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14}}>✓ Finish Warmup</button>
+      <button onClick={onCancel} style={{width:"100%",padding:"8px 0",marginTop:8,background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:11}}>Cancel session</button>
+    </div>);
+  }
+
+  // ── Cooldown step ──
+  if (session.cooldownStarted && session.cooldown && !session.cooldown.done) {
+    const machine = CARDIO_MACHINES.find(m=>m.id===session.cooldown.type)||CARDIO_MACHINES[CARDIO_MACHINES.length-1];
+    const fields = session.cooldown.fields||{};
+    return(<div style={{background:C.card,border:`1px solid ${C.blue}`,borderRadius:14,padding:"16px 18px",marginBottom:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+        <span style={{fontSize:13,fontWeight:700,color:C.blue}}>{machine.emoji} Cooldown</span>
+        <span style={{fontFamily:"monospace",fontSize:12,color:C.muted}}>{fmtTime(elapsed)}</span>
+      </div>
+      {machine.fields.length>0?(<div style={{display:"grid",gridTemplateColumns:machine.fields.length===3?"1fr 1fr 1fr":"1fr 1fr",gap:8,marginBottom:9}}>
+        {machine.fields.map(f=>(<Field key={f} label={f==="distanceKm"?"Distance km":f==="incline"?"Incline":f==="speed"?"Speed":f==="resistance"?"Resistance":"Level"} value={fields[f]||""} onChange={v=>update(s=>({...s,cooldown:{...s.cooldown,fields:{...s.cooldown.fields,[f]:v}}}))} placeholder="—"/>))}
+      </div>):(
+        <textarea value={session.cooldown.notes||""} onChange={e=>update(s=>({...s,cooldown:{...s.cooldown,notes:e.target.value}}))} placeholder="Describe your cooldown…" rows={2} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:13,outline:"none",resize:"none",fontFamily:"inherit",marginBottom:9}}/>
+      )}
+      <button onClick={()=>{update(s=>({...s,cooldown:{...s.cooldown,done:true}}));goToFinish();}} style={{width:"100%",padding:"11px 0",borderRadius:10,background:C.blue,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14}}>✓ Finish Cooldown</button>
+      <button onClick={goToFinish} style={{width:"100%",padding:"8px 0",marginTop:8,background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:11}}>Skip cooldown</button>
+    </div>);
+  }
+
+  const combo = session.combos[session.currentComboIdx];
+  const isLastCombo = session.currentComboIdx >= session.combos.length-1;
+  const atRoundStart = session.currentExInRound === 0;
+
+  // ── Finish confirmation ──
+  if (showFinish) {
+    const est = estimateGymKcal(elapsed, latestWeight);
+    return(<div style={{background:C.card,border:`1px solid ${C.lime}`,borderRadius:14,padding:"16px 18px",marginBottom:14}}>
+      <div style={{fontSize:14,fontWeight:700,color:C.lime,marginBottom:10}}>🏁 Finish Session</div>
+      <div style={{fontSize:12,color:C.muted,marginBottom:10}}>Duration: <span style={{color:C.text,fontFamily:"monospace",fontWeight:700}}>{fmtTime(elapsed)}</span></div>
+      <Field label="Active kcal burned (optional)" value={finishKcal} onChange={setFinishKcal} type="number" placeholder={String(est)}/>
+      <div style={{fontSize:10,color:C.muted,marginTop:5,marginBottom:12}}>{finishKcal?"Using your entry.":`No entry — will use estimate: ~${est} kcal`}</div>
+      <div style={{display:"flex",gap:8}}>
+        <button onClick={()=>setShowFinish(false)} style={{flex:1,padding:"10px 0",borderRadius:9,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:13}}>← Back</button>
+        <button onClick={()=>onFinish({durationSec:elapsed, kcal:parseFloat(finishKcal)||est, method:finishKcal?"manual":"estimated"})} style={{flex:2,padding:"10px 0",borderRadius:9,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:14}}>Save Session</button>
+      </div>
+    </div>);
+  }
+
+  return(<div style={{background:C.card,border:`1px solid ${C.orange}`,borderRadius:14,padding:"16px 18px",marginBottom:14}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+      <span style={{fontSize:12,color:C.muted,fontFamily:"monospace"}}>Combo {session.currentComboIdx+1}/{session.combos.length}{combo.exercises.length>1?" · superset":""}</span>
+      <div style={{display:"flex",alignItems:"center",gap:10}}>
+        <span style={{fontFamily:"monospace",fontSize:12,color:C.muted}}>{fmtTime(elapsed)}</span>
+        <button onClick={goToFinishOrCooldown} style={{fontSize:11,color:C.red,background:"none",border:`1px solid ${C.red}40`,borderRadius:6,padding:"3px 9px",cursor:"pointer"}}>🏁 Finish</button>
+      </div>
+    </div>
+    <div style={{textAlign:"right",marginBottom:6}}><button onClick={onCancel} style={{fontSize:10,color:C.muted,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>cancel session</button></div>
+
+    {/* Resting between rounds */}
+    {session.resting ? (
+      <div style={{textAlign:"center",padding:"18px 0"}}>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Resting</div>
+        <div style={{fontSize:38,fontWeight:900,fontFamily:"monospace",color:C.orange,marginBottom:16}}>{fmtTime(restElapsed)}</div>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>update(s=>({...s,resting:false}))} style={{flex:1,padding:"12px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14}}>▶ Start Next Round</button>
+        </div>
+        {!isLastCombo&&<button onClick={()=>update(s=>({...s,resting:false,currentComboIdx:s.currentComboIdx+1,currentExInRound:0}))} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12}}>⏭ Next Combo →</button>}
+        {isLastCombo&&<button onClick={goToFinishOrCooldown} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.lime}60`,color:C.lime,cursor:"pointer",fontSize:12,fontWeight:600}}>🏁 That's it — {session.cooldown&&!session.cooldown.done?"Cooldown":"Finish Session"}</button>}
+      </div>
+    ) : (<>
+      {/* Exercise list for current combo, current one highlighted */}
+      {combo.exercises.map((ex,ei)=>{
+        const isCurrent = ei===session.currentExInRound;
+        const last = getLastPerformance(ex.name, gymSessions);
+        const suggestion = isCurrent ? suggestProgression(ex.name, gymSessions, gymSettings?.trainingMethod) : null;
+        const lib = libFor(ex.name);
+        const canSwap = (ex.sets||[]).length === 0 && lib; // only before this exercise has been started
+        return(<div key={ex.id} style={{background:isCurrent?`${C.lime}0d`:C.bg,border:`1px solid ${isCurrent?C.lime:C.border}`,borderRadius:10,padding:"11px 13px",marginBottom:8}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:2}}>
+            <span style={{fontSize:13,fontWeight:isCurrent?700:500,color:isCurrent?C.lime:C.text}}>{ex.name}</span>
+            {last&&<span style={{fontSize:9.5,color:C.muted}}>last: {last.weight}{ex.unit||"kg"} · {last.sets.map(s=>s.reps).join("/")} ({new Date(last.date+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"})})</span>}
+          </div>
+          {lib?.note&&<div style={{fontSize:10,color:C.yellow,fontStyle:"italic",marginBottom:4}}>📌 {lib.note}</div>}
+          {canSwap&&<button onClick={()=>setSwapOpenFor(swapOpenFor===ex.id?null:ex.id)} style={{fontSize:9.5,color:C.blue,background:"none",border:"none",cursor:"pointer",textDecoration:"underline",marginBottom:4,display:"block"}}>⇄ swap exercise</button>}
+          {swapOpenFor===ex.id&&lib&&(()=>{
+            const alts = findAlternatives(lib.muscleGroup, gymExerciseLibrary, ex.name);
+            return(<div style={{marginBottom:8,background:C.card,border:`1px solid ${C.blue}40`,borderRadius:7,padding:"7px 9px"}}>
+              <div style={{fontSize:9.5,color:C.muted,marginBottom:5}}>Same muscle group ({lib.muscleGroup}) — equipment occupied?</div>
+              {alts.length===0&&<div style={{fontSize:10.5,color:C.muted}}>No alternatives found.</div>}
+              <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{alts.map(a=>{
+                const altLast=getLastPerformance(a.name,gymSessions);
+                return(<button key={a.name} onClick={()=>{update(s=>{const c={...s.combos[s.currentComboIdx]};c.exercises=c.exercises.map(x=>x.id===ex.id?{...x,name:a.name,weight:altLast?String(altLast.weight):""}:x);const combos=[...s.combos];combos[s.currentComboIdx]=c;return{...s,combos};});setSwapOpenFor(null);}} style={{padding:"4px 9px",borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,color:C.text,cursor:"pointer",fontSize:10.5}}>{a.name}</button>);
+              })}</div>
+            </div>);
+          })()}
+          {ex.sets.length>0&&<div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:isCurrent?8:0}}>{ex.sets.map((s,si)=>(<span key={si} style={{fontSize:10,fontFamily:"monospace",background:C.card,color:C.muted,padding:"2px 7px",borderRadius:5}}>Set {si+1}: {s.reps}</span>))}</div>}
+          {isCurrent&&(<>
+            <div style={{display:"flex",gap:7,alignItems:"center"}}>
+              <input type="text" inputMode="decimal" value={ex.weight||""} onChange={e=>update(s=>{const c={...s.combos[s.currentComboIdx]};c.exercises=c.exercises.map(x=>x.id===ex.id?{...x,weight:e.target.value.replace(",",".")}:x);const combos=[...s.combos];combos[s.currentComboIdx]=c;return{...s,combos};})} placeholder="kg" style={{width:64,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:7,padding:"7px 8px",color:C.lime,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
+              <span style={{fontSize:11,color:C.muted}}>kg ×</span>
+              <input id={`reps-${ex.id}`} type="text" inputMode="numeric" placeholder="reps" style={{width:64,background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"7px 8px",color:C.text,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none"}} onKeyDown={e=>{
+                if(e.key==="Enter"){
+                  const reps=parseInt(e.target.value)||0; if(!reps)return;
+                  e.target.value="";
+                  update(s=>{
+                    const c={...s.combos[s.currentComboIdx]};
+                    c.exercises=c.exercises.map(x=>x.id===ex.id?{...x,sets:[...x.sets,{reps}]}:x);
+                    const combos=[...s.combos]; combos[s.currentComboIdx]=c;
+                    let nextEx=s.currentExInRound+1; let resting=false; let restStartedAt=s.restStartedAt;
+                    if(nextEx>=c.exercises.length){ nextEx=0; resting=true; restStartedAt=Date.now(); }
+                    return{...s, combos, currentExInRound:nextEx, resting, restStartedAt};
+                  });
+                }
+              }}/>
+              <button onClick={()=>{
+                const input=document.getElementById(`reps-${ex.id}`); const reps=parseInt(input?.value)||0; if(!reps)return; if(input)input.value="";
+                update(s=>{
+                  const c={...s.combos[s.currentComboIdx]};
+                  c.exercises=c.exercises.map(x=>x.id===ex.id?{...x,sets:[...x.sets,{reps}]}:x);
+                  const combos=[...s.combos]; combos[s.currentComboIdx]=c;
+                  let nextEx=s.currentExInRound+1; let resting=false; let restStartedAt=s.restStartedAt;
+                  if(nextEx>=c.exercises.length){ nextEx=0; resting=true; restStartedAt=Date.now(); }
+                  return{...s, combos, currentExInRound:nextEx, resting, restStartedAt};
+                });
+              }} style={{padding:"7px 14px",borderRadius:7,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Log Set</button>
+            </div>
+            {suggestion&&<div style={{fontSize:10,color:C.lime,marginTop:6,lineHeight:1.4}}>📈 {suggestion}</div>}
+          </>)}
+        </div>);
+      })}
+      {/* Add exercise to this combo live — only between rounds to avoid awkward partial rounds */}
+      {atRoundStart&&(addExMode?(
+        <div style={{background:C.bg,border:`1px dashed ${C.border}`,borderRadius:9,padding:"9px 11px",marginBottom:8}}>
+          <div style={{display:"flex",gap:6,marginBottom:6}}>
+            <input value={newExName} onChange={e=>setNewExName(e.target.value)} placeholder="Exercise name…" style={{flex:1,boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"6px 9px",color:C.text,fontSize:12,outline:"none"}}/>
+          </div>
+          <div style={{display:"flex",gap:6}}>
+            <button onClick={()=>setAddExMode(false)} style={{flex:1,padding:"6px 0",borderRadius:6,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button>
+            <button onClick={()=>{
+              if(!newExName.trim())return;
+              update(s=>{const c={...s.combos[s.currentComboIdx]};c.exercises=[...c.exercises,{id:Date.now()+Math.random(),name:newExName.trim(),type:"weighted",weight:"",sets:[]}];const combos=[...s.combos];combos[s.currentComboIdx]=c;return{...s,combos};});
+              setNewExName(""); setAddExMode(false);
+            }} style={{flex:2,padding:"6px 0",borderRadius:6,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>+ Add to Combo</button>
+          </div>
+        </div>
+      ):(
+        <button onClick={()=>setAddExMode(true)} style={{width:"100%",padding:"8px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11,marginBottom:8}}>+ Add exercise to this combo</button>
+      ))}
+      {atRoundStart&&<button onClick={()=>update(s=>({...s,combos:[...s.combos,{id:Date.now(),exercises:[]}],currentComboIdx:s.combos.length,currentExInRound:0}))} style={{width:"100%",padding:"8px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>+ New Combo</button>}
+    </>)}
+  </div>);
+}
+
+// ── Gym Setup Sheet ─────────────────────────────────────────────────────────
+// Pick default gym weekdays, set the overall training method, and jump into each
+// scheduled day's template editor.
+function GymSetupSheet({gymSchedule,setGymSchedule,gymSettings,setGymSettings,gymTemplates,onEditTemplate,onClose}){
+  const toggle=wd=>setGymSchedule(prev=>(prev||[]).includes(wd)?(prev||[]).filter(x=>x!==wd):[...(prev||[]),wd]);
+  const method=gymSettings?.trainingMethod||"maintain";
+  const setMethod=m=>setGymSettings(p=>({...(p||{}),trainingMethod:m}));
+  const setNote=n=>setGymSettings(p=>({...(p||{}),customNote:n}));
+  return(<Sheet onClose={onClose} title="Gym Settings">
+    <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Default gym days</div>
+    <div style={{display:"flex",gap:5,marginBottom:16}}>{WEEKDAY_ORDER.map(id=>{const wd=WEEKDAYS[id];const on=(gymSchedule||[]).includes(wd.id);return(<button key={wd.id} onClick={()=>toggle(wd.id)} style={{flex:1,padding:"9px 0",borderRadius:9,border:`1px solid ${on?C.orange:C.border}`,background:on?`${C.orange}18`:C.bg,color:on?C.orange:C.muted,fontWeight:on?700:400,cursor:"pointer",fontSize:11}}>{wd.label}</button>);})}</div>
+
+    <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Training method</div>
+    <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:16}}>{TRAINING_METHODS.map(m=>(
+      <button key={m.id} onClick={()=>setMethod(m.id)} style={{padding:"11px 13px",borderRadius:10,border:`1px solid ${method===m.id?C.lime:C.border}`,background:method===m.id?`${C.lime}12`:C.bg,cursor:"pointer",textAlign:"left"}}>
+        <div style={{fontSize:13,fontWeight:method===m.id?700:500,color:method===m.id?C.lime:C.text}}>{m.emoji} {m.label}</div>
+        <div style={{fontSize:10,color:C.muted,marginTop:2,lineHeight:1.4}}>{m.desc}</div>
+      </button>
+    ))}</div>
+    {method==="custom"&&<div style={{marginBottom:16}}><Field label="Your approach" value={gymSettings?.customNote||""} onChange={setNote} placeholder="e.g. pyramid sets, deload every 4th week"/></div>}
+
+    {(gymSchedule||[]).length>0&&<>
+      <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Day plans</div>
+      <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:6}}>{(gymSchedule||[]).slice().sort((a,b)=>WEEKDAY_ORDER.indexOf(a)-WEEKDAY_ORDER.indexOf(b)).map(wd=>{
+        const t=gymTemplates?.[wd];
+        const comboCount=t?.combos?.length||0;
+        return(<button key={wd} onClick={()=>onEditTemplate(wd)} style={{padding:"11px 13px",borderRadius:10,border:`1px solid ${C.border}`,background:C.bg,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div><div style={{fontSize:13,fontWeight:600,color:C.text}}>{WEEKDAYS[wd].full}</div><div style={{fontSize:10,color:C.muted,marginTop:1}}>{comboCount>0?`${comboCount} combo${comboCount!==1?"s":""}${t.warmup?" · warmup":""}`:"No plan yet — tap to set up"}</div></div>
+          <span style={{color:C.muted,fontSize:14}}>✎</span>
+        </button>);
+      })}</div>
+    </>}
+    <button onClick={onClose} style={{width:"100%",padding:"11px 0",borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer",marginTop:10}}>Done</button>
+  </Sheet>);
+}
+
+// ── Gym History Panel ──────────────────────────────────────────────────────
+// Past sessions list + tap any exercise name to see its performance history over time.
+// ── Gym Manual Log Sheet ────────────────────────────────────────────────────
+// Backfill a session you didn't track live — pick a date, build combos/exercises with
+// actual weights and set reps directly, plus total duration and kcal burned.
+function GymManualLogSheet({gymExerciseLibrary, setGymExerciseLibrary, onSave, onClose}){
+  const [date, setDate] = useState(TODAY());
+  const [durationMin, setDurationMin] = useState("");
+  const [kcal, setKcal] = useState("");
+  const [combos, setCombos] = useState([{id:Date.now(),exercises:[]}]);
+  const [pickerOpen, setPickerOpen] = useState(null);
+  const [pickerSearch, setPickerSearch] = useState("");
+  const [newExCat, setNewExCat] = useState("Push");
+  const [newExMuscle, setNewExMuscle] = useState("Chest");
+  const [setDrafts, setSetDrafts] = useState({}); // {exId: repsText}
+  const weekday = new Date(date+"T12:00:00").getDay();
+
+  const addExerciseFromLib = (comboId, libEx) => {
+    setCombos(p => p.map(c => c.id===comboId ? {...c, exercises:[...c.exercises,{id:Date.now()+Math.random(),name:libEx.name,weight:"",unit:"kg",sets:[]}]} : c));
+    setPickerOpen(null); setPickerSearch("");
+  };
+  const addNewCustomExercise = (comboId) => {
+    const name = pickerSearch.trim();
+    if (!name) return;
+    const newLibEx = {id:normExName(name)+Date.now(), name, category:newExCat, muscleGroup:newExMuscle, note:"", custom:true};
+    setGymExerciseLibrary(prev => [...(prev||[]), newLibEx]);
+    addExerciseFromLib(comboId, newLibEx);
+  };
+  const removeExercise = (comboId, exId) => setCombos(p => p.map(c => c.id===comboId ? {...c, exercises:c.exercises.filter(e=>e.id!==exId)} : c));
+  const setWeight = (comboId, exId, w) => setCombos(p => p.map(c => c.id===comboId ? {...c, exercises:c.exercises.map(e=>e.id===exId?{...e,weight:w}:e)} : c));
+  const addSet = (comboId, exId) => {
+    const reps = parseInt(setDrafts[exId])||0;
+    if (!reps) return;
+    setCombos(p => p.map(c => c.id===comboId ? {...c, exercises:c.exercises.map(e=>e.id===exId?{...e,sets:[...e.sets,{reps}]}:e)} : c));
+    setSetDrafts(p => ({...p, [exId]:""}));
+  };
+  const removeSet = (comboId, exId, si) => setCombos(p => p.map(c => c.id===comboId ? {...c, exercises:c.exercises.map(e=>e.id===exId?{...e,sets:e.sets.filter((_,i)=>i!==si)}:e)} : c));
+  const addCombo = () => setCombos(p => [...p, {id:Date.now(),exercises:[]}]);
+  const removeCombo = (comboId) => setCombos(p => p.filter(c=>c.id!==comboId));
+  const filteredLib = (gymExerciseLibrary||[]).filter(e=>!pickerSearch||e.name.toLowerCase().includes(pickerSearch.toLowerCase())).slice(0,20);
+
+  const canSave = combos.some(c=>c.exercises.some(e=>e.sets.length>0)) && durationMin;
+  const save = () => {
+    onSave({
+      date, weekday,
+      durationSec: (parseInt(durationMin)||0)*60,
+      warmup:null, cooldown:null,
+      combos: combos.filter(c=>c.exercises.length>0),
+      kcalBurned: parseFloat(kcal)||0,
+      kcalMethod: "manual",
+    });
+  };
+
+  return(<Sheet onClose={onClose} title="Log Past Session">
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:14}}>
+      <div><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:4}}>Date</div><input type="date" value={date} max={TODAY()} onChange={e=>setDate(e.target.value)} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"7px 8px",color:C.lime,fontSize:12,fontFamily:"monospace",outline:"none"}}/></div>
+      <Field label="Duration min" value={durationMin} onChange={setDurationMin} type="number" placeholder="60"/>
+      <Field label="Kcal burned" value={kcal} onChange={setKcal} type="number" placeholder="300"/>
+    </div>
+    <div style={{fontSize:11,color:C.muted,marginBottom:10}}>{WEEKDAYS[weekday].full}</div>
+
+    {combos.map((combo,ci)=>(
+      <div key={combo.id} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"11px 14px",marginBottom:9}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+          <span style={{fontSize:12,fontWeight:700,color:C.orange}}>Combo {ci+1}</span>
+          <button onClick={()=>removeCombo(combo.id)} style={{background:"none",border:"none",color:C.faint,fontSize:14,cursor:"pointer"}}>✕ remove</button>
+        </div>
+        {combo.exercises.map(ex=>(
+          <div key={ex.id} style={{background:C.bg,borderRadius:7,padding:"8px 10px",marginBottom:6}}>
+            <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6}}>
+              <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ex.name}</span>
+              <input type="text" inputMode="decimal" value={ex.weight} onChange={e=>setWeight(combo.id,ex.id,e.target.value.replace(",","."))} placeholder="kg" style={{width:56,background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"5px 7px",color:C.lime,fontSize:12,fontFamily:"monospace",outline:"none"}}/>
+              <button onClick={()=>removeExercise(combo.id,ex.id)} style={{background:"none",border:"none",color:C.faint,fontSize:15,cursor:"pointer",padding:"0 2px"}}>×</button>
+            </div>
+            {ex.sets.length>0&&<div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:6}}>{ex.sets.map((s,si)=>(<span key={si} onClick={()=>removeSet(combo.id,ex.id,si)} style={{fontSize:10,fontFamily:"monospace",background:C.card,color:C.muted,padding:"2px 7px",borderRadius:5,cursor:"pointer"}} title="Tap to remove">Set {si+1}: {s.reps} ×</span>))}</div>}
+            <div style={{display:"flex",gap:6}}>
+              <input value={setDrafts[ex.id]||""} onChange={e=>setSetDrafts(p=>({...p,[ex.id]:e.target.value}))} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addSet(combo.id,ex.id);}}} inputMode="numeric" placeholder="reps" style={{width:64,background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"5px 7px",color:C.text,fontSize:12,fontFamily:"monospace",outline:"none"}}/>
+              <button onClick={()=>addSet(combo.id,ex.id)} style={{padding:"5px 11px",borderRadius:6,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>+ Set</button>
+            </div>
+          </div>
+        ))}
+        {pickerOpen===combo.id ? (
+          <div style={{background:C.bg,border:`1px dashed ${C.border}`,borderRadius:8,padding:"8px 10px"}}>
+            <input value={pickerSearch} onChange={e=>setPickerSearch(e.target.value)} placeholder="Search or type new exercise…" autoFocus style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 9px",color:C.text,fontSize:12,outline:"none",marginBottom:7}}/>
+            <div style={{display:"flex",flexDirection:"column",gap:4,maxHeight:160,overflowY:"auto",marginBottom:7}}>
+              {filteredLib.map(libEx=>(<button key={libEx.id} onClick={()=>addExerciseFromLib(combo.id,libEx)} style={{padding:"6px 9px",borderRadius:6,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between"}}>
+                <span style={{fontSize:11.5,color:C.text}}>{libEx.name}</span><span style={{fontSize:9.5,color:C.muted}}>{libEx.muscleGroup}</span>
+              </button>))}
+              {filteredLib.length===0&&<div style={{fontSize:10.5,color:C.muted,padding:"3px 0"}}>No matches — add it as new below.</div>}
+            </div>
+            {pickerSearch.trim()&&!filteredLib.some(e=>normExName(e.name)===normExName(pickerSearch))&&(<div style={{borderTop:`1px dashed ${C.border}`,paddingTop:8}}>
+              <div style={{fontSize:10,color:C.muted,marginBottom:6}}>+ Add "{pickerSearch.trim()}" as a new exercise:</div>
+              <div style={{display:"flex",gap:5,marginBottom:6,flexWrap:"wrap"}}>{EXERCISE_CATEGORIES.map(c=>(<button key={c} onClick={()=>setNewExCat(c)} style={{padding:"3px 8px",borderRadius:10,border:`1px solid ${newExCat===c?C.orange:C.border}`,background:newExCat===c?`${C.orange}18`:C.card,color:newExCat===c?C.orange:C.muted,cursor:"pointer",fontSize:10}}>{c}</button>))}</div>
+              <div style={{display:"flex",gap:5,marginBottom:8,flexWrap:"wrap"}}>{MUSCLE_GROUPS.map(m=>(<button key={m} onClick={()=>setNewExMuscle(m)} style={{padding:"3px 8px",borderRadius:10,border:`1px solid ${newExMuscle===m?C.blue:C.border}`,background:newExMuscle===m?`${C.blue}18`:C.card,color:newExMuscle===m?C.blue:C.muted,cursor:"pointer",fontSize:10}}>{m}</button>))}</div>
+              <button onClick={()=>addNewCustomExercise(combo.id)} style={{width:"100%",padding:"7px 0",borderRadius:6,background:C.orange,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>+ Add to Combo</button>
+            </div>)}
+            <button onClick={()=>{setPickerOpen(null);setPickerSearch("");}} style={{width:"100%",padding:"6px 0",marginTop:7,background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:10.5}}>Cancel</button>
+          </div>
+        ) : (
+          <button onClick={()=>{setPickerOpen(combo.id);setPickerSearch("");}} style={{width:"100%",padding:"7px 0",borderRadius:7,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11.5}}>+ Add exercise</button>
+        )}
+      </div>
+    ))}
+    <button onClick={addCombo} style={{width:"100%",padding:"10px 0",borderRadius:10,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12,marginBottom:14}}>+ New Combo</button>
+    <div style={{display:"flex",gap:8}}>
+      <button onClick={onClose} style={{flex:1,padding:"11px 0",borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer"}}>Cancel</button>
+      <button onClick={save} disabled={!canSave} style={{flex:2,padding:"11px 0",borderRadius:10,background:canSave?C.lime:C.faint,color:"#000",fontWeight:700,border:"none",cursor:canSave?"pointer":"default",fontSize:14}}>Save Session</button>
+    </div>
+  </Sheet>);
+}
+
+function GymHistoryPanel({gymSessions,setGymSessions,gymExerciseLibrary,setGymExerciseLibrary,onClose}){
+  const [exerciseFilter,setExerciseFilter]=useState(null); // exercise name being drilled into, or null
+  const [showManualLog,setShowManualLog]=useState(false);
+  const [confirmDelete,setConfirmDelete]=useState(null); // session id pending delete confirmation
+  const sessions=gymSessions||[];
+  const saveManualSession = record => {
+    setGymSessions(prev=>[{...record,id:Date.now()},...(prev||[])].sort((a,b)=>b.date.localeCompare(a.date)));
+    // Also credit the kcal to that day's activity log so its target reflects the workout,
+    // consistent with how live-tracked sessions feed into daily targets.
+    (async()=>{
+      const log=await store.get(`fit_day_${record.date}`,{date:record.date,dayType:"rest",meals:[],activities:[],burnedExtra:0,tags:[],goalMode:null});
+      if(!log.activities)log.activities=[];
+      log.activities.push({id:Date.now(),type:"gym",label:`Gym — ${WEEKDAYS[record.weekday].full}`,kcal:record.kcalBurned,durationMin:Math.round(record.durationSec/60),time:"—"});
+      await store.set(`fit_day_${record.date}`,log);
+      await addToIndex(record.date);
+    })();
+    setShowManualLog(false);
+  };
+  const deleteSession = id => { setGymSessions(prev=>(prev||[]).filter(s=>s.id!==id)); setConfirmDelete(null); };
+  if(showManualLog) return <GymManualLogSheet gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary} onSave={saveManualSession} onClose={()=>setShowManualLog(false)}/>;
+  if(exerciseFilter){
+    const nl=normExName(exerciseFilter);
+    const rows=[];
+    for(const sess of sessions){
+      for(const combo of (sess.combos||[])){
+        for(const ex of (combo.exercises||[])){
+          if(normExName(ex.name)===nl&&ex.sets?.length) rows.push({date:sess.date,weight:ex.weight,sets:ex.sets});
+        }
+      }
+    }
+    return(<Sheet onClose={()=>setExerciseFilter(null)} title={exerciseFilter}>
+      <div style={{display:"flex",flexDirection:"column",gap:7}}>
+        {rows.map((r,i)=>(<div key={i} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 13px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <span style={{fontSize:12,color:C.muted}}>{new Date(r.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}><span style={{fontFamily:"monospace",fontSize:13,fontWeight:700,color:C.lime}}>{r.weight}kg</span><span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{r.sets.map(s=>s.reps).join("/")}</span></div>
+        </div>))}
+        {rows.length===0&&<div style={{textAlign:"center",padding:"30px 0",color:C.muted,fontSize:13}}>No history for this exercise yet.</div>}
+      </div>
+    </Sheet>);
+  }
+  return(<Sheet onClose={onClose} title="Gym Log">
+    <button onClick={()=>setShowManualLog(true)} style={{width:"100%",padding:"10px 0",borderRadius:10,background:`${C.lime}12`,border:`1px solid ${C.lime}50`,color:C.lime,fontWeight:700,cursor:"pointer",fontSize:13,marginBottom:12}}>+ Log Past Session</button>
+    {sessions.length===0&&<div style={{textAlign:"center",padding:"36px 0",color:C.muted}}><div style={{fontSize:32}}>🏋️</div><div style={{fontSize:14,marginTop:8}}>No sessions logged yet.</div></div>}
+    <div style={{display:"flex",flexDirection:"column",gap:8}}>{sessions.map(sess=>{
+      const allExercises=[...new Set((sess.combos||[]).flatMap(c=>(c.exercises||[]).map(e=>e.name)))];
+      return(<div key={sess.id} style={{background:C.card,border:`1px solid ${confirmDelete===sess.id?"#5a1a1a":C.border}`,borderRadius:12,padding:"12px 14px"}}>
+        {confirmDelete===sess.id&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"7px 10px",marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+          <span style={{fontSize:11,color:"#ff8080"}}>Delete this session? Can't be undone.</span>
+          <div style={{display:"flex",gap:6,flexShrink:0}}>
+            <button onClick={()=>setConfirmDelete(null)} style={{padding:"4px 9px",borderRadius:6,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button>
+            <button onClick={()=>deleteSession(sess.id)} style={{padding:"4px 9px",borderRadius:6,background:"#3a0a0a",border:"1px solid #ff4040",color:"#ff6060",fontWeight:700,cursor:"pointer",fontSize:11}}>Delete</button>
+          </div>
+        </div>}
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+          <span style={{fontSize:13,fontWeight:700,color:C.text}}>{WEEKDAYS[sess.weekday]?.full||""} · {new Date(sess.date+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"})}</span>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{Math.round((sess.durationSec||0)/60)}min</span>
+            <span style={{fontFamily:"monospace",fontSize:12,fontWeight:700,color:C.orange}}>+{Math.round(sess.kcalBurned||0)}kcal</span>
+            <button onClick={()=>setConfirmDelete(confirmDelete===sess.id?null:sess.id)} style={{background:"none",border:"none",color:confirmDelete===sess.id?"#ff4040":C.faint,fontSize:15,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button>
+          </div>
+        </div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{allExercises.map(name=>(<button key={name} onClick={()=>setExerciseFilter(name)} style={{padding:"4px 9px",borderRadius:12,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:10.5}}>{name}</button>))}</div>
+      </div>);
+    })}</div>
+  </Sheet>);
+}
+
+function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases,setWeightPhases,gymSchedule,setGymSchedule,gymTemplates,setGymTemplates,gymSessions,setGymSessions,gymSettings,setGymSettings,gymActiveSession,setGymActiveSession,gymExerciseLibrary,setGymExerciseLibrary}){
   const [modal,setModal]=useState(false);const [view,setView]=useState("today");const [histDates,setHistDates]=useState([]);const [histLogs,setHistLogs]=useState({});const [histLoaded,setHistLoaded]=useState(false);
   const activities=dayData.activities||[];const totalBurned=activities.reduce((s,a)=>s+a.kcal,0)+(dayData.burnedExtra||0);
+
+  // ── Gym tracking ──────────────────────────────────────────────────────────
+  const [gymSetupOpen,setGymSetupOpen]=useState(false);
+  const [editingWeekday,setEditingWeekday]=useState(null); // weekday id being edited in template editor, or null
+  const [showGymHistory,setShowGymHistory]=useState(false);
+  const [promptDismissed,setPromptDismissed]=useState(false);
+  const todayWeekday=new Date().getDay();
+  const isScheduledGymDay=(gymSchedule||[]).includes(todayWeekday);
+  const todayTemplate=(gymTemplates||{})[todayWeekday]||null;
+  const latestWeightForGym=weights[0]?.weight;
+  const todaysCompletedSession=(gymSessions||[]).find(s=>s.date===TODAY())||null;
+
+  const buildSessionFromTemplate=(weekday,template)=>{
+    const t=template||{warmup:null,cooldown:null,combos:[{id:Date.now(),exercises:[]}]};
+    const combos=(t.combos?.length?t.combos:[{id:Date.now(),exercises:[]}]).map(c=>({
+      id:c.id,
+      exercises:(c.exercises||[]).map(ex=>{
+        const last=getLastPerformance(ex.name,gymSessions);
+        return {id:ex.id,name:ex.name,type:ex.type||"weighted",weight:last?String(last.weight):"",unit:"kg",sets:[]};
+      }),
+    }));
+    return {
+      date:TODAY(), weekday,
+      startedAt:Date.now(),
+      warmup:t.warmup?{...t.warmup,done:false}:null,
+      cooldown:t.cooldown?{...t.cooldown,done:false}:null,
+      cooldownStarted:false,
+      combos: combos.length?combos:[{id:Date.now(),exercises:[]}],
+      currentComboIdx:0, currentExInRound:0,
+      resting:false, restStartedAt:null,
+    };
+  };
+
+  const startGymSession=(weekday,template)=>{
+    setGymActiveSession(buildSessionFromTemplate(weekday,template));
+  };
+  const cancelGymSession=()=>setGymActiveSession(null);
+  const finishGymSession=({durationSec,kcal,method})=>{
+    const sess=gymActiveSession;
+    if(!sess)return;
+    const record={id:Date.now(),date:sess.date,weekday:sess.weekday,durationSec,warmup:sess.warmup,cooldown:sess.cooldown,combos:sess.combos,kcalBurned:kcal,kcalMethod:method};
+    setGymSessions(prev=>[record,...(prev||[])]);
+    const durMin=Math.round(durationSec/60);
+    setDayData(p=>({...p,activities:[...(p.activities||[]),{id:Date.now(),type:"gym",label:`Gym — ${WEEKDAYS[sess.weekday].full}`,kcal,durationMin:durMin,time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}]}));
+    setGymActiveSession(null);
+  };
   useEffect(()=>{if(view==="history"&&!histLoaded){store.get("fit_dates",[]).then(async ds=>{const e={};for(const d of ds){const log=await store.get(`fit_day_${d}`,null);if(log&&(log.activities||[]).length>0)e[d]=log;}setHistLogs(e);setHistDates(Object.keys(e).sort((a,b)=>b.localeCompare(a)));setHistLoaded(true);});}},[view]);
   const addActivity=act=>{setDayData(p=>({...p,activities:[...(p.activities||[]),act]}));setModal(false);};
   const delActivity=id=>{setDayData(p=>({...p,activities:(p.activities||[]).filter(a=>a.id!==id)}));};
   const [wInput,setWInput]=useState("");const [editWIdx,setEditWIdx]=useState(null);const [editWVal,setEditWVal]=useState("");const [wDate,setWDate]=useState(TODAY());const [showAllW,setShowAllW]=useState(false);
+  const [weightLogOpen,setWeightLogOpen]=useState(false);
   const [undoEntry,setUndoEntry]=useState(null);
   const deleteWeight=(idx)=>{
     const entry = weights[idx];
@@ -2279,13 +3165,57 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
 
   return(<div style={{height:"100%",position:"relative"}}>
     <div style={{height:"100%",overflowY:"auto",padding:"0 16px 90px"}}>
-      <div style={{padding:"18px 0 8px"}}><div style={{fontSize:26,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>Activity</div></div>
-      {/* Weight section */}
-      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"10px 14px",marginBottom:12}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-          <span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Weight Log</span>
-          {latestW&&<div style={{display:"flex",alignItems:"baseline",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}><span style={{fontFamily:"monospace",fontSize:18,fontWeight:800,color:C.lime}}>{latestW.weight.toFixed(2)}</span><span style={{fontSize:12,color:C.muted}}>kg</span>{overallDelta!==null&&<span style={{fontFamily:"monospace",fontSize:11,color:overallDelta<0?C.lime:C.red}} title={"Total change since first log on "+firstW.date}>{overallDelta<0?"↓":"↑"}{Math.abs(overallDelta).toFixed(2)} since start</span>}</div>}
+      <div style={{padding:"18px 0 8px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div style={{fontSize:26,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>Activity</div>
+        <div style={{display:"flex",gap:6}}>
+          <button onClick={()=>setShowGymHistory(true)} style={{background:"none",border:`1px solid ${C.border}`,borderRadius:8,padding:"6px 10px",color:C.muted,cursor:"pointer",fontSize:11}}>🏋️ Gym Log</button>
+          <button onClick={()=>setGymSetupOpen(true)} style={{background:"none",border:`1px solid ${C.border}`,borderRadius:8,padding:"6px 10px",color:C.muted,cursor:"pointer",fontSize:11}}>⚙️</button>
         </div>
+      </div>
+
+      {/* ── Gym session area ── */}
+      {gymActiveSession ? (
+        <GymSessionPanel session={gymActiveSession} setSession={setGymActiveSession} gymSessions={gymSessions||[]} gymSettings={gymSettings} latestWeight={latestWeightForGym} gymExerciseLibrary={gymExerciseLibrary||[]} setGymExerciseLibrary={setGymExerciseLibrary} onFinish={finishGymSession} onCancel={cancelGymSession}/>
+      ) : todaysCompletedSession ? (
+        <div style={{background:C.card,border:`1px solid ${C.lime}60`,borderRadius:12,padding:"12px 16px",marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+          <div><div style={{fontSize:13,fontWeight:600,color:C.lime}}>✓ Session already completed today</div><div style={{fontSize:10,color:C.muted,marginTop:2}}>{Math.round((todaysCompletedSession.durationSec||0)/60)}min · +{Math.round(todaysCompletedSession.kcalBurned||0)}kcal</div></div>
+          <button onClick={()=>startGymSession(todayWeekday,todayTemplate)} style={{padding:"7px 14px",borderRadius:8,background:C.card,border:`1px solid ${C.lime}`,color:C.lime,fontWeight:700,cursor:"pointer",fontSize:12,flexShrink:0}}>+ Log another</button>
+        </div>
+      ) : isScheduledGymDay && !promptDismissed ? (
+        <div style={{background:C.card,border:`1px solid ${C.orange}60`,borderRadius:12,padding:"12px 16px",marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+          <div><div style={{fontSize:13,fontWeight:600,color:C.text}}>🏋️ At the gym already?</div><div style={{fontSize:10,color:C.muted,marginTop:2}}>{WEEKDAYS[todayWeekday].full} is a scheduled gym day</div></div>
+          <div style={{display:"flex",gap:6,flexShrink:0}}>
+            <button onClick={()=>setPromptDismissed(true)} style={{padding:"7px 10px",borderRadius:8,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Not yet</button>
+            <button onClick={()=>startGymSession(todayWeekday,todayTemplate)} style={{padding:"7px 14px",borderRadius:8,background:C.orange,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Start Session</button>
+          </div>
+        </div>
+      ) : (
+        <button onClick={()=>startGymSession(todayWeekday,todayTemplate)} style={{width:"100%",padding:"9px 0",borderRadius:10,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12,marginBottom:12}}>🏋️ + Start ad-hoc gym session</button>
+      )}
+      {gymSetupOpen&&<GymSetupSheet
+        gymSchedule={gymSchedule||[]} setGymSchedule={setGymSchedule}
+        gymSettings={gymSettings} setGymSettings={setGymSettings}
+        gymTemplates={gymTemplates||{}}
+        gymExerciseLibrary={gymExerciseLibrary||[]} setGymExerciseLibrary={setGymExerciseLibrary}
+        onEditTemplate={wd=>{setGymSetupOpen(false);setEditingWeekday(wd);}}
+        onClose={()=>setGymSetupOpen(false)}
+      />}
+      {editingWeekday!==null&&<GymTemplateEditor
+        weekday={editingWeekday}
+        template={(gymTemplates||{})[editingWeekday]}
+        setTemplate={t=>setGymTemplates(prev=>({...(prev||{}),[editingWeekday]:t}))}
+        gymExerciseLibrary={gymExerciseLibrary||[]} setGymExerciseLibrary={setGymExerciseLibrary}
+        onClose={()=>setEditingWeekday(null)}
+      />}
+      {showGymHistory&&<GymHistoryPanel gymSessions={gymSessions||[]} setGymSessions={setGymSessions} gymExerciseLibrary={gymExerciseLibrary||[]} setGymExerciseLibrary={setGymExerciseLibrary} onClose={()=>setShowGymHistory(false)}/>}
+
+      {/* Weight section */}
+      <div style={{background:C.card,border:`1px solid ${weightLogOpen?C.lime:C.border}`,borderRadius:12,padding:"10px 14px",marginBottom:12}}>
+        <button onClick={()=>setWeightLogOpen(p=>!p)} style={{width:"100%",background:"none",border:"none",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",padding:0,marginBottom:weightLogOpen?6:0}}>
+          <span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Weight Log {weightLogOpen?"▲":"▼"}</span>
+          {latestW&&<div style={{display:"flex",alignItems:"baseline",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}><span style={{fontFamily:"monospace",fontSize:18,fontWeight:800,color:C.lime}}>{latestW.weight.toFixed(2)}</span><span style={{fontSize:12,color:C.muted}}>kg</span>{overallDelta!==null&&<span style={{fontFamily:"monospace",fontSize:11,color:overallDelta<0?C.lime:C.red}} title={"Total change since first log on "+firstW.date}>{overallDelta<0?"↓":"↑"}{Math.abs(overallDelta).toFixed(2)} since start</span>}</div>}
+        </button>
+        {weightLogOpen&&(<>
         {wSpark.length>=4&&(<svg width={WW} height={WH} style={{display:"block",marginBottom:6,overflow:"visible"}}>
           {wTrend!==null&&wSpark.length>=4&&(()=>{const startV=wSpark[0].weight;const endV=wSpark[wSpark.length-1].weight+(wTrend/7*(wSpark.length-1));return<line x1={0} y1={wpy(startV)} x2={WW} y2={wpy(Math.min(wMax-0.1,Math.max(wMin+0.1,endV)))} stroke={wTrend<0?C.lime+"60":C.red+"60"} strokeWidth={1} strokeDasharray="3 3"/>;})()}
           <polyline points={wSpark.map((d,i)=>wpx(i)+","+wpy(d.weight)).join(" ")} fill="none" stroke={C.lime+"50"} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round"/>
@@ -2306,7 +3236,11 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
           }</div>))}
         </div>
         {weights.length>14&&<button onClick={()=>setShowAllW(p=>!p)} style={{width:"100%",marginTop:6,padding:"6px 0",borderRadius:6,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>{showAllW?"▴ Show recent only":`▾ Show all ${weights.length} entries`}</button>}
+        </>)}
       </div>
+
+      {/* Sports Coach */}
+      <CoachPanel profile={profile} weights={weights} products={[]} mealPreps={[]} weightPhases={weightPhases} gymSessions={gymSessions} gymSchedule={gymSchedule} gymSettings={gymSettings} mode="sports"/>
 
       {/* Phase tracker */}
       <div style={{background:C.card,border:`1px solid ${showPhases?C.blue:C.border}`,borderRadius:12,padding:"10px 14px",marginBottom:12}}>
@@ -2363,7 +3297,395 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
 }
 
 // ── Food Tab (Preps + Products) ───────────────────────────────────────────────
-function FoodTab({mealPreps,setMealPreps,products,setProducts,profile}){
+// ── Recipe Edit Sheet ───────────────────────────────────────────────────────
+// Combined pan+zoom style for a recipe photo, given {x,y} object-position percentages and a
+// zoom scale factor. Used consistently everywhere a recipe photo is rendered.
+const recipePhotoStyle = (pos, zoom) => ({
+  width:"100%", height:"100%", objectFit:"cover",
+  objectPosition:`${pos?.x ?? 50}% ${pos?.y ?? 50}%`,
+  transform:`scale(${zoom||1})`,
+  transformOrigin:`${pos?.x ?? 50}% ${pos?.y ?? 50}%`,
+  display:"block",
+});
+
+function RecipeEditSheet({recipe, products, profile, onSave, onClose}){
+  const r = recipe || {name:"",category:"main",photo:null,photoPos:{x:50,y:50},photoZoom:1,ingredients:[],instructions:[]};
+  const [name,setName] = useState(r.name||"");
+  const [category,setCategory] = useState(r.category||"main");
+  const [photo,setPhoto] = useState(r.photo||null);
+  const [photoPos,setPhotoPos] = useState(r.photoPos||{x:50,y:50});
+  const [photoZoom,setPhotoZoom] = useState(r.photoZoom||1);
+  const [ingredients,setIngredients] = useState(r.ingredients?.length?r.ingredients:[]);
+  const [instructions,setInstructions] = useState(r.instructions?.length?r.instructions:[]);
+  const [newIng,setNewIng] = useState("");
+  const [newStep,setNewStep] = useState("");
+  const [newStepTimer,setNewStepTimer] = useState("");
+  // Auto-fill from pasted text and/or a photo of a recipe
+  const [autoOpen,setAutoOpen] = useState(false);
+  const [pasteText,setPasteText] = useState("");
+  const [scanImgs,setScanImgs] = useState([]);
+  const [parsing,setParsing] = useState(false);
+  const [parseErr,setParseErr] = useState(null);
+
+  const handlePhoto = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => { setPhoto(ev.target.result); setPhotoPos({x:50,y:50}); setPhotoZoom(1); };
+    reader.readAsDataURL(file);
+  };
+  const addIngredient = () => { if(!newIng.trim())return; setIngredients(p=>[...p,{id:Date.now()+Math.random(),text:newIng.trim()}]); setNewIng(""); };
+  const removeIngredient = id => setIngredients(p=>p.filter(i=>i.id!==id));
+  const addStep = () => { if(!newStep.trim())return; setInstructions(p=>[...p,{id:Date.now()+Math.random(),text:newStep.trim(),timerMin:parseInt(newStepTimer)||null}]); setNewStep(""); setNewStepTimer(""); };
+  const removeStep = id => setInstructions(p=>p.filter(s=>s.id!==id));
+  const moveStep = (idx,dir) => setInstructions(p=>{const arr=[...p];const j=idx+dir;if(j<0||j>=arr.length)return p;[arr[idx],arr[j]]=[arr[j],arr[idx]];return arr;});
+
+  const runParse = async () => {
+    if (!pasteText.trim() && scanImgs.length===0) return;
+    setParsing(true); setParseErr(null);
+    try {
+      const res = await aParseRecipe(pasteText, scanImgs, profile?.apiKey);
+      if (!name.trim() && res.name) setName(res.name);
+      if (res.category) setCategory(res.category);
+      setIngredients((res.ingredients||[]).map(i=>({id:Date.now()+Math.random(),text:i.text})));
+      setInstructions((res.instructions||[]).map(s=>({id:Date.now()+Math.random(),text:s.text,timerMin:s.timerMin||null})));
+      setAutoOpen(false); setPasteText(""); setScanImgs([]);
+    } catch(e) {
+      setParseErr(String(e.message||e));
+    }
+    setParsing(false);
+  };
+
+  const canSave = name.trim() && ingredients.length>0 && instructions.length>0;
+  const save = () => onSave({id:r.id||Date.now(), name:name.trim(), category, photo, photoPos, photoZoom, ingredients, instructions, generatedByAI:r.generatedByAI||false});
+
+  return(<Sheet onClose={onClose} title={recipe?.id?"Edit Recipe":"New Recipe"}>
+    {/* Auto-fill from pasted text or a scanned photo */}
+    <div style={{background:C.card,border:`1px solid ${autoOpen?C.blue:C.border}`,borderRadius:10,padding:"11px 14px",marginBottom:14}}>
+      <button onClick={()=>setAutoOpen(p=>!p)} style={{width:"100%",background:"none",border:"none",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",padding:0}}>
+        <span style={{fontSize:13,fontWeight:600,color:autoOpen?C.blue:C.text}}>✨ Auto-fill from text or photo</span>
+        <span style={{fontSize:11,color:C.muted}}>{autoOpen?"▲":"▼"}</span>
+      </button>
+      {autoOpen&&(<div style={{marginTop:10}}>
+        <div style={{fontSize:10.5,color:C.muted,marginBottom:8,lineHeight:1.4}}>Paste a full recipe (from a website, note, etc.) and/or upload a photo of one — the AI will sort it into ingredients and instructions for you.</div>
+        <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)} rows={4} placeholder="Paste recipe text here…" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:12,outline:"none",resize:"none",fontFamily:"inherit",marginBottom:8}}/>
+        <ImgZone imgs={scanImgs} setImgs={setScanImgs} compact maxPhotos={3}/>
+        {parseErr&&<div style={{fontSize:11,color:"#ff8080",marginTop:8}}>{parseErr}</div>}
+        <button onClick={runParse} disabled={parsing||(!pasteText.trim()&&scanImgs.length===0)} style={{width:"100%",padding:"10px 0",borderRadius:8,background:parsing?C.faint:(pasteText.trim()||scanImgs.length)?C.blue:C.faint,border:"none",color:"#000",fontWeight:700,cursor:parsing?"default":"pointer",fontSize:13,marginTop:10}}>{parsing?"Parsing…":"✨ Parse Recipe"}</button>
+        <div style={{fontSize:9.5,color:C.muted,marginTop:6}}>This replaces the ingredients/instructions below — you can still edit everything after.</div>
+      </div>)}
+    </div>
+
+    <Field label="Recipe name" value={name} onChange={setName} placeholder="e.g. Protein Pancakes"/>
+    <div style={{marginTop:10,marginBottom:12}}>
+      <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Category</div>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{RECIPE_CATEGORIES.map(c=>(<button key={c.id} onClick={()=>setCategory(c.id)} style={{padding:"7px 12px",borderRadius:10,border:`1px solid ${category===c.id?C.lime:C.border}`,background:category===c.id?`${C.lime}18`:C.bg,color:category===c.id?C.lime:C.muted,cursor:"pointer",fontSize:12,fontWeight:category===c.id?700:400}}>{c.emoji} {c.label}</button>))}</div>
+    </div>
+    <div style={{marginBottom:14}}>
+      <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Photo</div>
+      {photo ? (<>
+        <div style={{position:"relative",marginBottom:8,width:"100%",height:160,borderRadius:10,overflow:"hidden",background:C.bg}}>
+          <img src={photo} style={recipePhotoStyle(photoPos,photoZoom)}/>
+          <button onClick={()=>{setPhoto(null);setPhotoPos({x:50,y:50});setPhotoZoom(1);}} style={{position:"absolute",top:8,right:8,background:"rgba(0,0,0,0.7)",border:"none",color:"#fff",borderRadius:6,padding:"4px 9px",cursor:"pointer",fontSize:11}}>Remove</button>
+        </div>
+        <div style={{background:C.bg,borderRadius:8,padding:"9px 11px"}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><span style={{fontSize:10,color:C.muted}}>Zoom</span><span style={{fontSize:10,color:C.muted,fontFamily:"monospace"}}>{photoZoom.toFixed(1)}×</span></div>
+          <input type="range" min="1" max="2.5" step="0.1" value={photoZoom} onChange={e=>setPhotoZoom(parseFloat(e.target.value))} style={{width:"100%",accentColor:C.lime,marginBottom:8}}/>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><span style={{fontSize:10,color:C.muted}}>Horizontal position</span></div>
+          <input type="range" min="0" max="100" value={photoPos.x} onChange={e=>setPhotoPos(p=>({...p,x:parseInt(e.target.value)}))} style={{width:"100%",accentColor:C.lime,marginBottom:8}}/>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}><span style={{fontSize:10,color:C.muted}}>Vertical position</span></div>
+          <input type="range" min="0" max="100" value={photoPos.y} onChange={e=>setPhotoPos(p=>({...p,y:parseInt(e.target.value)}))} style={{width:"100%",accentColor:C.lime,marginBottom:8}}/>
+          <button onClick={()=>{setPhotoPos({x:50,y:50});setPhotoZoom(1);}} style={{width:"100%",padding:"6px 0",borderRadius:6,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Reset position</button>
+        </div>
+      </>) : (
+        <label style={{display:"block",padding:"20px 0",borderRadius:10,border:`1px dashed ${C.border}`,textAlign:"center",cursor:"pointer",color:C.muted,fontSize:12}}>
+          📷 Tap to add a photo
+          <input type="file" accept="image/*" onChange={handlePhoto} style={{display:"none"}}/>
+        </label>
+      )}
+    </div>
+    <div style={{marginBottom:14}}>
+      <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Ingredients</div>
+      {ingredients.map(ing=>(<div key={ing.id} style={{display:"flex",alignItems:"center",gap:7,background:C.bg,borderRadius:7,padding:"7px 10px",marginBottom:5}}>
+        <span style={{flex:1,fontSize:12,color:C.text}}>{ing.text}</span>
+        <button onClick={()=>removeIngredient(ing.id)} style={{background:"none",border:"none",color:C.faint,fontSize:15,cursor:"pointer"}}>×</button>
+      </div>))}
+      <div style={{display:"flex",gap:6}}>
+        <input value={newIng} onChange={e=>setNewIng(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addIngredient();}}} placeholder="e.g. 200g flour" style={{flex:1,boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"7px 10px",color:C.text,fontSize:12,outline:"none"}}/>
+        <button onClick={addIngredient} style={{padding:"7px 12px",borderRadius:7,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>+ Add</button>
+      </div>
+    </div>
+    <div style={{marginBottom:16}}>
+      <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Instructions</div>
+      {instructions.map((step,i)=>(<div key={step.id} style={{background:C.bg,borderRadius:7,padding:"8px 10px",marginBottom:5}}>
+        <div style={{display:"flex",alignItems:"center",gap:7}}>
+          <span style={{fontSize:11,color:C.muted,flexShrink:0}}>{i+1}.</span>
+          <span style={{flex:1,fontSize:12,color:C.text}}>{step.text}{step.timerMin?` (⏱ ${step.timerMin}min)`:""}</span>
+          <button onClick={()=>moveStep(i,-1)} disabled={i===0} style={{background:"none",border:"none",color:i===0?C.faint:C.muted,cursor:i===0?"default":"pointer",fontSize:11}}>▲</button>
+          <button onClick={()=>moveStep(i,1)} disabled={i===instructions.length-1} style={{background:"none",border:"none",color:i===instructions.length-1?C.faint:C.muted,cursor:i===instructions.length-1?"default":"pointer",fontSize:11}}>▼</button>
+          <button onClick={()=>removeStep(step.id)} style={{background:"none",border:"none",color:C.faint,fontSize:15,cursor:"pointer"}}>×</button>
+        </div>
+      </div>))}
+      <div style={{display:"flex",gap:6}}>
+        <input value={newStep} onChange={e=>setNewStep(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addStep();}}} placeholder="e.g. Mix dry ingredients" style={{flex:1,boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"7px 10px",color:C.text,fontSize:12,outline:"none"}}/>
+        <input value={newStepTimer} onChange={e=>setNewStepTimer(e.target.value)} inputMode="numeric" placeholder="min" style={{width:56,boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"7px 8px",color:C.text,fontSize:12,outline:"none"}}/>
+        <button onClick={addStep} style={{padding:"7px 12px",borderRadius:7,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>+ Add</button>
+      </div>
+      <div style={{fontSize:9.5,color:C.muted,marginTop:5}}>Optional "min" = wait timer, e.g. baking or resting time</div>
+    </div>
+    <div style={{display:"flex",gap:8}}>
+      <button onClick={onClose} style={{flex:1,padding:"11px 0",borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer"}}>Cancel</button>
+      <button onClick={save} disabled={!canSave} style={{flex:2,padding:"11px 0",borderRadius:10,background:canSave?C.lime:C.faint,color:"#000",fontWeight:700,border:"none",cursor:canSave?"pointer":"default",fontSize:14}}>Save Recipe</button>
+    </div>
+  </Sheet>);
+}
+
+// ── Recipe Detail Sheet (view / shop / cook) ───────────────────────────────
+function RecipeDetailSheet({recipe, onEdit, onDelete, onClose}){
+  const [shoppingMode, setShoppingMode] = useState(false);
+  const [checked, setChecked] = useState({}); // {ingredientId: bool} — ephemeral, resets each visit
+  const [completedSteps, setCompletedSteps] = useState({}); // {stepId: bool} — ephemeral
+  const [timerRemaining, setTimerRemaining] = useState({}); // {stepId: secondsRemaining}
+  const [timerRunning, setTimerRunning] = useState({}); // {stepId: bool}
+  const cat = recipeCatById(recipe.category);
+
+  useEffect(() => {
+    const anyRunning = Object.values(timerRunning).some(Boolean);
+    if (!anyRunning) return;
+    const iv = setInterval(() => {
+      setTimerRemaining(prev => {
+        const next = {...prev};
+        for (const id of Object.keys(timerRunning)) {
+          if (timerRunning[id] && next[id] > 0) next[id] -= 1;
+        }
+        return next;
+      });
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [timerRunning]);
+
+  const toggleIngredient = id => setChecked(p => ({...p, [id]: !p[id]}));
+  const markStepDone = id => setCompletedSteps(p => ({...p, [id]: true}));
+  const startTimer = (id, min) => { setTimerRemaining(p=>({...p,[id]: (p[id] ?? min*60)})); setTimerRunning(p=>({...p,[id]:true})); };
+  const pauseTimer = id => setTimerRunning(p=>({...p,[id]:false}));
+  const fmtT = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
+
+  const firstIncompleteIdx = (recipe.instructions||[]).findIndex(s=>!completedSteps[s.id]);
+  const checkedCount = Object.values(checked).filter(Boolean).length;
+
+  return(<Sheet onClose={onClose} title={recipe.name}>
+    {recipe.photo && <div style={{width:"100%",height:200,borderRadius:12,marginBottom:12,overflow:"hidden",background:C.bg}}><img src={recipe.photo} style={recipePhotoStyle(recipe.photoPos,recipe.photoZoom)}/></div>}
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+      <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+        <span style={{fontSize:12,padding:"4px 10px",borderRadius:12,background:C.card,border:`1px solid ${C.border}`,color:C.muted}}>{cat.emoji} {cat.label}</span>
+        {recipe.generatedByAI&&<span style={{fontSize:11,padding:"4px 10px",borderRadius:12,background:`${C.blue}18`,border:`1px solid ${C.blue}60`,color:C.blue}}>✨ AI Generated</span>}
+      </div>
+      <div style={{display:"flex",gap:6}}>
+        <button onClick={onEdit} style={{padding:"5px 10px",borderRadius:7,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>✎ Edit</button>
+        <button onClick={onDelete} style={{padding:"5px 10px",borderRadius:7,background:"none",border:`1px solid ${C.border}`,color:C.faint,cursor:"pointer",fontSize:11}}>Delete</button>
+      </div>
+    </div>
+
+    <button onClick={()=>setShoppingMode(p=>!p)} style={{width:"100%",padding:"11px 0",borderRadius:10,background:shoppingMode?C.lime:`${C.lime}15`,border:`1px solid ${C.lime}`,color:shoppingMode?"#000":C.lime,fontWeight:700,cursor:"pointer",fontSize:13,marginBottom:14}}>{shoppingMode?`✓ Done Shopping (${checkedCount}/${(recipe.ingredients||[]).length})`:"🛒 Shopping Mode"}</button>
+
+    {shoppingMode ? (
+      <div>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:8}}>Ingredients — tap to check off</div>
+        {(recipe.ingredients||[]).map(ing=>(
+          <button key={ing.id} onClick={()=>toggleIngredient(ing.id)} style={{width:"100%",textAlign:"left",display:"flex",alignItems:"center",gap:10,padding:"11px 13px",borderRadius:9,background:checked[ing.id]?`${C.lime}12`:C.card,border:`1px solid ${checked[ing.id]?C.lime:C.border}`,marginBottom:6,cursor:"pointer"}}>
+            <span style={{width:20,height:20,borderRadius:5,border:`2px solid ${checked[ing.id]?C.lime:C.border}`,background:checked[ing.id]?C.lime:"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,fontSize:12,color:"#000"}}>{checked[ing.id]?"✓":""}</span>
+            <span style={{fontSize:13,color:checked[ing.id]?C.muted:C.text,textDecoration:checked[ing.id]?"line-through":"none"}}>{ing.text}</span>
+          </button>
+        ))}
+      </div>
+    ) : (<>
+      <div style={{marginBottom:16}}>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:8}}>Ingredients</div>
+        {(recipe.ingredients||[]).map(ing=>(<div key={ing.id} style={{fontSize:13,color:C.text,padding:"7px 0",borderBottom:`1px solid ${C.border}`}}>• {ing.text}</div>))}
+      </div>
+      <div>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:8}}>Instructions</div>
+        {(recipe.instructions||[]).map((step,i)=>{
+          const done = !!completedSteps[step.id];
+          const isCurrent = i===firstIncompleteIdx;
+          const remaining = timerRemaining[step.id] ?? (step.timerMin?step.timerMin*60:0);
+          const running = !!timerRunning[step.id];
+          return(<div key={step.id} style={{background:done?C.bg:isCurrent?`${C.lime}0d`:C.card,border:`1px solid ${isCurrent?C.lime:C.border}`,borderRadius:10,padding:"11px 13px",marginBottom:8,opacity:done?0.55:1}}>
+            <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
+              <span style={{width:22,height:22,borderRadius:11,background:done?C.lime:C.bg,border:`1px solid ${done?C.lime:C.border}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:done?"#000":C.muted,flexShrink:0}}>{done?"✓":i+1}</span>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:13,color:C.text,lineHeight:1.5,textDecoration:done?"line-through":"none"}}>{step.text}</div>
+                {step.timerMin>0 && isCurrent && (
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8,flexWrap:"wrap"}}>
+                    <span style={{fontFamily:"monospace",fontSize:16,fontWeight:800,color:remaining<=0?C.lime:C.orange}}>{fmtT(remaining)}</span>
+                    {remaining<=0 ? <span style={{fontSize:11,color:C.lime,fontWeight:600}}>⏰ Time's up!</span> : running ? (
+                      <button onClick={()=>pauseTimer(step.id)} style={{padding:"4px 10px",borderRadius:6,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Pause</button>
+                    ) : (
+                      <button onClick={()=>startTimer(step.id, step.timerMin)} style={{padding:"4px 10px",borderRadius:6,background:C.orange,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>▶ Start {step.timerMin}min timer</button>
+                    )}
+                  </div>
+                )}
+                {isCurrent && !done && <button onClick={()=>markStepDone(step.id)} style={{marginTop:9,padding:"7px 14px",borderRadius:7,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>✓ Mark Done</button>}
+              </div>
+            </div>
+          </div>);
+        })}
+        {firstIncompleteIdx===-1 && (recipe.instructions||[]).length>0 && <div style={{textAlign:"center",padding:"10px 0",color:C.lime,fontSize:13,fontWeight:600}}>🎉 All steps done!</div>}
+      </div>
+    </>)}
+  </Sheet>);
+}
+
+// ── Recipes Section (embedded in Food tab) ─────────────────────────────────
+// ── Recipe Suggest Sheet (AI generates a full recipe) ──────────────────────
+function RecipeSuggestSheet({products, profile, onSave, onClose}){
+  const [description, setDescription] = useState("");
+  const [fromPantry, setFromPantry] = useState(false);
+  // Default nutritional focus to something sensible for the user's current goal
+  const defaultFocus = profile?.goal==="cut" ? "low_cal" : profile?.goal==="bulk" ? "high_cal" : "balanced";
+  const [focus, setFocus] = useState(defaultFocus);
+  const [generating, setGenerating] = useState(false);
+  const [err, setErr] = useState(null);
+  const [result, setResult] = useState(null); // parsed recipe preview, pre-save
+
+  const FOCUS_OPTIONS = [
+    {id:"high_protein", label:"High Protein", emoji:"🍗"},
+    {id:"high_carb", label:"High Carb", emoji:"🍚"},
+    {id:"low_cal", label:"Low Cal / Cutting", emoji:"✂️"},
+    {id:"high_cal", label:"High Cal / Bulking", emoji:"💪"},
+    {id:"balanced", label:"Balanced", emoji:"⚖️"},
+  ];
+
+  const generate = async () => {
+    setGenerating(true); setErr(null);
+    try {
+      const res = await aGenerateRecipe({description, fromPantry, focus, products, profile}, profile?.apiKey);
+      setResult({
+        id: Date.now(),
+        name: res.name || "Generated Recipe",
+        category: res.category || "main",
+        photo: null, photoPos:{x:50,y:50}, photoZoom:1,
+        ingredients: (res.ingredients||[]).map(i=>({id:Date.now()+Math.random(),text:i.text})),
+        instructions: (res.instructions||[]).map(s=>({id:Date.now()+Math.random(),text:s.text,timerMin:s.timerMin||null})),
+        generatedByAI: true,
+      });
+    } catch(e) {
+      setErr(String(e.message||e));
+    }
+    setGenerating(false);
+  };
+
+  if (result) {
+    const cat = recipeCatById(result.category);
+    return(<Sheet onClose={onClose} title="Generated Recipe">
+      <div style={{background:`${C.blue}12`,border:`1px solid ${C.blue}40`,borderRadius:10,padding:"10px 13px",marginBottom:14,fontSize:11,color:C.blue}}>✨ AI Generated — review before saving</div>
+      <div style={{fontSize:17,fontWeight:700,color:C.text,marginBottom:6}}>{result.name}</div>
+      <div style={{fontSize:12,color:C.muted,marginBottom:14}}>{cat.emoji} {cat.label}</div>
+      <div style={{marginBottom:14}}>
+        <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Ingredients</div>
+        {result.ingredients.map(ing=>(<div key={ing.id} style={{fontSize:13,color:C.text,padding:"6px 0",borderBottom:`1px solid ${C.border}`}}>• {ing.text}</div>))}
+      </div>
+      <div style={{marginBottom:16}}>
+        <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Instructions</div>
+        {result.instructions.map((s,i)=>(<div key={s.id} style={{fontSize:13,color:C.text,padding:"6px 0",borderBottom:`1px solid ${C.border}`}}>{i+1}. {s.text}{s.timerMin?` (⏱ ${s.timerMin}min)`:""}</div>))}
+      </div>
+      <div style={{display:"flex",gap:8}}>
+        <button onClick={()=>setResult(null)} style={{flex:1,padding:"11px 0",borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer"}}>← Try Again</button>
+        <button onClick={()=>onSave(result)} style={{flex:2,padding:"11px 0",borderRadius:10,background:C.lime,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14}}>Save to Recipes</button>
+      </div>
+    </Sheet>);
+  }
+
+  return(<Sheet onClose={onClose} title="✨ Suggest a Recipe">
+    <div style={{fontSize:11,color:C.muted,marginBottom:12,lineHeight:1.4}}>Describe what you're after and the AI will build a full recipe — ingredients, instructions, timers included.</div>
+    <textarea value={description} onChange={e=>setDescription(e.target.value)} rows={3} placeholder="e.g. a quick high-protein pasta dish, or a chocolate dessert that's not too sweet" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:13,outline:"none",resize:"none",fontFamily:"inherit",marginBottom:12}}/>
+
+    <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginBottom:14,background:C.card,border:`1px solid ${C.border}`,borderRadius:9,padding:"10px 13px"}}>
+      <input type="checkbox" checked={fromPantry} onChange={e=>setFromPantry(e.target.checked)} style={{accentColor:C.lime,cursor:"pointer"}}/>
+      <div><div style={{fontSize:12,fontWeight:600,color:C.text}}>Only use my product labels</div><div style={{fontSize:10,color:C.muted,marginTop:1}}>{(products||[]).length} products in your pantry — otherwise the AI can suggest anything</div></div>
+    </label>
+
+    <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Nutritional focus</div>
+    <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:16}}>{FOCUS_OPTIONS.map(f=>(
+      <button key={f.id} onClick={()=>setFocus(f.id)} style={{padding:"9px 12px",borderRadius:9,border:`1px solid ${focus===f.id?C.lime:C.border}`,background:focus===f.id?`${C.lime}12`:C.bg,cursor:"pointer",textAlign:"left",fontSize:12,color:focus===f.id?C.lime:C.text,fontWeight:focus===f.id?700:400}}>{f.emoji} {f.label}</button>
+    ))}</div>
+
+    {err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:11,color:"#ff8080",marginBottom:12}}>{err}</div>}
+    <div style={{display:"flex",gap:8}}>
+      <button onClick={onClose} style={{flex:1,padding:"11px 0",borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer"}}>Cancel</button>
+      <button onClick={generate} disabled={generating} style={{flex:2,padding:"11px 0",borderRadius:10,background:generating?C.faint:C.lime,color:"#000",fontWeight:700,border:"none",cursor:generating?"default":"pointer",fontSize:14}}>{generating?"Generating…":"✨ Generate Recipe"}</button>
+    </div>
+  </Sheet>);
+}
+
+function RecipesSection({recipes, setRecipes, products, profile}){
+  const [expanded, setExpanded] = useState(false);
+  const [catFilter, setCatFilter] = useState(null);
+  const [viewing, setViewing] = useState(null); // recipe being viewed
+  const [editing, setEditing] = useState(null); // recipe being edited, or {} for new
+  const [suggesting, setSuggesting] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(null);
+
+  const filtered = (recipes||[]).filter(r=>!catFilter||r.category===catFilter);
+  const saveRecipe = rec => {
+    setRecipes(prev => {
+      const exists = (prev||[]).some(r=>r.id===rec.id);
+      return exists ? prev.map(r=>r.id===rec.id?rec:r) : [...(prev||[]), rec];
+    });
+    setEditing(null);
+    setSuggesting(false);
+    setViewing(rec);
+  };
+  const deleteRecipe = id => {
+    setRecipes(prev => (prev||[]).filter(r=>r.id!==id));
+    setConfirmDelete(null);
+    setViewing(null);
+  };
+
+  return(<div style={{marginBottom:16}}>
+    <button onClick={()=>setExpanded(p=>!p)} style={{width:"100%",padding:"12px 16px",borderRadius:12,background:C.card,border:`1px solid ${expanded?C.lime:C.border}`,color:expanded?C.lime:C.text,fontWeight:600,cursor:"pointer",fontSize:13,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:expanded?10:0}}>
+      <span>📖 Recipes ({(recipes||[]).length})</span><span style={{fontSize:11}}>{expanded?"▲":"▼"}</span>
+    </button>
+    {expanded && (<>
+      <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:10}}>
+        <button onClick={()=>setCatFilter(null)} style={{padding:"5px 10px",borderRadius:12,border:`1px solid ${!catFilter?C.lime:C.border}`,background:!catFilter?`${C.lime}18`:C.bg,color:!catFilter?C.lime:C.muted,cursor:"pointer",fontSize:11}}>All</button>
+        {RECIPE_CATEGORIES.map(c=>(<button key={c.id} onClick={()=>setCatFilter(catFilter===c.id?null:c.id)} style={{padding:"5px 10px",borderRadius:12,border:`1px solid ${catFilter===c.id?C.lime:C.border}`,background:catFilter===c.id?`${C.lime}18`:C.bg,color:catFilter===c.id?C.lime:C.muted,cursor:"pointer",fontSize:11}}>{c.emoji} {c.label}</button>))}
+      </div>
+      <div style={{display:"flex",gap:8,marginBottom:10}}>
+        <button onClick={()=>setEditing({})} style={{flex:1,padding:"10px 0",borderRadius:10,background:`${C.lime}12`,border:`1px solid ${C.lime}50`,color:C.lime,fontWeight:700,cursor:"pointer",fontSize:12.5}}>+ Add Recipe</button>
+        <button onClick={()=>setSuggesting(true)} style={{flex:1,padding:"10px 0",borderRadius:10,background:`${C.blue}12`,border:`1px solid ${C.blue}50`,color:C.blue,fontWeight:700,cursor:"pointer",fontSize:12.5}}>✨ Suggest a Recipe</button>
+      </div>
+      {filtered.length===0 && <div style={{textAlign:"center",padding:"20px 0",color:C.muted,fontSize:12}}>No recipes {catFilter?"in this category":"yet"}.</div>}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9}}>
+        {filtered.map(r=>{
+          const cat = recipeCatById(r.category);
+          return(<button key={r.id} onClick={()=>setViewing(r)} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,overflow:"hidden",cursor:"pointer",textAlign:"left",padding:0}}>
+            <div style={{position:"relative",width:"100%",height:100,background:C.bg,overflow:"hidden"}}>
+              {r.photo ? <img src={r.photo} style={recipePhotoStyle(r.photoPos,r.photoZoom)}/> : <div style={{width:"100%",height:"100%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:32}}>{cat.emoji}</div>}
+              <span style={{position:"absolute",top:6,right:6,background:"rgba(0,0,0,0.7)",borderRadius:6,padding:"2px 6px",fontSize:13}}>{cat.emoji}</span>
+              {r.generatedByAI&&<span style={{position:"absolute",top:6,left:6,background:`${C.blue}cc`,borderRadius:6,padding:"2px 6px",fontSize:10}}>✨</span>}
+            </div>
+            <div style={{padding:"8px 10px",fontSize:12,fontWeight:600,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.name}</div>
+          </button>);
+        })}
+      </div>
+    </>)}
+    {viewing && <RecipeDetailSheet recipe={viewing} onEdit={()=>{setEditing(viewing);setViewing(null);}} onDelete={()=>setConfirmDelete(viewing.id)} onClose={()=>setViewing(null)}/>}
+    {editing!==null && <RecipeEditSheet recipe={editing.id?editing:null} products={products} profile={profile} onSave={saveRecipe} onClose={()=>setEditing(null)}/>}
+    {suggesting && <RecipeSuggestSheet products={products} profile={profile} onSave={saveRecipe} onClose={()=>setSuggesting(false)}/>}
+    {confirmDelete && (<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",zIndex:70,display:"flex",alignItems:"center",justifyContent:"center",padding:20}} onClick={e=>e.target===e.currentTarget&&setConfirmDelete(null)}>
+      <div style={{background:C.card,border:"1px solid #5a1a1a",borderRadius:14,padding:20,maxWidth:320}}>
+        <div style={{fontSize:14,color:"#ff8080",marginBottom:14}}>Delete this recipe? This can't be undone.</div>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>setConfirmDelete(null)} style={{flex:1,padding:"9px 0",borderRadius:8,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer"}}>Cancel</button>
+          <button onClick={()=>deleteRecipe(confirmDelete)} style={{flex:1,padding:"9px 0",borderRadius:8,background:"#3a0a0a",border:"1px solid #ff4040",color:"#ff6060",fontWeight:700,cursor:"pointer"}}>Delete</button>
+        </div>
+      </div>
+    </div>)}
+  </div>);
+}
+
+function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,weightPhases,recipes,setRecipes}){
   const [modal,setModal]=useState(false);const [editPrep,setEditPrep]=useState(null);const [showProd,setShowProd]=useState(false);
   const [search,setSearch]=useState("");const [showAdd,setShowAdd]=useState(false);const [editPIdx,setEditPIdx]=useState(null);
   const formRef=useRef(null); // ref on the add/edit form div — scrolled to on edit
@@ -2499,7 +3821,10 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile}){
   return(<div style={{height:"100%",position:"relative"}}>
     <div style={{height:"100%",overflowY:"auto",padding:"0 16px 90px"}}>
       <div style={{padding:"18px 0 14px"}}><div style={{fontSize:26,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>Food</div><div style={{fontSize:12,color:C.muted}}>{active.length} active prep{active.length!==1?"s":""} · {products.length} products</div></div>
+      {/* Food Coach */}
+      <CoachPanel profile={profile} weights={weights||[]} products={products} mealPreps={mealPreps} weightPhases={weightPhases||[]} recipes={recipes} mode="food"/>
       <div style={{marginBottom:16}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Meal Preps</div>{mealPreps.length===0&&<div style={{textAlign:"center",padding:"16px 0",color:C.muted,fontSize:13}}>No meal preps yet. Tap + to create.</div>}{active.length>0&&<div style={{marginBottom:8}}><div style={{display:"flex",flexDirection:"column",gap:8}}>{active.map(p=><PrepCard key={p.id} prep={p}/>)}</div></div>}{done.length>0&&<div><button onClick={()=>setShowDone(p=>!p)} style={{width:"100%",padding:"8px 12px",borderRadius:10,background:C.card,border:`1px solid ${showDone?C.border:C.dim}`,color:C.muted,fontWeight:600,cursor:"pointer",fontSize:11,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:showDone?8:0,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}><span>Finished ({done.length})</span><span>{showDone?"▲":"▼"}</span></button>{showDone&&<div style={{display:"flex",flexDirection:"column",gap:8}}>{done.map(p=><PrepCard key={p.id} prep={p}/>)}</div>}</div>}</div>
+      <RecipesSection recipes={recipes} setRecipes={setRecipes} products={products} profile={profile}/>
       <button onClick={()=>setShowProd(p=>!p)} style={{width:"100%",padding:"12px 16px",borderRadius:12,background:C.card,border:`1px solid ${showProd?C.lime:C.border}`,color:showProd?C.lime:C.text,fontWeight:600,cursor:"pointer",fontSize:13,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:showProd?10:0}}><span>Product Labels ({products.length})</span><span style={{fontSize:11}}>{showProd?"▲":"▼"}</span></button>
       {showProd&&<div><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}><span style={{fontSize:11,color:C.muted}}>per 100g</span><button onClick={()=>{setShowAdd(p=>!p);setEditPIdx(null);setPForm({name:"",kcal:"",p:"",c:"",f:"",servingG:"",categories:[],supermarket:""});setScanImgs([]);}} style={{padding:"7px 14px",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>+ Add</button></div><input placeholder="Search products…" value={search} onChange={e=>setSearch(e.target.value)} style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"9px 14px",color:C.text,fontSize:13,outline:"none",marginBottom:8}}/>
       {saveToast&&(saveToast.type==="added"||saveToast.type==="updated")&&<div style={{background:`${C.lime}15`,border:`1px solid ${C.lime}66`,borderRadius:10,padding:"9px 13px",marginBottom:10,display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}><div style={{fontSize:12,color:C.lime,fontWeight:600}}>✓ {saveToast.type==="added"?"Added":"Updated"}: <span style={{fontFamily:"monospace"}}>{saveToast.name}</span></div><button onClick={()=>setSaveToast(null)} style={{background:"none",border:"none",color:C.lime,fontSize:16,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button></div>}
@@ -2559,9 +3884,8 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile}){
   </div>);
 }
 
-// ── Analysis Tab ──────────────────────────────────────────────────────────────
 // ── Coach Panel — free-form Q&A with full app context ───────────────────────
-function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
+function CoachPanel({profile, weights, products, mealPreps, weightPhases, gymSessions, gymSchedule, gymSettings, recipes, mode}) {
   const [question, setQuestion] = useState("");
   const [history, setHistory] = useState([]); // [{role, content}]
   const [historyLoaded, setHistoryLoaded] = useState(false);
@@ -2571,15 +3895,18 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
   const apiKey = profile?.apiKey;
+  // Sports and Food coaches keep entirely separate conversations — a workout question
+  // shouldn't show up in the middle of a recipe chat and vice versa.
+  const storageKey = mode === "sports" ? "fit_coach_history_sports" : "fit_coach_history_food";
 
   // Persist chat history across tab switches / app reloads — without this the whole
   // conversation vanished the moment CoachPanel unmounted (e.g. switching tabs).
   useEffect(() => {
-    store.get("fit_coach_history", []).then(h => { setHistory(Array.isArray(h)?h:[]); setHistoryLoaded(true); });
-  }, []);
+    store.get(storageKey, []).then(h => { setHistory(Array.isArray(h)?h:[]); setHistoryLoaded(true); });
+  }, [storageKey]);
   useEffect(() => {
-    if (historyLoaded) store.set("fit_coach_history", history);
-  }, [history, historyLoaded]);
+    if (historyLoaded) store.set(storageKey, history);
+  }, [history, historyLoaded, storageKey]);
 
   // Load recent logs on mount — also refreshed before each question so coach
   // always sees meals logged earlier in the same session.
@@ -2616,12 +3943,6 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
     ctx += "Goal mode: " + (profile?.goal||"cut") + (profile?.goalNote?" — \""+profile.goalNote+"\"":"") + ".\n";
     if (profile?.targetWeightKg) ctx += "Target weight: " + profile.targetWeightKg + "kg.\n";
     if (tdee) ctx += "Estimated TDEE: " + tdee + " kcal/day.\n";
-    // CRITICAL: give explicit, separately-labeled trend windows. A single ambiguous
-    // "recent trend" number caused the coach to answer "last week" questions using a
-    // ~3-week blended slope that could show net gain even when the most recent week
-    // was a clear loss. Each window below is computed independently — use the one that
-    // matches what the user is actually asking about (their wording, e.g. "this week",
-    // "last week" → WEEK; "this month", "last month", "overall" → MONTH).
     ctx += "WEIGHT TREND (use the window that matches the user's question — don't blend them):\n";
     ctx += "  • Last 7 days (WEEK): " + (tWeek!==null ? (tWeek<0?"-":"+") + Math.abs(tWeek).toFixed(2) + "kg/week (" + (tWeek<0?"losing":tWeek>0?"gaining":"flat") + ")" : "not enough recent data") + "\n";
     ctx += "  • Last 30 days (MONTH): " + (tMonth!==null ? (tMonth<0?"-":"+") + Math.abs(tMonth).toFixed(2) + "kg/week (" + (tMonth<0?"losing":tMonth>0?"gaining":"flat") + ")" : "not enough data") + "\n";
@@ -2631,17 +3952,14 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
     if (tWeek!==null && tMonth!==null && Math.sign(tWeek)!==Math.sign(tMonth) && tWeek!==0 && tMonth!==0) {
       ctx += "  NOTE: week and month trends point in OPPOSITE directions (e.g. lost this week but net gained over the month, or vice versa) — when answering, be explicit about which window you're citing.\n";
     }
-    // Day type targets
     ctx += "Day-type targets (kcal): ";
     ctx += Object.entries(DAY_TYPES).map(([k,v]) => v.label + " " + getDT(profile,k,latest,0,false).kcal).join(", ") + ".\n";
-    // Today's status
     if (todayLog) {
       const tot = (todayLog.meals||[]).reduce((a,m)=>({k:a.k+m.kcal,p:a.p+m.protein,c:a.c+m.carbs,f:a.f+m.fat}),{k:0,p:0,c:0,f:0});
       const burn = (todayLog.activities||[]).reduce((s,a)=>s+a.kcal,0)+(todayLog.burnedExtra||0);
       ctx += "TODAY ("+today+", " + (DAY_TYPES[todayLog.dayType]?.label||"Rest") + " day): consumed " + Math.round(tot.k) + " kcal / " + Math.round(tot.p) + "g P / " + Math.round(tot.c) + "g C / " + Math.round(tot.f) + "g F across " + (todayLog.meals||[]).length + " meals; activity burn " + Math.round(burn) + " kcal.\n";
       if ((todayLog.tags||[]).length) ctx += "Tags today: " + todayLog.tags.join(", ") + ".\n";
     }
-    // Last 7 days summary (compact)
     const lastWeekDates = Object.keys(recentLogs).sort((a,b)=>b.localeCompare(a)).slice(0,7);
     if (lastWeekDates.length > 1) {
       ctx += "\nLAST " + lastWeekDates.length + " DAYS:\n";
@@ -2654,23 +3972,6 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
         ctx += "  " + d + " (" + (DAY_TYPES[l.dayType]?.label||"rest") + "): " + Math.round(tot.k) + " kcal, " + Math.round(tot.p) + "g P, burned " + Math.round(burn) + " · " + acts + "\n";
       }
     }
-    // Active meal preps
-    const active = (mealPreps||[]).filter(p => (p.remainingWeightG||p.totalWeightG||0) > 0);
-    if (active.length) {
-      ctx += "\nACTIVE MEAL PREPS (available right now):\n";
-      for (const p of active.slice(0, 5)) {
-        const remG = Math.round(p.remainingWeightG ?? p.totalWeightG ?? 0);
-        ctx += "  - " + p.name + ": " + remG + "g left, " + (p.per100Kcal||0) + " kcal/100g, " + (p.per100Protein||0) + "g P/100g\n";
-      }
-    }
-    // Notable products from pantry
-    if ((products||[]).length) {
-      const high = products.filter(p => (p.p||0) >= 15).slice(0,12);
-      if (high.length) {
-        ctx += "\nHIGH-PROTEIN PANTRY ITEMS: " + high.map(p => p.name + " ("+p.kcal+"k/"+p.p+"P per 100g)").join("; ") + "\n";
-      }
-    }
-    // Weight phases — gives coach timeline context for goal transitions
     if ((weightPhases||[]).length) {
       ctx += "\nWEIGHT PHASES:\n";
       const sorted = [...weightPhases].sort((a,b) => b.startDate.localeCompare(a.startDate)).slice(0,5);
@@ -2682,6 +3983,38 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
           ? Math.round((new Date(p.endDate+"T12:00:00") - new Date(p.startDate+"T12:00:00")) / 86400000) + "d"
           : Math.round((Date.now() - new Date(p.startDate+"T12:00:00")) / 86400000) + "d so far";
         ctx += "  " + (isCurrent?"[ACTIVE] ":"") + p.label + " (" + p.goal + "): " + p.startDate + " → " + (p.endDate||"now") + " (" + dur + "), " + (p.startWeight||"?") + "kg → " + (endW||"?") + "kg = " + (parseFloat(delta)>0?"+":"") + delta + "kg\n";
+      }
+    }
+    if (mode === "sports") {
+      ctx += "\nTRAINING METHOD: " + (TRAINING_METHODS.find(m=>m.id===(gymSettings?.trainingMethod))?.label || "Maintain") + (gymSettings?.customNote?" — \""+gymSettings.customNote+"\"":"") + ".\n";
+      if ((gymSchedule||[]).length) ctx += "Scheduled gym days: " + gymSchedule.map(d=>WEEKDAYS[d].full).join(", ") + ".\n";
+      const recentSessions = (gymSessions||[]).slice(0,6);
+      if (recentSessions.length) {
+        ctx += "\nRECENT GYM SESSIONS:\n";
+        for (const s of recentSessions) {
+          const exSummary = (s.combos||[]).flatMap(c=>(c.exercises||[])).filter(e=>e.sets?.length).map(e=>e.name+" "+e.weight+"kg×"+e.sets.map(x=>x.reps).join("/")).join(", ");
+          ctx += "  " + s.date + " (" + (WEEKDAYS[s.weekday]?.full||"") + ", " + Math.round((s.durationSec||0)/60) + "min, +" + Math.round(s.kcalBurned||0) + "kcal): " + (exSummary||"no exercises logged") + "\n";
+        }
+      } else {
+        ctx += "\nNo gym sessions logged yet.\n";
+      }
+    } else {
+      const active = (mealPreps||[]).filter(p => (p.remainingWeightG||p.totalWeightG||0) > 0);
+      if (active.length) {
+        ctx += "\nACTIVE MEAL PREPS (available right now):\n";
+        for (const p of active.slice(0, 5)) {
+          const remG = Math.round(p.remainingWeightG ?? p.totalWeightG ?? 0);
+          ctx += "  - " + p.name + ": " + remG + "g left, " + (p.per100Kcal||0) + " kcal/100g, " + (p.per100Protein||0) + "g P/100g\n";
+        }
+      }
+      if ((products||[]).length) {
+        const high = products.filter(p => (p.p||0) >= 15).slice(0,12);
+        if (high.length) {
+          ctx += "\nHIGH-PROTEIN PANTRY ITEMS: " + high.map(p => p.name + " ("+p.kcal+"k/"+p.p+"P per 100g)").join("; ") + "\n";
+        }
+      }
+      if ((recipes||[]).length) {
+        ctx += "\nSAVED RECIPES: " + recipes.map(r=>r.name+" ("+r.category+")").join(", ") + "\n";
       }
     }
     return ctx;
@@ -2710,19 +4043,28 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
     setLoading(false);
   };
 
-  const suggestions = [
-    "What should I eat tomorrow morning before a 10km run?",
+  const suggestions = mode === "sports" ? [
+    "How's my training progressing this week?",
+    "Am I ready to increase weight on any lifts?",
+    "Suggest a warmup for leg day.",
+    "Should I train today given my recovery/nutrition?",
+  ] : [
+    "Suggest a high-protein meal from what's in my pantry.",
+    "What should I eat before/after training?",
     "Am I on track for my goal? Any adjustments?",
-    "Suggest a high-protein dinner from what's in my pantry.",
-    "How's my last week of training and nutrition looking?",
+    "How's my nutrition looking this week?",
   ];
+  const title = mode === "sports" ? "💪 Ask Sports Coach" : "🍽️ Ask Food Coach";
+  const subtitle = mode === "sports"
+    ? "Training, recovery, progression. The coach sees your weight trend, recent gym sessions, and training method. Tap any of your past questions to ask it again."
+    : "Nutrition, recipes, macros. The coach sees your weight trend, recent meals, pantry, and saved recipes. Tap any of your past questions to ask it again.";
 
   return(<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:"14px 16px",marginBottom:12}}>
     <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
-      <div style={{fontSize:14,fontWeight:600,color:C.text}}>💬 Ask Coach</div>
-      {history.length>0&&<button onClick={()=>{setHistory([]);store.set("fit_coach_history",[]);}} style={{fontSize:10,color:C.muted,background:"none",border:`1px solid ${C.border}`,borderRadius:5,padding:"3px 8px",cursor:"pointer"}}>Clear</button>}
+      <div style={{fontSize:14,fontWeight:600,color:C.text}}>{title}</div>
+      {history.length>0&&<button onClick={()=>{setHistory([]);store.set(storageKey,[]);}} style={{fontSize:10,color:C.muted,background:"none",border:`1px solid ${C.border}`,borderRadius:5,padding:"3px 8px",cursor:"pointer"}}>Clear</button>}
     </div>
-    <div style={{fontSize:11,color:C.muted,marginBottom:10}}>Free-form questions about training, nutrition, recovery. The coach sees your weight trend, recent meals, activities, and pantry. Tap any of your past questions to ask it again.</div>
+    <div style={{fontSize:11,color:C.muted,marginBottom:10}}>{subtitle}</div>
     {history.length>0&&<div ref={scrollRef} style={{maxHeight:380,overflowY:"auto",display:"flex",flexDirection:"column",gap:8,marginBottom:10,padding:"4px 2px"}}>
       {history.map((m,i)=>(
         <div key={i} style={{alignSelf:m.role==="user"?"flex-end":"flex-start",maxWidth:"85%"}}>
@@ -2758,122 +4100,6 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases}) {
   </div>);
 }
 
-function AnalysisTab({weights,profile,setProfile,progressPhotos,setProgressPhotos,products,mealPreps,weightPhases}){
-  const [imgs,setImgs]=useState([]);const [analyzing,setAnalyzing]=useState(false);const [result,setResult]=useState(null);const [err,setErr]=useState(null);const [expanded,setExpanded]=useState(null);
-  const latestWeight=weights[0]?.weight;
-  const trend=weeklyTrend(weights);       // 21-day linear regression (full history)
-  const trendShort=shortTrend(weights);   // 7-day linear regression (full history)
-  // Phase-scoped trends: use only weights logged since this phase started, so starting
-  // a new goal (e.g. cut→maintain) resets the trend to reflect current phase only.
-  // Falls back to full-history trend when < 2 phase weights available.
-  const currentPhaseStart=(weightPhases||[]).find(p=>!p.endDate)?.startDate;
-  const phaseWeights=currentPhaseStart
-    ?weights.filter(w=>w.date>=currentPhaseStart)
-    :weights;
-  const tWeek = phaseWeights.length>=2 ? shortTrend(phaseWeights) : trendShort;
-  const tMonth = phaseWeights.length>=3 ? weeklyTrend(phaseWeights) : trend;
-  const phaseScoped = phaseWeights.length>=2 && currentPhaseStart; // true = showing phase-only trend
-  const gc=gCol(profile.goal);
-  const spark=[...weights].reverse().slice(-20);const W=300,H=60;const vals=spark.map(w=>w.weight);const hasT=profile.targetWeightKg&&spark.length>1;const sMin=vals.length?Math.min(...vals,(hasT?profile.targetWeightKg:Infinity))-0.5:65;const sMax=vals.length?Math.max(...vals)+0.5:70;const px=i=>spark.length>1?(i/(spark.length-1))*W:W/2;const py=v=>H-((v-sMin)/(sMax-sMin))*(H-8)-4;
-  const startW=weights[weights.length-1]?.weight||latestWeight;
-  // BUG FIX: "Total lost/gained" was always computed from the oldest weight ever logged
-  // (all-time), so switching to maintenance still showed the full historical cut total
-  // (-8.35kg) instead of the near-zero change expected while maintaining. Scope this to
-  // the current phase instead — use the oldest weight logged *within* this phase.
-  const phaseStartW = phaseScoped ? (phaseWeights[phaseWeights.length-1]?.weight ?? startW) : startW;
-  const phaseDelta = (phaseStartW!=null && latestWeight!=null) ? (phaseStartW-latestWeight) : null;
-  const totalLost = phaseDelta; // kept as `totalLost` for the ETA/kgToGoal logic below, now phase-scoped
-  // Historical extremes: biggest single-phase loss and biggest single-phase gain across all
-  // CLOSED phases (completed transformations only — the active phase is shown separately above).
-  const closedPhases = (weightPhases||[]).filter(p=>p.endDate&&p.startWeight!=null&&p.endWeight!=null);
-  const phaseDeltas = closedPhases.map(p=>({delta:p.endWeight-p.startWeight, phase:p}));
-  const maxLostPhase = phaseDeltas.filter(d=>d.delta>0).sort((a,b)=>b.delta-a.delta)[0]||null;   // startW>endW → weight dropped
-  const maxGainedPhase = phaseDeltas.filter(d=>d.delta<0).sort((a,b)=>a.delta-b.delta)[0]||null; // endW>startW → weight rose
-  const kgToGoal=profile.targetWeightKg&&latestWeight?latestWeight-profile.targetWeightKg:null;
-  // ETA: use phase-scoped 7d trend first (most relevant), fall back to phase 21d, then full history
-  const etaTrend=(tWeek&&kgToGoal&&Math.sign(kgToGoal)!==Math.sign(tWeek))?tWeek:(tMonth&&kgToGoal&&Math.sign(kgToGoal)!==Math.sign(tMonth))?tMonth:null;
-  const weeksETA=etaTrend&&kgToGoal&&Math.sign(kgToGoal)!==Math.sign(etaTrend)?Math.abs(kgToGoal/etaTrend):null;
-  const goalDate=weeksETA?new Date(Date.now()+weeksETA*7*24*3600*1000):null;
-  const tdee=latestWeight?getTDEE(profile,latestWeight):null;
-  const analyze=async()=>{if(!imgs.length)return;setAnalyzing(true);setErr(null);try{
-    const res=await aAnalysis(imgs,profile,latestWeight,trend,profile.apiKey);
-    setResult(res);
-    // Properly resize to a small thumbnail (truncating base64 produces a broken image)
-    const thumb=await resizeImg(imgs[0].preview,360);
-    const entry={id:Date.now(),date:TODAY(),preview:thumb,analysis:res};
-    setProgressPhotos(p=>[entry,...p].slice(0,50));setImgs([]);
-  }catch(e){setErr(String(e.message||e));}setAnalyzing(false);};
-  return(<div style={{height:"100%",overflowY:"auto",padding:"0 16px 20px"}}>
-    <div style={{padding:"18px 0 12px"}}><div style={{fontSize:26,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>Analysis</div></div>
-    {latestWeight&&<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:"14px 16px",marginBottom:12}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
-        <div><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>{profile.goal==="cut"?"Cutting":profile.goal==="bulk"?"Bulking":"Maintaining"}</div><div style={{display:"flex",alignItems:"baseline",gap:5,marginTop:4}}><span style={{fontSize:36,fontWeight:900,fontFamily:"monospace",color:C.text,letterSpacing:"-0.03em",lineHeight:1}}>{latestWeight.toFixed(2)}</span><span style={{fontSize:14,color:C.muted}}>kg</span></div>
-          <div style={{display:"flex",gap:10,marginTop:4,flexWrap:"wrap"}}>
-            {tWeek!==null&&<span style={{fontSize:11,color:tWeek<0?C.lime:C.red,fontFamily:"monospace"}}>{tWeek<0?"↓":"↑"}{Math.abs(tWeek).toFixed(2)}/wk <span style={{color:C.muted,fontSize:9}}>{phaseScoped?"this phase · 7d":"7d"}</span></span>}
-            {tMonth!==null&&<span style={{fontSize:11,color:tMonth<0?C.lime+"99":C.red+"99",fontFamily:"monospace"}}>{tMonth<0?"↓":"↑"}{Math.abs(tMonth).toFixed(2)}/wk <span style={{color:C.muted,fontSize:9}}>{phaseScoped?"this phase · 21d":"21d"}</span></span>}
-            {phaseScoped&&phaseWeights.length<2&&<span style={{fontSize:10,color:C.yellow,fontFamily:"monospace"}}>new phase — log a few weights for trend</span>}
-          </div>
-        </div>
-        <div style={{textAlign:"right"}}>{totalLost!==null&&<div>{profile.goal==="maintain"?(<>
-          <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>Δ this phase</div>
-          <div style={{fontSize:18,fontWeight:800,fontFamily:"monospace",color:Math.abs(totalLost)<0.5?C.lime:C.yellow}}>{totalLost>0?"-":totalLost<0?"+":""}{Math.abs(totalLost).toFixed(2)}kg</div>
-        </>):(<>
-          <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>{phaseScoped?"This phase":"Total"} {profile.goal==="bulk"?(totalLost<0?"gained":"lost"):(totalLost>0?"lost":"gained")}</div>
-          <div style={{fontSize:18,fontWeight:800,fontFamily:"monospace",color:(profile.goal==="bulk"?totalLost<0:totalLost>0)?C.lime:C.red}}>{(profile.goal==="bulk"?totalLost<0:totalLost>0)?"-":""}{Math.abs(totalLost).toFixed(2)}kg</div>
-        </>)}</div>}{tdee&&<div style={{marginTop:4}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>TDEE</div><div style={{fontSize:14,fontWeight:700,fontFamily:"monospace",color:C.blue}}>{tdee} kcal</div></div>}</div>
-      </div>
-      {(maxLostPhase||maxGainedPhase)&&<div style={{display:"flex",gap:8,marginBottom:8,flexWrap:"wrap"}}>
-        {maxLostPhase&&<div style={{flex:1,minWidth:120,background:C.bg,borderRadius:8,padding:"6px 10px"}}><div style={{fontSize:9,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>📉 Max lost (all-time)</div><div style={{fontSize:13,fontWeight:700,fontFamily:"monospace",color:C.lime}}>{Math.abs(maxLostPhase.delta).toFixed(2)}kg</div><div style={{fontSize:9,color:C.muted,marginTop:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{maxLostPhase.phase.label||maxLostPhase.phase.goal}</div></div>}
-        {maxGainedPhase&&<div style={{flex:1,minWidth:120,background:C.bg,borderRadius:8,padding:"6px 10px"}}><div style={{fontSize:9,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>📈 Max gained (all-time)</div><div style={{fontSize:13,fontWeight:700,fontFamily:"monospace",color:C.blue}}>{Math.abs(maxGainedPhase.delta).toFixed(2)}kg</div><div style={{fontSize:9,color:C.muted,marginTop:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{maxGainedPhase.phase.label||maxGainedPhase.phase.goal}</div></div>}
-      </div>}
-      {spark.length>=3&&<svg width="100%" viewBox={"0 0 "+W+" "+H} style={{display:"block",marginBottom:8}}>
-        {hasT&&<line x1={0} y1={py(profile.targetWeightKg)} x2={W} y2={py(profile.targetWeightKg)} stroke={gc+"50"} strokeWidth={1} strokeDasharray="4 4"/>}
-        <polyline points={spark.map((d,i)=>px(i)+","+py(d.weight)).join(" ")} fill="none" stroke={C.lime+"40"} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round"/>
-        <polyline points={spark.map((d,i)=>px(i)+","+py(d.weight)).join(" ")} fill="none" stroke={C.lime} strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round"/>
-        <circle cx={px(spark.length-1)} cy={py(spark[spark.length-1].weight)} r={4} fill={C.lime}/>
-      </svg>}
-      <div style={{display:"flex",gap:8}}>{kgToGoal!==null&&<div style={{flex:1,background:C.bg,borderRadius:8,padding:"8px 10px"}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>To goal</div><div style={{fontSize:18,fontWeight:800,fontFamily:"monospace",color:gc}}>{Math.abs(kgToGoal).toFixed(1)}kg</div></div>}{weeksETA&&goalDate?<div style={{flex:2,background:C.bg,borderRadius:8,padding:"8px 10px"}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>ETA</div><div style={{fontSize:14,fontWeight:700,color:gc}}>{goalDate.toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</div><div style={{fontSize:10,color:C.muted}}>~{Math.round(weeksETA)} weeks · {etaTrend===tWeek?"7d":"21d"} pace ({phaseScoped?"this phase · ":""}{etaTrend<0?"↓":"↑"}{Math.abs(etaTrend).toFixed(2)}/wk)</div></div>:profile.targetWeightKg?(()=>{
-        // Fallback messages, in priority order
-        const atGoal = kgToGoal !== null && Math.abs(kgToGoal) < 0.3;
-        const notEnoughData = trend === null;
-        // Same signs = trend moving AWAY from goal (e.g. above target AND gaining, or below target AND losing)
-        const wrongDirection = trend !== null && kgToGoal !== null && Math.sign(kgToGoal) === Math.sign(trend) && !atGoal && Math.abs(trend)>0.05;
-        let msg;
-        if (atGoal) msg = "At goal — focus on maintenance";
-        else if (notEnoughData) msg = "Log 4+ weights over ~3 days for estimate";
-        else if (wrongDirection) msg = (profile.goal==="cut"?"Trend is up — need a deficit":profile.goal==="bulk"?"Trend is down — need a surplus":"Trending away from target");
-        else msg = "Trend too flat to estimate";
-        return (<div style={{flex:2,background:C.bg,borderRadius:8,padding:"8px 10px"}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>ETA</div><div style={{fontSize:12,color:C.muted}}>{msg}</div></div>);
-      })():null}</div>
-    </div>}
-    <CoachPanel profile={profile} weights={weights} products={products} mealPreps={mealPreps} weightPhases={weightPhases}/>
-    <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:"14px 16px",marginBottom:12}}>
-      <div style={{fontSize:14,fontWeight:600,color:C.text,marginBottom:4}}>Body Composition Analysis</div>
-      <div style={{fontSize:12,color:C.muted,marginBottom:10}}>Upload a photo — AI assesses physique vs goal: <span style={{color:gc}}>"{profile.goalNote||"visible abs"}"</span></div>
-      <ImgZone imgs={imgs} setImgs={setImgs} compact maxPhotos={3}/>
-      {err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ff8080",margin:"8px 0",wordBreak:"break-word"}}>{err}</div>}
-      {imgs.length>0&&<button onClick={analyze} disabled={analyzing} style={{width:"100%",padding:"11px 0",borderRadius:10,background:analyzing?C.faint:C.lime,border:"none",color:"#000",fontWeight:700,cursor:analyzing?"default":"pointer",fontSize:14,marginTop:8}}>{analyzing?"Analyzing…":"Analyze & Get Feedback"}</button>}
-    </div>
-    {result&&<div style={{background:C.card,border:"1px solid "+gc+"40",borderRadius:14,padding:"14px 16px",marginBottom:12}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}><span style={{fontSize:13,fontWeight:600,color:C.text}}>Assessment</span><div style={{display:"flex",gap:8}}>{result.estimatedBfPct?<span style={{fontFamily:"monospace",fontSize:14,fontWeight:700,color:C.muted}}>{result.estimatedBfPct}%</span>:null}{result.targetBfPct?<span style={{fontFamily:"monospace",fontSize:14,fontWeight:700,color:gc}}>{result.targetBfPct}% target</span>:null}</div></div>
-      {result.verdict&&<div style={{fontSize:12,background:gc+"18",color:gc,padding:"5px 10px",borderRadius:8,marginBottom:8,fontWeight:600}}>{result.verdict}</div>}
-      {result.goalDateStr&&<div style={{background:C.bg,borderRadius:8,padding:"8px 12px",marginBottom:8}}><div style={{fontSize:11,color:C.muted}}>Goal deadline (AI parsed)</div><div style={{fontSize:15,fontWeight:700,color:gc,marginTop:2}}>{result.goalDateStr}</div>{result.weeksToGoalDate?<div style={{fontSize:11,color:C.muted,marginTop:2}}>{result.weeksToGoalDate} weeks · need {result.neededKgPerWeek}kg/week{result.isAchievable?" — achievable":" — very aggressive"}</div>:null}</div>}
-      {result.estimatedKgToGoal?<div style={{fontSize:12,color:C.muted,marginBottom:8}}>Est. {result.estimatedKgToGoal}kg to lose → target ~{result.targetWeight}kg</div>:null}
-      {result.assessment&&<div style={{fontSize:13,color:C.text,marginBottom:8,lineHeight:1.5}}>{result.assessment}</div>}
-      {result.recommendations&&<div style={{fontSize:12,color:C.muted,lineHeight:1.5,borderTop:"1px solid "+C.border,paddingTop:8,marginTop:4}}>{result.recommendations}</div>}
-      {result.targetWeight&&<button onClick={()=>setProfile(p=>({...p,targetWeightKg:result.targetWeight}))} style={{width:"100%",padding:"9px 0",borderRadius:8,background:gc+"20",border:"1px solid "+gc+"40",color:gc,fontWeight:700,cursor:"pointer",fontSize:13,marginTop:10}}>Set {result.targetWeight}kg as goal weight</button>}
-    </div>}
-    {progressPhotos.length>0&&<div><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Progress Photos ({progressPhotos.length}/12)</div>
-      <div style={{display:"flex",flexWrap:"wrap",gap:8}}>{progressPhotos.map(photo=><div key={photo.id} style={{position:"relative",cursor:"pointer"}} onClick={()=>setExpanded(expanded===photo.id?null:photo.id)}>
-        <img src={photo.preview} alt="" style={{width:80,height:80,borderRadius:10,objectFit:"cover",border:"2px solid "+(expanded===photo.id?gc:C.border)}}/>
-        <div style={{position:"absolute",bottom:0,left:0,right:0,background:"rgba(0,0,0,0.7)",borderRadius:"0 0 8px 8px",padding:"2px 5px"}}><div style={{fontSize:9,color:"#fff",fontFamily:"monospace"}}>{new Date(photo.date+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"})}</div></div>
-        {photo.analysis?.estimatedBfPct&&<div style={{position:"absolute",top:3,left:3,background:"rgba(0,0,0,0.75)",borderRadius:4,padding:"1px 5px",fontSize:9,color:C.lime,fontFamily:"monospace"}}>{photo.analysis.estimatedBfPct}%</div>}
-        <button onClick={e=>{e.stopPropagation();setProgressPhotos(p=>p.filter(x=>x.id!==photo.id));if(expanded===photo.id)setExpanded(null);}} style={{position:"absolute",top:-5,right:-5,width:17,height:17,borderRadius:"50%",background:C.red,border:"none",color:"#fff",fontSize:10,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>
-      </div>)}</div>
-      {expanded&&(()=>{const a=progressPhotos.find(p=>p.id===expanded)?.analysis;if(!a)return null;return(<div style={{background:C.card,border:"1px solid "+C.border,borderRadius:10,padding:"12px 14px",marginTop:8}}><div style={{display:"flex",gap:10,marginBottom:6}}>{a.estimatedBfPct&&<span style={{fontFamily:"monospace",fontSize:13,color:C.muted}}>BF: {a.estimatedBfPct}%</span>}{a.verdict&&<span style={{fontSize:12,color:gc,fontWeight:600}}>{a.verdict}</span>}</div>{a.assessment&&<div style={{fontSize:12,color:C.text,lineHeight:1.5}}>{a.assessment}</div>}</div>);})()}
-    </div>}
-  </div>);
-}
 // ── History Tab (shows weight per day) ───────────────────────────────────────
 function HistoryTab({weights,products,profile}){
   const [dates,setDates]=useState([]);const [logs,setLogs]=useState({});const [expanded,setExpanded]=useState(null);const [loading,setLoading]=useState(true);
@@ -3137,7 +4363,7 @@ function SettingsTab({profile,setProfile,weights,setWeights,weightPhases,setWeig
   const AGE=calcAge(profile.birthday);
   const saveProfile=()=>{setProfile({...pf,heightCm:parseFloat(pf.heightCm)||null,apiKey:pf.apiKey||""});setEditProf(false);};
   const exportData=async()=>{
-    const keys=["fit_dates","fit_weights","fit_products","fit_mealpreps","fit_profile","fit_photos","fit_weight_phases","fit_seeded_presets"];
+    const keys=["fit_dates","fit_weights","fit_products","fit_mealpreps","fit_profile","fit_photos","fit_weight_phases","fit_seeded_presets","fit_gym_schedule","fit_gym_templates","fit_gym_sessions","fit_gym_settings","fit_gym_exercise_library","fit_recipes"];
     const out={};for(const k of keys){out[k]=await store.get(k,null);}
     const dates=out.fit_dates||[];for(const d of dates){out["fit_day_"+d]=await store.get("fit_day_"+d,null);}
     const blob=new Blob([JSON.stringify(out,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="fitness-data-"+TODAY()+".json";a.click();URL.revokeObjectURL(url);setExportMsg("Exported!");setTimeout(()=>setExportMsg(""),2000);
@@ -3340,7 +4566,7 @@ function OnboardingScreen({onDone}){
 }
 
 function Nav({tab,setTab}){
-  const tabs=[["today","◉","Today"],["activity","⚡","Activity"],["food","🍱","Food"],["analysis","📊","Analysis"],["history","▤","History"],["settings","⚙","Settings"]];
+  const tabs=[["today","◉","Today"],["activity","⚡","Activity"],["food","🍱","Food"],["history","▤","History"],["settings","⚙","Settings"]];
   return(<div style={{height:52,background:C.surf,borderTop:`1px solid ${C.border}`,display:"flex",flexShrink:0}}>{tabs.map(([id,icon,label])=>(<button key={id} onClick={()=>setTab(id)} style={{flex:1,background:"none",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1,padding:"3px 0"}}><span style={{fontSize:13,color:tab===id?C.lime:C.muted,lineHeight:1}}>{icon}</span><span style={{fontSize:7.5,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.03em",color:tab===id?C.lime:C.muted,fontWeight:tab===id?700:400}}>{label}</span></button>))}</div>);
 }
 
@@ -3365,6 +4591,16 @@ function ImportScreen({onImport,onSkip}){
 
 function App(){
   const [tab,setTab]=useState("today");const [dayData,setDayData_]=useState(null);const [weights,setWeights_]=useState([]);const [products,setProducts_]=useState([]);const [mealPreps,setMealPreps_]=useState([]);const [profile,setProfile_]=useState(null);const [progressPhotos,setProgressPhotos_]=useState([]);const [weightPhases,setWeightPhases_]=useState([]);const [ready,setReady]=useState(false);
+  // Gym tracking state — schedule (which weekdays), per-weekday templates, completed session
+  // history, overall training method settings, and the currently in-progress session (if any,
+  // persisted continuously so it survives an app reload mid-workout).
+  const [gymSchedule,setGymSchedule_]=useState([]);
+  const [gymTemplates,setGymTemplates_]=useState({});
+  const [gymSessions,setGymSessions_]=useState([]);
+  const [gymSettings,setGymSettings_]=useState({trainingMethod:"maintain",customNote:""});
+  const [gymActiveSession,setGymActiveSession_]=useState(null);
+  const [gymExerciseLibrary,setGymExerciseLibrary_]=useState([]);
+  const [recipes,setRecipes_]=useState([]);
   // `today` is reactive state, not a const. If we use a const, leaving the app open across
   // midnight means React renders with a NEW today value but dayData still holds yesterday's
   // meals — and the setDayData closure writes that stale payload to today's storage key,
@@ -3436,7 +4672,32 @@ function App(){
     const wts=await store.get("fit_weights",[]);const preps=await store.get("fit_mealpreps",[]);
     const prof=await store.get("fit_profile",null)||DEFAULT_PROFILE;const photos=await store.get("fit_photos",[]);
     const phases=await store.get("fit_weight_phases",[]);
+    const gSchedule=await store.get("fit_gym_schedule",[]);
+    const gTemplates=await store.get("fit_gym_templates",{});
+    const gSessions=await store.get("fit_gym_sessions",[]);
+    const gSettings=await store.get("fit_gym_settings",{trainingMethod:"maintain",customNote:""});
+    const gActive=await store.get("fit_gym_active_session",null);
+    // Exercise library: seed with defaults on first load. On later loads, merge in any exercise
+    // names already used in templates/sessions that aren't in the library yet (e.g. from an
+    // older version before this library existed) as custom entries with no category yet.
+    let gLibrary=await store.get("fit_gym_exercise_library",null);
+    if(!gLibrary){
+      gLibrary=DEFAULT_EXERCISES.map(e=>({id:normExName(e.name),name:e.name,category:e.category,muscleGroup:e.muscleGroup,note:"",custom:false}));
+      await store.set("fit_gym_exercise_library",gLibrary);
+    }else{
+      const known=new Set(gLibrary.map(e=>normExName(e.name)));
+      const usedNames=new Set();
+      Object.values(gTemplates||{}).forEach(t=>(t?.combos||[]).forEach(c=>(c.exercises||[]).forEach(ex=>usedNames.add(ex.name))));
+      (gSessions||[]).forEach(s=>(s.combos||[]).forEach(c=>(c.exercises||[]).forEach(ex=>usedNames.add(ex.name))));
+      const toAdd=[...usedNames].filter(n=>n&&!known.has(normExName(n)));
+      if(toAdd.length){
+        gLibrary=[...gLibrary,...toAdd.map(n=>({id:normExName(n)+Date.now(),name:n,category:"Other",muscleGroup:"Full Body",note:"",custom:true}))];
+        await store.set("fit_gym_exercise_library",gLibrary);
+      }
+    }
+    const rRecipes=await store.get("fit_recipes",[]);
     setProducts_(prods);setDayData_(day);setWeights_(wts);setMealPreps_(preps);setProfile_(prof);setProgressPhotos_(photos);setWeightPhases_(Array.isArray(phases)?phases:[]);
+    setGymSchedule_(Array.isArray(gSchedule)?gSchedule:[]);setGymTemplates_(gTemplates||{});setGymSessions_(Array.isArray(gSessions)?gSessions:[]);setGymSettings_(gSettings||{trainingMethod:"maintain",customNote:""});setGymActiveSession_(gActive||null);setGymExerciseLibrary_(gLibrary);setRecipes_(Array.isArray(rRecipes)?rRecipes:[]);
     setToday(bootDate); // Make sure state matches what we just loaded
     lastLoadedDate.current = bootDate;
     setReady(true);
@@ -3464,6 +4725,13 @@ function App(){
   const setProfile=useCallback(upd=>{setProfile_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_profile",n);return n;});},[]);
   const setProgressPhotos=useCallback(upd=>{setProgressPhotos_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_photos",n);return n;});},[]);
   const setWeightPhases=useCallback(upd=>{setWeightPhases_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_weight_phases",n);return n;});},[]);
+  const setGymSchedule=useCallback(upd=>{setGymSchedule_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_schedule",n);return n;});},[]);
+  const setGymTemplates=useCallback(upd=>{setGymTemplates_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_templates",n);return n;});},[]);
+  const setGymSessions=useCallback(upd=>{setGymSessions_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_sessions",n);return n;});},[]);
+  const setGymSettings=useCallback(upd=>{setGymSettings_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_settings",n);return n;});},[]);
+  const setGymActiveSession=useCallback(upd=>{setGymActiveSession_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_active_session",n);return n;});},[]);
+  const setGymExerciseLibrary=useCallback(upd=>{setGymExerciseLibrary_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_exercise_library",n);return n;});},[]);
+  const setRecipes=useCallback(upd=>{setRecipes_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_recipes",n);return n;});},[]);
   const latestWeight=weights[0]?.weight;
   // Auto-revert temporary goal when its revert date arrives
   useEffect(()=>{
@@ -3474,8 +4742,7 @@ function App(){
     }
   },[profile?.temporaryGoal,today]);
   const needsOnboarding=!profile?.birthday||!profile?.heightCm;
-  const [showImport,setShowImport]=useState(null); // null=loading, true=show, false=skip
-  // On first mount: if no profile exists at all, offer import before onboarding
+  const [showImport,setShowImport]=useState(null);
   useEffect(()=>{if(ready){setShowImport(prev=>prev===null?(!profile?.birthday):prev);}}, [ready]);
   const handleImportDone=async(n)=>{setShowImport(false);window.location.reload();};
   if(!ready||!profile||showImport===null)return(<div style={{background:C.bg,height:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}}><div style={{color:C.muted,fontFamily:"monospace",fontSize:13}}>Loading…</div></div>);
@@ -3490,9 +4757,8 @@ function App(){
     </div>}
     <div style={{flex:1,overflow:"hidden"}}>
       {tab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")}/>}
-      {tab==="activity"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases}/>}
-      {tab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile}/>}
-      {tab==="analysis"&&<AnalysisTab weights={weights} profile={profile} setProfile={setProfile} progressPhotos={progressPhotos} setProgressPhotos={setProgressPhotos} products={products} mealPreps={mealPreps} weightPhases={weightPhases}/>}
+      {tab==="activity"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary}/>}
+      {tab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes}/>}
       {tab==="history"&&<HistoryTab weights={weights} products={products} profile={profile}/>}
       {tab==="settings"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight}/>}
     </div>
@@ -3500,9 +4766,8 @@ function App(){
   </div>);
 }
 
-const { createElement: ce } = React;
 const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(ce(App));
+root.render(<App/>);
 </script>
 </body>
 </html>

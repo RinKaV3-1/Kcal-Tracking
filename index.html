@@ -2602,6 +2602,21 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
   const [addExMode, setAddExMode] = useState(false);
   const [newExName, setNewExName] = useState("");
   const [swapOpenFor, setSwapOpenFor] = useState(null); // exercise id showing swap alternatives
+  const [undoStack, setUndoStack] = useState([]); // snapshots of session before each discrete action
+  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [showJumpCombo, setShowJumpCombo] = useState(false);
+  const [showCooldownChoice, setShowCooldownChoice] = useState(false); // "Finish or Cooldown?" prompt
+  const [stretchTarget, setStretchTarget] = useState(null); // {duration, startedAt} for the 30s/60s stretch timer, or null
+  const [stretchRemaining, setStretchRemaining] = useState(0);
+
+  useEffect(() => {
+    if (!stretchTarget) { setStretchRemaining(0); return; }
+    const tick = () => setStretchRemaining(Math.max(0, stretchTarget.duration - Math.floor((Date.now()-stretchTarget.startedAt)/1000)));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [stretchTarget]);
+  const startStretchTimer = duration => setStretchTarget({duration, startedAt:Date.now()});
 
   useEffect(() => {
     if (showFinish) return; // frozen once Finish is tapped — don't keep ticking while confirming
@@ -2617,20 +2632,61 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
   }, [session.resting, session.restStartedAt]);
 
   const fmtTime = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
+  // Continuous field edits (typing weight, warmup fields, etc) — no undo tracking, would flood the stack.
   const update = fn => setSession(prev => fn({...prev}));
+  // Discrete actions (log set, advance round/combo, skip, reorder) — snapshot first so an
+  // accidental tap can always be undone.
+  const updateAction = fn => { setUndoStack(prev => [session, ...prev].slice(0,10)); setSession(prev => fn({...prev})); };
+  const undo = () => { if (!undoStack.length) return; const [last, ...rest] = undoStack; setSession(last); setUndoStack(rest); };
   const libFor = name => (gymExerciseLibrary||[]).find(e=>normExName(e.name)===normExName(name));
 
-  // Route "done with lifting" through cooldown if the plan has one and it isn't done yet;
-  // otherwise go straight to the finish confirmation.
+  const hasLoggedAnything = (session.combos||[]).some(c=>(c.exercises||[]).some(e=>(e.sets||[]).length>0));
+  const tryCancel = () => { if (hasLoggedAnything) setShowCancelConfirm(true); else onCancel(); };
+
+  // "Done with lifting" now always asks: finish now, or cooldown/stretch first? Cooldown is
+  // always available (buildSessionFromTemplate creates it unconditionally), so this choice
+  // shows every time until cooldown has actually been done or explicitly skipped.
   const goToFinishOrCooldown = () => {
     if (session.cooldown && !session.cooldown.done) {
-      update(s=>({...s, cooldownStarted:true}));
+      setShowCooldownChoice(true);
     } else {
       setElapsed(Math.floor((Date.now()-session.startedAt)/1000));
       setShowFinish(true);
     }
   };
   const goToFinish = () => { setElapsed(Math.floor((Date.now()-session.startedAt)/1000)); setShowFinish(true); };
+  const enterCooldown = () => { setShowCooldownChoice(false); updateAction(s=>({...s, cooldownStarted:true})); };
+  // Advance to the next exercise in the round (used by both "Log Set" and "Skip exercise").
+  // loggedReps is null when skipping — the exercise's sets array is left untouched.
+  const advanceExercise = (comboIdx, exId, loggedReps) => {
+    updateAction(s=>{
+      const c={...s.combos[comboIdx]};
+      c.exercises=c.exercises.map(x=>x.id===exId&&loggedReps!=null?{...x,sets:[...x.sets,{reps:loggedReps}]}:x);
+      const combos=[...s.combos]; combos[comboIdx]=c;
+      let nextEx=s.currentExInRound+1; let resting=false; let restStartedAt=s.restStartedAt;
+      if(nextEx>=c.exercises.length){ nextEx=0; resting=true; restStartedAt=Date.now(); }
+      return{...s, combos, currentExInRound:nextEx, resting, restStartedAt};
+    });
+  };
+  const skipCombo = () => {
+    updateAction(s=>{
+      if (s.currentComboIdx>=s.combos.length-1) return s; // last combo — nothing to skip to, use Finish instead
+      return {...s, currentComboIdx:s.currentComboIdx+1, currentExInRound:0, resting:false};
+    });
+  };
+  const jumpToCombo = idx => {
+    updateAction(s=>({...s, currentComboIdx:idx, currentExInRound:0, resting:false}));
+    setShowJumpCombo(false);
+  };
+  const moveExercise = (comboIdx, idx, dir) => {
+    updateAction(s=>{
+      const c={...s.combos[comboIdx]}; const arr=[...c.exercises]; const j=idx+dir;
+      if(j<0||j>=arr.length) return s;
+      [arr[idx],arr[j]]=[arr[j],arr[idx]]; c.exercises=arr;
+      const combos=[...s.combos]; combos[comboIdx]=c;
+      return {...s, combos};
+    });
+  };
 
   // ── Warmup step ──
   if (session.warmup && !session.warmup.done) {
@@ -2646,8 +2702,23 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       </div>):(
         <textarea value={session.warmup.notes||""} onChange={e=>update(s=>({...s,warmup:{...s.warmup,notes:e.target.value}}))} placeholder="Describe your warmup…" rows={2} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:13,outline:"none",resize:"none",fontFamily:"inherit",marginBottom:9}}/>
       )}
-      <button onClick={()=>update(s=>({...s,warmup:{...s.warmup,done:true}}))} style={{width:"100%",padding:"11px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14}}>✓ Finish Warmup</button>
-      <button onClick={onCancel} style={{width:"100%",padding:"8px 0",marginTop:8,background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:11}}>Cancel session</button>
+      <button onClick={()=>updateAction(s=>({...s,warmup:{...s.warmup,done:true}}))} style={{width:"100%",padding:"11px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14}}>✓ Finish Warmup</button>
+      <div style={{display:"flex",justifyContent:"center",gap:16,marginTop:8}}>
+        <button onClick={()=>updateAction(s=>({...s,warmup:{...s.warmup,done:true}}))} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:11,textDecoration:"underline"}}>Skip warmup</button>
+        <button onClick={tryCancel} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:11}}>Cancel session</button>
+      </div>
+      {showCancelConfirm&&<CancelConfirmBox onSaveFinish={()=>{setShowCancelConfirm(false);goToFinish();}} onDiscard={onCancel} onKeepGoing={()=>setShowCancelConfirm(false)}/>}
+    </div>);
+  }
+
+  // ── "Finish or Cooldown?" choice ──
+  if (showCooldownChoice) {
+    return(<div style={{background:C.card,border:`1px solid ${C.lime}`,borderRadius:14,padding:"18px",marginBottom:14,textAlign:"center"}}>
+      <div style={{fontSize:28,marginBottom:6}}>🏁</div>
+      <div style={{fontSize:15,fontWeight:700,color:C.text,marginBottom:6}}>All combos done!</div>
+      <div style={{fontSize:12,color:C.muted,marginBottom:18}}>Finish up now, or take a few minutes to stretch and cool down first?</div>
+      <button onClick={enterCooldown} style={{width:"100%",padding:"13px 0",borderRadius:10,background:C.blue,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14,marginBottom:9}}>❄️ Cooldown / Stretch</button>
+      <button onClick={()=>{setShowCooldownChoice(false);goToFinish();}} style={{width:"100%",padding:"11px 0",borderRadius:10,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:13}}>🏁 Finish Workout</button>
     </div>);
   }
 
@@ -2660,12 +2731,27 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
         <span style={{fontSize:13,fontWeight:700,color:C.blue}}>{machine.emoji} Cooldown</span>
         <span style={{fontFamily:"monospace",fontSize:12,color:C.muted}}>{fmtTime(elapsed)}</span>
       </div>
+
+      {/* Quick stretch timers — tap 30s/60s per stretch, re-tap for the next one */}
+      <div style={{background:C.bg,borderRadius:10,padding:"12px 14px",marginBottom:12,textAlign:"center"}}>
+        <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:8}}>Stretch Timer</div>
+        {stretchTarget?(<>
+          <div style={{fontSize:34,fontWeight:900,fontFamily:"monospace",color:stretchRemaining<=0?C.lime:C.blue,marginBottom:4}}>{fmtTime(stretchRemaining)}</div>
+          <div style={{fontSize:11,color:stretchRemaining<=0?C.lime:C.muted,marginBottom:10}}>{stretchRemaining<=0?"⏰ Time's up!":"holding…"}</div>
+        </>):null}
+        <div style={{display:"flex",gap:8,justifyContent:"center"}}>
+          <button onClick={()=>startStretchTimer(30)} style={{flex:1,maxWidth:110,padding:"10px 0",borderRadius:9,background:`${C.blue}18`,border:`1px solid ${C.blue}`,color:C.blue,fontWeight:700,cursor:"pointer",fontSize:13}}>⏱ 30s</button>
+          <button onClick={()=>startStretchTimer(60)} style={{flex:1,maxWidth:110,padding:"10px 0",borderRadius:9,background:`${C.blue}18`,border:`1px solid ${C.blue}`,color:C.blue,fontWeight:700,cursor:"pointer",fontSize:13}}>⏱ 60s</button>
+        </div>
+        {stretchTarget&&<button onClick={()=>setStretchTarget(null)} style={{marginTop:9,background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:10.5,textDecoration:"underline"}}>✕ stop</button>}
+      </div>
+
       {machine.fields.length>0?(<div style={{display:"grid",gridTemplateColumns:machine.fields.length===3?"1fr 1fr 1fr":"1fr 1fr",gap:8,marginBottom:9}}>
         {machine.fields.map(f=>(<Field key={f} label={f==="distanceKm"?"Distance km":f==="incline"?"Incline":f==="speed"?"Speed":f==="resistance"?"Resistance":"Level"} value={fields[f]||""} onChange={v=>update(s=>({...s,cooldown:{...s.cooldown,fields:{...s.cooldown.fields,[f]:v}}}))} placeholder="—"/>))}
       </div>):(
         <textarea value={session.cooldown.notes||""} onChange={e=>update(s=>({...s,cooldown:{...s.cooldown,notes:e.target.value}}))} placeholder="Describe your cooldown…" rows={2} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:13,outline:"none",resize:"none",fontFamily:"inherit",marginBottom:9}}/>
       )}
-      <button onClick={()=>{update(s=>({...s,cooldown:{...s.cooldown,done:true}}));goToFinish();}} style={{width:"100%",padding:"11px 0",borderRadius:10,background:C.blue,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14}}>✓ Finish Cooldown</button>
+      <button onClick={()=>{updateAction(s=>({...s,cooldown:{...s.cooldown,done:true}}));goToFinish();}} style={{width:"100%",padding:"11px 0",borderRadius:10,background:C.blue,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14}}>✓ Finish Cooldown</button>
       <button onClick={goToFinish} style={{width:"100%",padding:"8px 0",marginTop:8,background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:11}}>Skip cooldown</button>
     </div>);
   }
@@ -2673,6 +2759,9 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
   const combo = session.combos[session.currentComboIdx];
   const isLastCombo = session.currentComboIdx >= session.combos.length-1;
   const atRoundStart = session.currentExInRound === 0;
+  const roundsDone = Math.max(0, ...combo.exercises.map(e=>(e.sets||[]).length), 0);
+  const targetSets = gymSettings?.targetSetsPerCombo;
+  const nextCombo = !isLastCombo ? session.combos[session.currentComboIdx+1] : null;
 
   // ── Finish confirmation ──
   if (showFinish) {
@@ -2692,23 +2781,37 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
   return(<div style={{background:C.card,border:`1px solid ${C.orange}`,borderRadius:14,padding:"16px 18px",marginBottom:14}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
       <span style={{fontSize:12,color:C.muted,fontFamily:"monospace"}}>Combo {session.currentComboIdx+1}/{session.combos.length}{combo.exercises.length>1?" · superset":""}</span>
-      <div style={{display:"flex",alignItems:"center",gap:10}}>
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
         <span style={{fontFamily:"monospace",fontSize:12,color:C.muted}}>{fmtTime(elapsed)}</span>
+        {undoStack.length>0&&<button onClick={undo} style={{fontSize:11,color:C.blue,background:"none",border:`1px solid ${C.blue}40`,borderRadius:6,padding:"3px 8px",cursor:"pointer"}}>↩ Undo</button>}
         <button onClick={goToFinishOrCooldown} style={{fontSize:11,color:C.red,background:"none",border:`1px solid ${C.red}40`,borderRadius:6,padding:"3px 9px",cursor:"pointer"}}>🏁 Finish</button>
       </div>
     </div>
-    <div style={{textAlign:"right",marginBottom:6}}><button onClick={onCancel} style={{fontSize:10,color:C.muted,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>cancel session</button></div>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+      <button onClick={()=>setShowJumpCombo(p=>!p)} style={{fontSize:10,color:C.muted,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>🔀 jump to another combo</button>
+      <button onClick={tryCancel} style={{fontSize:10,color:C.muted,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>cancel session</button>
+    </div>
+    {showCancelConfirm&&<CancelConfirmBox onSaveFinish={()=>{setShowCancelConfirm(false);goToFinishOrCooldown();}} onDiscard={onCancel} onKeepGoing={()=>setShowCancelConfirm(false)}/>}
+    {showJumpCombo&&(<div style={{background:C.bg,border:`1px solid ${C.blue}40`,borderRadius:9,padding:"9px 11px",marginBottom:8}}>
+      <div style={{fontSize:10,color:C.muted,marginBottom:6}}>Jump to:</div>
+      <div style={{display:"flex",flexDirection:"column",gap:5}}>{session.combos.map((c,ci)=>ci===session.currentComboIdx?null:(
+        <button key={c.id} onClick={()=>jumpToCombo(ci)} style={{padding:"7px 10px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,color:C.text,cursor:"pointer",textAlign:"left",fontSize:11.5}}>Combo {ci+1}: {c.exercises.map(e=>e.name).join(" + ")||"(empty)"}</button>
+      ))}</div>
+    </div>)}
 
     {/* Resting between rounds */}
     {session.resting ? (
-      <div style={{textAlign:"center",padding:"18px 0"}}>
+      <div style={{textAlign:"center",padding:"14px 0 4px"}}>
+        <div style={{fontSize:13,color:C.lime,fontWeight:600,marginBottom:10}}>✅ Set {roundsDone} done for this combo</div>
         <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Resting</div>
-        <div style={{fontSize:38,fontWeight:900,fontFamily:"monospace",color:C.orange,marginBottom:16}}>{fmtTime(restElapsed)}</div>
+        <div style={{fontSize:38,fontWeight:900,fontFamily:"monospace",color:C.orange,marginBottom:12}}>{fmtTime(restElapsed)}</div>
+        {targetSets&&roundsDone>=targetSets&&<div style={{background:`${C.yellow}15`,border:`1px solid ${C.yellow}50`,borderRadius:8,padding:"7px 11px",marginBottom:12,fontSize:11,color:C.yellow}}>⚠ You've hit your usual {targetSets} sets — maybe move to the next combo</div>}
+        {nextCombo&&<div style={{background:C.bg,borderRadius:8,padding:"8px 11px",marginBottom:12,fontSize:11,color:C.muted,textAlign:"left"}}>👀 Coming up — Combo {session.currentComboIdx+2}: <span style={{color:C.text}}>{nextCombo.exercises.map(e=>e.name).join(" + ")||"(empty)"}</span></div>}
         <div style={{display:"flex",gap:8}}>
-          <button onClick={()=>update(s=>({...s,resting:false}))} style={{flex:1,padding:"12px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14}}>▶ Start Next Round</button>
+          <button onClick={()=>updateAction(s=>({...s,resting:false}))} style={{flex:1,padding:"12px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14}}>▶ Start Next Round</button>
         </div>
-        {!isLastCombo&&<button onClick={()=>update(s=>({...s,resting:false,currentComboIdx:s.currentComboIdx+1,currentExInRound:0}))} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12}}>⏭ Next Combo →</button>}
-        {isLastCombo&&<button onClick={goToFinishOrCooldown} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.lime}60`,color:C.lime,cursor:"pointer",fontSize:12,fontWeight:600}}>🏁 That's it — {session.cooldown&&!session.cooldown.done?"Cooldown":"Finish Session"}</button>}
+        {!isLastCombo&&<button onClick={()=>updateAction(s=>({...s,resting:false,currentComboIdx:s.currentComboIdx+1,currentExInRound:0}))} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12}}>⏭ Next Combo →</button>}
+        {isLastCombo&&<button onClick={goToFinishOrCooldown} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.lime}60`,color:C.lime,cursor:"pointer",fontSize:12,fontWeight:600}}>🏁 That's it — Wrap Up</button>}
       </div>
     ) : (<>
       {/* Exercise list for current combo, current one highlighted */}
@@ -2724,7 +2827,11 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
             {last&&<span style={{fontSize:9.5,color:C.muted}}>last: {last.weight}{ex.unit||"kg"} · {last.sets.map(s=>s.reps).join("/")} ({new Date(last.date+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"})})</span>}
           </div>
           {lib?.note&&<div style={{fontSize:10,color:C.yellow,fontStyle:"italic",marginBottom:4}}>📌 {lib.note}</div>}
-          {canSwap&&<button onClick={()=>setSwapOpenFor(swapOpenFor===ex.id?null:ex.id)} style={{fontSize:9.5,color:C.blue,background:"none",border:"none",cursor:"pointer",textDecoration:"underline",marginBottom:4,display:"block"}}>⇄ swap exercise</button>}
+          <div style={{display:"flex",gap:12,marginBottom:4,flexWrap:"wrap"}}>
+            {canSwap&&<button onClick={()=>setSwapOpenFor(swapOpenFor===ex.id?null:ex.id)} style={{fontSize:9.5,color:C.blue,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>⇄ swap exercise</button>}
+            {atRoundStart&&<button onClick={()=>moveExercise(session.currentComboIdx,ei,-1)} disabled={ei===0} style={{fontSize:9.5,color:ei===0?C.faint:C.muted,background:"none",border:"none",cursor:ei===0?"default":"pointer"}}>▲ move up</button>}
+            {atRoundStart&&<button onClick={()=>moveExercise(session.currentComboIdx,ei,1)} disabled={ei===combo.exercises.length-1} style={{fontSize:9.5,color:ei===combo.exercises.length-1?C.faint:C.muted,background:"none",border:"none",cursor:ei===combo.exercises.length-1?"default":"pointer"}}>▼ move down</button>}
+          </div>
           {swapOpenFor===ex.id&&lib&&(()=>{
             const alts = findAlternatives(lib.muscleGroup, gymExerciseLibrary, ex.name);
             return(<div style={{marginBottom:8,background:C.card,border:`1px solid ${C.blue}40`,borderRadius:7,padding:"7px 9px"}}>
@@ -2732,7 +2839,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
               {alts.length===0&&<div style={{fontSize:10.5,color:C.muted}}>No alternatives found.</div>}
               <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{alts.map(a=>{
                 const altLast=getLastPerformance(a.name,gymSessions);
-                return(<button key={a.name} onClick={()=>{update(s=>{const c={...s.combos[s.currentComboIdx]};c.exercises=c.exercises.map(x=>x.id===ex.id?{...x,name:a.name,weight:altLast?String(altLast.weight):""}:x);const combos=[...s.combos];combos[s.currentComboIdx]=c;return{...s,combos};});setSwapOpenFor(null);}} style={{padding:"4px 9px",borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,color:C.text,cursor:"pointer",fontSize:10.5}}>{a.name}</button>);
+                return(<button key={a.name} onClick={()=>{updateAction(s=>{const c={...s.combos[s.currentComboIdx]};c.exercises=c.exercises.map(x=>x.id===ex.id?{...x,name:a.name,weight:altLast?String(altLast.weight):""}:x);const combos=[...s.combos];combos[s.currentComboIdx]=c;return{...s,combos};});setSwapOpenFor(null);}} style={{padding:"4px 9px",borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,color:C.text,cursor:"pointer",fontSize:10.5}}>{a.name}</button>);
               })}</div>
             </div>);
           })()}
@@ -2745,32 +2852,20 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
                 if(e.key==="Enter"){
                   const reps=parseInt(e.target.value)||0; if(!reps)return;
                   e.target.value="";
-                  update(s=>{
-                    const c={...s.combos[s.currentComboIdx]};
-                    c.exercises=c.exercises.map(x=>x.id===ex.id?{...x,sets:[...x.sets,{reps}]}:x);
-                    const combos=[...s.combos]; combos[s.currentComboIdx]=c;
-                    let nextEx=s.currentExInRound+1; let resting=false; let restStartedAt=s.restStartedAt;
-                    if(nextEx>=c.exercises.length){ nextEx=0; resting=true; restStartedAt=Date.now(); }
-                    return{...s, combos, currentExInRound:nextEx, resting, restStartedAt};
-                  });
+                  advanceExercise(session.currentComboIdx, ex.id, reps);
                 }
               }}/>
               <button onClick={()=>{
                 const input=document.getElementById(`reps-${ex.id}`); const reps=parseInt(input?.value)||0; if(!reps)return; if(input)input.value="";
-                update(s=>{
-                  const c={...s.combos[s.currentComboIdx]};
-                  c.exercises=c.exercises.map(x=>x.id===ex.id?{...x,sets:[...x.sets,{reps}]}:x);
-                  const combos=[...s.combos]; combos[s.currentComboIdx]=c;
-                  let nextEx=s.currentExInRound+1; let resting=false; let restStartedAt=s.restStartedAt;
-                  if(nextEx>=c.exercises.length){ nextEx=0; resting=true; restStartedAt=Date.now(); }
-                  return{...s, combos, currentExInRound:nextEx, resting, restStartedAt};
-                });
+                advanceExercise(session.currentComboIdx, ex.id, reps);
               }} style={{padding:"7px 14px",borderRadius:7,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Log Set</button>
             </div>
+            <button onClick={()=>advanceExercise(session.currentComboIdx, ex.id, null)} style={{marginTop:7,background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:10.5,textDecoration:"underline"}}>Skip this exercise</button>
             {suggestion&&<div style={{fontSize:10,color:C.lime,marginTop:6,lineHeight:1.4}}>📈 {suggestion}</div>}
           </>)}
         </div>);
       })}
+      {!isLastCombo&&<button onClick={skipCombo} style={{width:"100%",padding:"8px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11,marginBottom:8}}>⏭ Skip this combo entirely</button>}
       {/* Add exercise to this combo live — only between rounds to avoid awkward partial rounds */}
       {atRoundStart&&(addExMode?(
         <div style={{background:C.bg,border:`1px dashed ${C.border}`,borderRadius:9,padding:"9px 11px",marginBottom:8}}>
@@ -2781,7 +2876,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
             <button onClick={()=>setAddExMode(false)} style={{flex:1,padding:"6px 0",borderRadius:6,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button>
             <button onClick={()=>{
               if(!newExName.trim())return;
-              update(s=>{const c={...s.combos[s.currentComboIdx]};c.exercises=[...c.exercises,{id:Date.now()+Math.random(),name:newExName.trim(),type:"weighted",weight:"",sets:[]}];const combos=[...s.combos];combos[s.currentComboIdx]=c;return{...s,combos};});
+              updateAction(s=>{const c={...s.combos[s.currentComboIdx]};c.exercises=[...c.exercises,{id:Date.now()+Math.random(),name:newExName.trim(),type:"weighted",weight:"",sets:[]}];const combos=[...s.combos];combos[s.currentComboIdx]=c;return{...s,combos};});
               setNewExName(""); setAddExMode(false);
             }} style={{flex:2,padding:"6px 0",borderRadius:6,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>+ Add to Combo</button>
           </div>
@@ -2789,8 +2884,23 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       ):(
         <button onClick={()=>setAddExMode(true)} style={{width:"100%",padding:"8px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11,marginBottom:8}}>+ Add exercise to this combo</button>
       ))}
-      {atRoundStart&&<button onClick={()=>update(s=>({...s,combos:[...s.combos,{id:Date.now(),exercises:[]}],currentComboIdx:s.combos.length,currentExInRound:0}))} style={{width:"100%",padding:"8px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>+ New Combo</button>}
+      {atRoundStart&&<button onClick={()=>updateAction(s=>({...s,combos:[...s.combos,{id:Date.now(),exercises:[]}],currentComboIdx:s.combos.length,currentExInRound:0}))} style={{width:"100%",padding:"8px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>+ New Combo</button>}
     </>)}
+  </div>);
+}
+
+// Small inline confirm box shown when cancelling a session that already has logged sets —
+// makes sure reps/weights aren't silently thrown away by an accidental tap.
+function CancelConfirmBox({onSaveFinish, onDiscard, onKeepGoing}){
+  return(<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:9,padding:"11px 13px",marginBottom:10}}>
+    <div style={{fontSize:12,color:"#ff8080",marginBottom:9}}>You've logged sets in this session — cancelling will lose them unless you save first.</div>
+    <div style={{display:"flex",flexDirection:"column",gap:6}}>
+      <button onClick={onSaveFinish} style={{padding:"8px 0",borderRadius:7,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>💾 Save what I've done</button>
+      <div style={{display:"flex",gap:6}}>
+        <button onClick={onKeepGoing} style={{flex:1,padding:"7px 0",borderRadius:7,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Keep going</button>
+        <button onClick={onDiscard} style={{flex:1,padding:"7px 0",borderRadius:7,background:"#3a0a0a",border:"1px solid #ff4040",color:"#ff6060",fontWeight:700,cursor:"pointer",fontSize:11}}>Discard</button>
+      </div>
+    </div>
   </div>);
 }
 
@@ -2814,6 +2924,12 @@ function GymSetupSheet({gymSchedule,setGymSchedule,gymSettings,setGymSettings,gy
       </button>
     ))}</div>
     {method==="custom"&&<div style={{marginBottom:16}}><Field label="Your approach" value={gymSettings?.customNote||""} onChange={setNote} placeholder="e.g. pyramid sets, deload every 4th week"/></div>}
+
+    <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Usual sets per combo</div>
+    <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:16}}>
+      <input type="text" inputMode="numeric" value={gymSettings?.targetSetsPerCombo||""} onChange={e=>setGymSettings(p=>({...(p||{}),targetSetsPerCombo:parseInt(e.target.value.replace(/\D/g,""))||null}))} placeholder="e.g. 3" style={{width:70,background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 10px",color:C.text,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
+      <span style={{fontSize:11,color:C.muted,flex:1,lineHeight:1.4}}>Optional — shows a heads-up once you've hit this many rounds on a combo, so you know it's about time to move on.</span>
+    </div>
 
     {(gymSchedule||[]).length>0&&<>
       <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Day plans</div>
@@ -2941,10 +3057,76 @@ function GymManualLogSheet({gymExerciseLibrary, setGymExerciseLibrary, onSave, o
   </Sheet>);
 }
 
+// ── Gym Session Detail Sheet ────────────────────────────────────────────────
+// Full breakdown of one completed session — warmup, every combo/exercise/set/weight, cooldown.
+function GymSessionDetailSheet({session, onClose, onDelete}){
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const fieldSummary = fields => Object.entries(fields||{}).filter(([,v])=>v).map(([k,v])=>`${k}: ${v}`).join(" · ");
+  return(<Sheet onClose={onClose} title={`${WEEKDAYS[session.weekday]?.full||""} · ${new Date(session.date+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}`}>
+    <div style={{display:"flex",gap:10,marginBottom:16}}>
+      <div style={{flex:1,background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 12px",textAlign:"center"}}>
+        <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>Duration</div>
+        <div style={{fontSize:16,fontWeight:800,fontFamily:"monospace",color:C.text}}>{Math.round((session.durationSec||0)/60)}min</div>
+      </div>
+      <div style={{flex:1,background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 12px",textAlign:"center"}}>
+        <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>Burned</div>
+        <div style={{fontSize:16,fontWeight:800,fontFamily:"monospace",color:C.orange}}>{Math.round(session.kcalBurned||0)}kcal</div>
+      </div>
+    </div>
+
+    {session.warmup&&(session.warmup.notes||fieldSummary(session.warmup.fields))&&(
+      <div style={{background:C.card,border:`1px solid ${C.orange}40`,borderRadius:10,padding:"11px 13px",marginBottom:10}}>
+        <div style={{fontSize:11,fontWeight:700,color:C.orange,marginBottom:5}}>🔥 Warmup</div>
+        {fieldSummary(session.warmup.fields)&&<div style={{fontSize:11,color:C.muted}}>{fieldSummary(session.warmup.fields)}</div>}
+        {session.warmup.notes&&<div style={{fontSize:11,color:C.muted,marginTop:3}}>{session.warmup.notes}</div>}
+      </div>
+    )}
+
+    {(session.combos||[]).map((combo,ci)=>(
+      <div key={combo.id||ci} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"11px 13px",marginBottom:9}}>
+        <div style={{fontSize:12,fontWeight:700,color:C.text,marginBottom:8}}>Combo {ci+1}{combo.exercises?.length>1?" · superset":""}</div>
+        {(combo.exercises||[]).map(ex=>(
+          <div key={ex.id} style={{marginBottom:8}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+              <span style={{fontSize:12,color:C.text}}>{ex.name}</span>
+              {ex.weight&&<span style={{fontSize:11,fontFamily:"monospace",color:C.lime,fontWeight:700}}>{ex.weight}{ex.unit||"kg"}</span>}
+            </div>
+            {ex.sets?.length>0?(
+              <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>{ex.sets.map((s,si)=>(<span key={si} style={{fontSize:10,fontFamily:"monospace",background:C.bg,color:C.muted,padding:"2px 7px",borderRadius:5}}>Set {si+1}: {s.reps}</span>))}</div>
+            ):(<div style={{fontSize:10,color:C.faint,fontStyle:"italic"}}>skipped</div>)}
+          </div>
+        ))}
+        {(combo.exercises||[]).length===0&&<div style={{fontSize:11,color:C.faint,fontStyle:"italic"}}>(empty combo)</div>}
+      </div>
+    ))}
+    {(session.combos||[]).length===0&&<div style={{textAlign:"center",padding:"16px 0",color:C.muted,fontSize:12}}>No combos recorded.</div>}
+
+    {session.cooldown&&(session.cooldown.notes||fieldSummary(session.cooldown.fields))&&(
+      <div style={{background:C.card,border:`1px solid ${C.blue}40`,borderRadius:10,padding:"11px 13px",marginBottom:10}}>
+        <div style={{fontSize:11,fontWeight:700,color:C.blue,marginBottom:5}}>❄️ Cooldown</div>
+        {fieldSummary(session.cooldown.fields)&&<div style={{fontSize:11,color:C.muted}}>{fieldSummary(session.cooldown.fields)}</div>}
+        {session.cooldown.notes&&<div style={{fontSize:11,color:C.muted,marginTop:3}}>{session.cooldown.notes}</div>}
+      </div>
+    )}
+
+    {confirmDelete?(
+      <div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:9,padding:"11px 13px",marginTop:6}}>
+        <div style={{fontSize:12,color:"#ff8080",marginBottom:9}}>Delete this session? Can't be undone.</div>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>setConfirmDelete(false)} style={{flex:1,padding:"8px 0",borderRadius:7,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12}}>Cancel</button>
+          <button onClick={onDelete} style={{flex:1,padding:"8px 0",borderRadius:7,background:"#3a0a0a",border:"1px solid #ff4040",color:"#ff6060",fontWeight:700,cursor:"pointer",fontSize:12}}>Delete</button>
+        </div>
+      </div>
+    ):(
+      <button onClick={()=>setConfirmDelete(true)} style={{width:"100%",padding:"10px 0",borderRadius:9,background:"none",border:`1px solid ${C.border}`,color:C.faint,cursor:"pointer",fontSize:12,marginTop:6}}>Delete Session</button>
+    )}
+  </Sheet>);
+}
+
 function GymHistoryPanel({gymSessions,setGymSessions,gymExerciseLibrary,setGymExerciseLibrary,onClose}){
   const [exerciseFilter,setExerciseFilter]=useState(null); // exercise name being drilled into, or null
+  const [viewingSession,setViewingSession]=useState(null); // full session being viewed, or null
   const [showManualLog,setShowManualLog]=useState(false);
-  const [confirmDelete,setConfirmDelete]=useState(null); // session id pending delete confirmation
   const sessions=gymSessions||[];
   const saveManualSession = record => {
     setGymSessions(prev=>[{...record,id:Date.now()},...(prev||[])].sort((a,b)=>b.date.localeCompare(a.date)));
@@ -2959,8 +3141,9 @@ function GymHistoryPanel({gymSessions,setGymSessions,gymExerciseLibrary,setGymEx
     })();
     setShowManualLog(false);
   };
-  const deleteSession = id => { setGymSessions(prev=>(prev||[]).filter(s=>s.id!==id)); setConfirmDelete(null); };
+  const deleteSession = id => { setGymSessions(prev=>(prev||[]).filter(s=>s.id!==id)); setConfirmDelete(null); setViewingSession(null); };
   if(showManualLog) return <GymManualLogSheet gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary} onSave={saveManualSession} onClose={()=>setShowManualLog(false)}/>;
+  if(viewingSession) return <GymSessionDetailSheet session={viewingSession} onClose={()=>setViewingSession(null)} onDelete={()=>deleteSession(viewingSession.id)}/>;
   if(exerciseFilter){
     const nl=normExName(exerciseFilter);
     const rows=[];
@@ -2986,23 +3169,16 @@ function GymHistoryPanel({gymSessions,setGymSessions,gymExerciseLibrary,setGymEx
     {sessions.length===0&&<div style={{textAlign:"center",padding:"36px 0",color:C.muted}}><div style={{fontSize:32}}>🏋️</div><div style={{fontSize:14,marginTop:8}}>No sessions logged yet.</div></div>}
     <div style={{display:"flex",flexDirection:"column",gap:8}}>{sessions.map(sess=>{
       const allExercises=[...new Set((sess.combos||[]).flatMap(c=>(c.exercises||[]).map(e=>e.name)))];
-      return(<div key={sess.id} style={{background:C.card,border:`1px solid ${confirmDelete===sess.id?"#5a1a1a":C.border}`,borderRadius:12,padding:"12px 14px"}}>
-        {confirmDelete===sess.id&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"7px 10px",marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
-          <span style={{fontSize:11,color:"#ff8080"}}>Delete this session? Can't be undone.</span>
-          <div style={{display:"flex",gap:6,flexShrink:0}}>
-            <button onClick={()=>setConfirmDelete(null)} style={{padding:"4px 9px",borderRadius:6,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button>
-            <button onClick={()=>deleteSession(sess.id)} style={{padding:"4px 9px",borderRadius:6,background:"#3a0a0a",border:"1px solid #ff4040",color:"#ff6060",fontWeight:700,cursor:"pointer",fontSize:11}}>Delete</button>
-          </div>
-        </div>}
+      return(<div key={sess.id} onClick={()=>setViewingSession(sess)} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"12px 14px",cursor:"pointer"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
           <span style={{fontSize:13,fontWeight:700,color:C.text}}>{WEEKDAYS[sess.weekday]?.full||""} · {new Date(sess.date+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"})}</span>
           <div style={{display:"flex",gap:8,alignItems:"center"}}>
             <span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{Math.round((sess.durationSec||0)/60)}min</span>
             <span style={{fontFamily:"monospace",fontSize:12,fontWeight:700,color:C.orange}}>+{Math.round(sess.kcalBurned||0)}kcal</span>
-            <button onClick={()=>setConfirmDelete(confirmDelete===sess.id?null:sess.id)} style={{background:"none",border:"none",color:confirmDelete===sess.id?"#ff4040":C.faint,fontSize:15,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button>
+            <span style={{color:C.faint,fontSize:13}}>›</span>
           </div>
         </div>
-        <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{allExercises.map(name=>(<button key={name} onClick={()=>setExerciseFilter(name)} style={{padding:"4px 9px",borderRadius:12,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:10.5}}>{name}</button>))}</div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{allExercises.map(name=>(<button key={name} onClick={e=>{e.stopPropagation();setExerciseFilter(name);}} style={{padding:"4px 9px",borderRadius:12,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:10.5}}>{name}</button>))}</div>
       </div>);
     })}</div>
   </Sheet>);
@@ -3036,7 +3212,10 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
       date:TODAY(), weekday,
       startedAt:Date.now(),
       warmup:t.warmup?{...t.warmup,done:false}:null,
-      cooldown:t.cooldown?{...t.cooldown,done:false}:null,
+      // Cooldown is ALWAYS available, regardless of whether the template configured one —
+      // finishing the last combo should always offer the choice to stretch/cool down first,
+      // not just when pre-planned. Falls back to a free-text "other" cooldown if unconfigured.
+      cooldown:{type:t.cooldown?.type||"other", fields:t.cooldown?.fields||{}, notes:t.cooldown?.notes||"", done:false},
       cooldownStarted:false,
       combos: combos.length?combos:[{id:Date.now(),exercises:[]}],
       currentComboIdx:0, currentExInRound:0,
@@ -4667,12 +4846,16 @@ function App(){
     }
     // Use the date at the moment of bootstrap (in case midnight already passed during load).
     const bootDate = TODAY();
-    const day=await store.get(`fit_day_${bootDate}`,{date:bootDate,dayType:"rest",meals:[],activities:[],burnedExtra:0,tags:[],goalMode:null});
+    // Fetch gym schedule BEFORE constructing today's default day object, so a brand-new day
+    // on a scheduled gym weekday defaults to "gym" instead of "rest". Only applies when no
+    // day log exists yet — never overrides a day type the user already chose.
+    const gSchedule=await store.get("fit_gym_schedule",[]);
+    const bootDefaultDayType = (Array.isArray(gSchedule)?gSchedule:[]).includes(new Date(bootDate+"T12:00:00").getDay()) ? "gym" : "rest";
+    const day=await store.get(`fit_day_${bootDate}`,{date:bootDate,dayType:bootDefaultDayType,meals:[],activities:[],burnedExtra:0,tags:[],goalMode:null});
     if(!day.activities)day.activities=[];if(!day.tags)day.tags=[];
     const wts=await store.get("fit_weights",[]);const preps=await store.get("fit_mealpreps",[]);
     const prof=await store.get("fit_profile",null)||DEFAULT_PROFILE;const photos=await store.get("fit_photos",[]);
     const phases=await store.get("fit_weight_phases",[]);
-    const gSchedule=await store.get("fit_gym_schedule",[]);
     const gTemplates=await store.get("fit_gym_templates",{});
     const gSessions=await store.get("fit_gym_sessions",[]);
     const gSettings=await store.get("fit_gym_settings",{trainingMethod:"maintain",customNote:""});
@@ -4711,7 +4894,8 @@ function App(){
     if (lastLoadedDate.current === today) return;
     lastLoadedDate.current = today;
     (async () => {
-      const day = await store.get(`fit_day_${today}`, {date:today,dayType:"rest",meals:[],activities:[],burnedExtra:0,tags:[],goalMode:null});
+      const rolloverDefaultDayType = (gymSchedule||[]).includes(new Date(today+"T12:00:00").getDay()) ? "gym" : "rest";
+      const day = await store.get(`fit_day_${today}`, {date:today,dayType:rolloverDefaultDayType,meals:[],activities:[],burnedExtra:0,tags:[],goalMode:null});
       if (!day.activities) day.activities = [];
       if (!day.tags) day.tags = [];
       setDayData_(day);

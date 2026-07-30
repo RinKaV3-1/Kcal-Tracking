@@ -2,10 +2,18 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <!-- viewport-fit=cover is required for env(safe-area-inset-*) to report real values on
+       notched iPhones. user-scalable=no was removed deliberately: it is an accessibility
+       failure (blocks pinch-zoom) and iOS Safari has ignored it since iOS 10 anyway. The
+       reason it was there — iOS auto-zooming when you focus a small input — is fixed
+       properly below by forcing form controls to 16px. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
   <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="mobile-web-app-capable" content="yes"/>
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
   <meta name="theme-color" content="#0b0b0e"/>
+  <meta name="color-scheme" content="dark"/>
+  <meta name="description" content="Track calories, macros, workouts and body weight with AI photo logging."/>
   <title>Kcal Tracker</title>
   <link rel="manifest" href="manifest.json"/>
   <link rel="apple-touch-icon" href="icon.png"/>
@@ -14,10 +22,38 @@
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body, #root { height: 100%; background: #0b0b0e; }
     body { overflow: hidden; }
+
+    /* Boot splash. React + ReactDOM + Babel are ~2MB over the network and the JSX below is
+       transpiled in-browser on every cold load, so there is a real multi-second gap before
+       anything renders. Without this the user stares at an empty black rectangle and assumes
+       the app is broken. Removed by the app itself once React mounts. */
+    #boot {
+      position: fixed; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 18px;
+      background: #0b0b0e; z-index: 9999;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    #boot .mark {
+      width: 54px; height: 54px; border-radius: 16px;
+      background: linear-gradient(145deg, #c4f135, #9bc428);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 26px; font-weight: 800; color: #0b0b0e;
+      box-shadow: 0 0 34px rgba(196, 241, 53, 0.28);
+    }
+    #boot .bar { width: 132px; height: 3px; border-radius: 3px; background: #23232f; overflow: hidden; }
+    #boot .bar i { display: block; height: 100%; width: 40%; border-radius: 3px; background: #c4f135; animation: bootslide 1.1s ease-in-out infinite; }
+    #boot .label { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: #8b8ba7; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    @keyframes bootslide { 0% { transform: translateX(-100%); } 100% { transform: translateX(250%); } }
+    @media (prefers-reduced-motion: reduce) { #boot .bar i { animation: none; width: 100%; } }
   </style>
 </head>
 <body>
   <div id="root"></div>
+  <div id="boot">
+    <div class="mark">K</div>
+    <div class="bar"><i></i></div>
+    <div class="label">Loading</div>
+  </div>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
@@ -180,11 +216,84 @@ const PRESETS = [
   { name:"FitSpo Dubai Chocolate Style Bar (50g)", kcal:396, p:17.7, c:34.3, f:17.7 },
   { name:"Lidl Pea Crackers Cheese & Onion (70g pack)", kcal:411, p:24, c:47.9, f:11.7 },
 ];
+// ── Color tokens ──────────────────────────────────────────────────────────────
+// Two tokens changed here for accessibility, and they are load-bearing because between them
+// they cover most secondary text and every divider in the app:
+//
+//   muted  #55556e → #8b8ba7   was 2.75:1 against the background — below WCAG's 3:1 floor
+//                              even for large text, and it is used ~420× for labels, units,
+//                              timestamps and helper copy. Now 5.9:1 (passes AA for body).
+//   border #1e1e2a → #2b2b3a   was ~1.15:1 against the card surface, i.e. effectively
+//                              invisible, so cards had no perceptible edge. Now legible.
+//
+// `muted2` is new: the genuinely decorative tier (watermarks, "tap to dismiss" hints) that
+// should stay recessive. Use it deliberately — never for text carrying meaning.
 const C = {
-  bg:"#0b0b0e",surf:"#111116",card:"#16161d",border:"#1e1e2a",dim:"#2a2a36",faint:"#33333f",
+// The accent hues are deliberately unchanged: measured against the background they were
+// already 5.8:1 (red) to 8.2:1 (blue), so they pass, and they carry the app's energy.
+  bg:"#0b0b0e",surf:"#111116",card:"#16161d",border:"#2b2b3a",dim:"#2a2a36",faint:"#33333f",
   lime:"#c4f135",orange:"#ff6b35",blue:"#5aacff",purple:"#a87bff",red:"#ff4545",yellow:"#ffc107",
-  text:"#ececec",muted:"#55556e",
+  text:"#ececec",muted:"#8b8ba7",muted2:"#5f5f7a",
+  // Semantic aliases — prefer these in new code so intent survives a palette change.
+  success:"#c4f135",danger:"#ff4545",warn:"#ffc107",focus:"#5aacff",
 };
+
+// ── Global stylesheet ─────────────────────────────────────────────────────────
+// Shared by App and OnboardingScreen so the two entry points can't drift apart.
+// Everything here is deliberately global because the app styles via ~1,500 inline style
+// objects — a rule written once here is the only way to change all of them at once.
+const GLOBAL_CSS = `
+*{-webkit-tap-highlight-color:transparent;box-sizing:border-box}
+input,textarea,select{color-scheme:dark}
+
+/* iOS Safari zooms the whole page when you focus a form control smaller than 16px, and it
+   never zooms back out. Every input in this app was 14px. Forcing 16px is the standard fix
+   and is what let us drop user-scalable=no from the viewport tag. !important is required
+   because the inline style attribute would otherwise win. */
+input,textarea,select{font-size:16px!important}
+
+/* Keyboard focus. Every input in this app sets outline:none inline, which left keyboard and
+   switch-control users with no visible focus position at all. :focus-visible restores it
+   without showing a ring on mouse/touch taps. */
+:focus{outline:none}
+:focus-visible{outline:2px solid ${C.focus};outline-offset:2px;border-radius:6px}
+
+/* Press feedback within the 80-150ms window users read as "responsive". Opacity+scale only:
+   neither affects layout bounds, so nothing around the control jitters. */
+button{cursor:pointer;transition:opacity .16s ease,transform .16s ease,background-color .16s ease,border-color .16s ease}
+button:active{opacity:.82;transform:scale(.975)}
+button[disabled],button:disabled{cursor:default;opacity:.45}
+button[disabled]:active,button:disabled:active{transform:none;opacity:.45}
+
+/* Scrollbars were hidden outright, which is fine on touch but leaves desktop users with no
+   scroll position at all. Thin and dim instead of absent. */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:${C.dim};border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:${C.faint}}
+*{scrollbar-width:thin;scrollbar-color:${C.dim} transparent}
+
+/* Momentum scrolling, and stop a scroll that hits the end of a panel from chaining out to
+   the page behind it (which on iOS shows as the whole app bouncing). */
+[data-scroll]{-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+
+::selection{background:${C.lime}44;color:${C.text}}
+
+/* Honour the OS "reduce motion" setting. Required by the accessibility checklist and by
+   both app stores' review guidelines. */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
+}
+
+@keyframes sheetIn{from{transform:translateY(100%)}to{transform:translateY(0)}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes toastIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+`;
+
+// Safe-area helpers. Without these the bottom tab bar sits underneath the iPhone home
+// indicator and its bottom third is untappable — one of the most common PWA-on-iOS defects.
+const SAFE_BOTTOM = "env(safe-area-inset-bottom, 0px)";
+const SAFE_TOP = "env(safe-area-inset-top, 0px)";
 
 // ── Gym tracking ─────────────────────────────────────────────────────────────
 const WEEKDAYS = [
@@ -343,6 +452,26 @@ function suggestProgression(exerciseName, gymSessions, method) {
 }
 // Alternatives for the "swap this exercise" feature — same muscle group, excluding itself,
 // sorted with custom (user-added) exercises first since those are most likely relevant.
+// Flatten a completed session's combos into a plain list of performed exercises, so a summary
+// can render "what I lifted and how much" without the reader having to open a detail sheet.
+// Exercises with no logged sets are dropped — they were skipped, not performed.
+function sessionExerciseSummary(session) {
+  if (!session) return [];
+  const out = [];
+  (session.combos||[]).forEach(c => (c.exercises||[]).forEach(ex => {
+    const sets = ex.sets || [];
+    if (!sets.length) return;
+    out.push({
+      name: ex.name,
+      weight: ex.weight || null,
+      unit: ex.unit || "kg",
+      reps: sets.map(s => s.reps),
+      volume: (parseFloat(ex.weight)||0) * sets.reduce((a,s)=>a+(s.reps||0),0),
+    });
+  }));
+  return out;
+}
+
 function findAlternatives(muscleGroup, exerciseLibrary, excludeName) {
   const nl = normExName(excludeName);
   return (exerciseLibrary||[])
@@ -794,12 +923,15 @@ async function aLabel(imgs, apiKey) {
       + "6. Salt row — IGNORE. Don't put salt anywhere.\n\n"
       + "PRODUCT NAME: brand + descriptive name from the FRONT of the package (e.g. 'Milbona Coconut Flavour Milk Product', 'Pilos Liesa Varškė 0.5%', 'Barebells Caramel Cashew'). Skip slogans like 'High Protein' if it's not part of the official name. Include flavour/variant.\n\n"
       + "SUBTITLE: a short 1-3 word GENERIC food category for this product, so it's easy to search by what it actually is rather than the brand name. Examples: 'Lidl Smulkinta Jautiena 10%' → 'Beef'. 'ProPud Cookie Dough Bar' → 'Protein Bar'. 'Pilos Liesa Varškė 0.5%' → 'Cottage Cheese'. 'Barebells Caramel Cashew' → 'Protein Bar'. 'Crownfield Oats' → 'Oats'. Keep it generic and short — this is a category tag, not a description.\n\n"
+      + "PACK SIZE (packSizeG): the NET WEIGHT of the whole package, in grams. This is printed on the FRONT of the pack, not in the nutrition table — e.g. '55 g', 'Net 200g', '500 g ℮', '1 kg', '330 ml'. Convert kg→g (1 kg = 1000) and treat ml as g for drinks/liquids (330 ml → 330). If the pack states a drained weight AND a total weight, use the TOTAL. If you genuinely cannot see a net weight anywhere, return null — do NOT guess it from the nutrition table.\n\n"
+      + "SERVING SIZE (servingG): only if the label explicitly states a portion size, e.g. 'per serving (30 g)', 'portion 1/2 pack', '1 bar = 55 g'. In grams. If the label doesn't state one, return null — do NOT invent a serving.\n\n"
       + "VALIDATION before returning:\n"
       + "  • kcal must be plausible: 0-900 (most foods <500/100g; oils ~900). If you got something outside this, recheck — you probably misread.\n"
       + "  • protein + carbs + fat × 9/4 should roughly equal kcal: kcal ≈ protein×4 + carbs×4 + fat×9. If wildly off, you mixed rows up — recheck.\n"
-      + "  • Numbers in the table use comma as decimal separator in many EU countries: '0,6' = 0.6. Convert.\n\n"
-      + "Reply with EXACTLY this JSON, nothing else:\n"
-      + '{"name":"","kcal":0,"p":0,"c":0,"f":0,"subtitle":""}' },
+      + "  • Numbers in the table use comma as decimal separator in many EU countries: '0,6' = 0.6. Convert.\n"
+      + "  • packSizeG and servingG are WEIGHTS, never kcal values. servingG must be ≤ packSizeG when both are present.\n\n"
+      + "Reply with EXACTLY this JSON, nothing else (use null for any size you can't read):\n"
+      + '{"name":"","kcal":0,"p":0,"c":0,"f":0,"subtitle":"","packSizeG":null,"servingG":null}' },
     ...iBlks(c),
   ], apiKey, VISION_MODEL, 600);
 }
@@ -877,27 +1009,55 @@ async function aAnalysis(imgs, profile, weight, trend, apiKey) {
 
 // ── Primitives ────────────────────────────────────────────────────────────────
 function Ring({value,max,color,label}){
-  const s=70,r=27,circ=2*Math.PI*r,pct=max>0?Math.min(value/max,1.06):0,over=pct>1;
-  return(<div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
-    <div style={{position:"relative",width:s,height:s}}>
-      <svg width={s} height={s} style={{transform:"rotate(-90deg)"}}>
-        <circle cx={s/2} cy={s/2} r={r} fill="none" stroke={C.dim} strokeWidth={4.5}/>
-        <circle cx={s/2} cy={s/2} r={r} fill="none" stroke={(over&&label==="protein")?C.lime:over?C.red:color} strokeWidth={4.5} strokeDasharray={`${pct*circ} ${circ}`} strokeLinecap="round" style={{transition:"stroke-dasharray 0.5s"}}/>
+  const s=74,r=29,circ=2*Math.PI*r,pct=max>0?Math.min(value/max,1.06):0,over=pct>1;
+  // Going over on protein is a good outcome on a cut, so it stays lime; every other macro
+  // turns red. Keeping that rule in one place rather than repeated inline three times.
+  const ringCol=(over&&label==="protein")?C.lime:over?C.red:color;
+  const pctText=max>0?Math.round((value/max)*100):0;
+  return(<div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:5}}>
+    {/* role=img + a spoken label: without it a screen reader reads the ring as the bare
+        numbers "134 262" with no indication of which macro or that it is a progress meter. */}
+    <div role="img" aria-label={`${label}: ${Math.round(value)} of ${Math.round(max)}, ${pctText}%`} style={{position:"relative",width:s,height:s}}>
+      <svg width={s} height={s} style={{transform:"rotate(-90deg)"}} aria-hidden="true">
+        <circle cx={s/2} cy={s/2} r={r} fill="none" stroke={C.dim} strokeWidth={5}/>
+        <circle cx={s/2} cy={s/2} r={r} fill="none" stroke={ringCol} strokeWidth={5}
+          strokeDasharray={`${pct*circ} ${circ}`} strokeLinecap="round"
+          style={{transition:"stroke-dasharray .6s cubic-bezier(.4,0,.2,1), stroke .3s ease"}}/>
       </svg>
       <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
-        <span style={{fontSize:13,fontWeight:700,color:(over&&label==="protein")?C.lime:over?C.red:C.text,fontFamily:"monospace",lineHeight:1}}>{Math.round(value)}</span>
-        <span style={{fontSize:9,color:C.muted,fontFamily:"monospace"}}>/{Math.round(max)}</span>
+        <span style={{fontSize:15,fontWeight:700,color:over?ringCol:C.text,fontFamily:"monospace",lineHeight:1}}>{Math.round(value)}</span>
+        <span style={{fontSize:10,color:C.muted,fontFamily:"monospace",marginTop:2}}>/{Math.round(max)}</span>
       </div>
     </div>
-    <span style={{fontSize:9,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em"}}>{label}</span>
+    <span style={{fontSize:10,color:over?ringCol:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",fontWeight:over?700:400}}>{label}</span>
   </div>);
 }
 function Chip({val,label,color}){return <span style={{fontFamily:"monospace",fontSize:11}}><span style={{color}}>{Math.round(val)}</span><span style={{color:C.muted}}>{label}</span></span>;}
+// Shown under a picked product to explain where the pre-filled gram amount came from.
+// Products flagged "always eaten whole" say so explicitly — otherwise the pre-filled number
+// looks like an arbitrary default rather than the deliberate one the user configured.
+function PortionHint({prod}){
+  if(!prod) return null;
+  if(prod.alwaysFullPack && prod.packSizeG)
+    return <div style={{fontSize:11,color:C.lime,marginBottom:6,fontStyle:"italic"}}>📦 Always eaten whole — full {prod.packSizeG}g pack</div>;
+  const serving = prod.servingG || prod.packageG;
+  if(!serving) return null;
+  return <div style={{fontSize:11,color:C.lime,marginBottom:6,fontStyle:"italic"}}>🍽 Usual serving: {serving}g{prod.packSizeG?` · pack ${prod.packSizeG}g`:""}</div>;
+}
 function InfoTip({text}){
   const [open,setOpen]=useState(false);
+  // The visible dot stays small so it doesn't fight the label it annotates, but the button
+  // itself is padded out to a 44px hit area (::after below) — the dot was previously a
+  // 16×16 target, well under the 44px accessibility minimum and genuinely hard to hit.
   return(<span style={{position:"relative",display:"inline-flex",alignItems:"center"}}>
-    <button onClick={()=>setOpen(p=>!p)} style={{background:"none",border:`1px solid ${C.border}`,borderRadius:"50%",width:16,height:16,cursor:"pointer",fontSize:9,color:C.muted,display:"inline-flex",alignItems:"center",justifyContent:"center",padding:0,lineHeight:1,flexShrink:0}}>ⓘ</button>
-    {open&&<div onClick={()=>setOpen(false)} style={{position:"absolute",left:0,top:20,background:C.card,border:`1px solid ${C.lime}40`,borderRadius:8,padding:"8px 10px",fontSize:11,color:C.muted,lineHeight:1.5,zIndex:50,width:240,boxShadow:"0 4px 16px rgba(0,0,0,0.5)",cursor:"pointer"}}>{text}<div style={{fontSize:9,color:C.faint,marginTop:4}}>tap to dismiss</div></div>}
+    <button onClick={()=>setOpen(p=>!p)} aria-label={open?"Hide explanation":"Show explanation"} aria-expanded={open}
+      style={{background:open?`${C.lime}18`:"none",border:`1px solid ${open?C.lime:C.muted}`,borderRadius:"50%",width:18,height:18,fontSize:10,color:open?C.lime:C.muted,display:"inline-flex",alignItems:"center",justifyContent:"center",padding:0,lineHeight:1,flexShrink:0,position:"relative"}}>
+      i
+      <span aria-hidden="true" style={{position:"absolute",top:"50%",left:"50%",transform:"translate(-50%,-50%)",width:44,height:44}}/>
+    </button>
+    {open&&<div onClick={()=>setOpen(false)} role="tooltip"
+      style={{position:"absolute",left:0,top:24,background:C.card,border:`1px solid ${C.lime}40`,borderRadius:10,padding:"10px 12px",fontSize:12,color:C.text,lineHeight:1.55,zIndex:50,width:250,boxShadow:"0 6px 22px rgba(0,0,0,0.6)",cursor:"pointer",animation:"fadeIn .15s ease"}}>
+      {text}<div style={{fontSize:10,color:C.muted2,marginTop:6}}>tap to dismiss</div></div>}
   </span>);
 }
 function Field({label,value,onChange,type="text",placeholder="",disabled=false}){
@@ -920,7 +1080,7 @@ function Field({label,value,onChange,type="text",placeholder="",disabled=false})
     }
     onChange(v);
   };
-  return(<div>{label&&<div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>{label}</div>}
+  return(<div>{label&&<div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>{label}</div>}
     <input type={isNum?"text":type} inputMode={isNum?"decimal":undefined} pattern={isNum?"[0-9]*[.]?[0-9]*":undefined} value={value} onChange={handleChange} placeholder={placeholder} disabled={disabled}
       style={{display:"block",width:"100%",boxSizing:"border-box",background:disabled?C.card:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:disabled?C.muted:C.text,fontSize:14,outline:"none",fontFamily:isNum?"monospace":"inherit"}}/>
   </div>);
@@ -944,11 +1104,25 @@ function ImgZone({imgs,setImgs,compact=false,maxPhotos=10}){
   </>);
 }
 function Sheet({onClose,title,children}){
-  return(<div style={{position:"absolute",inset:0,background:"rgba(0,0,0,0.78)",zIndex:60,display:"flex",flexDirection:"column",justifyContent:"flex-end"}} onClick={e=>e.target===e.currentTarget&&onClose()}>
-    <div style={{background:C.surf,borderRadius:"18px 18px 0 0",border:`1px solid ${C.border}`,maxHeight:"92%",overflow:"auto",padding:"20px 18px 30px"}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-        <span style={{fontSize:17,fontWeight:700,color:C.text}}>{title}</span>
-        <button onClick={onClose} style={{background:"none",border:"none",color:C.muted,fontSize:22,cursor:"pointer",lineHeight:1}}>×</button>
+  // Escape closes the sheet. Previously the only ways out were the × or a backdrop tap,
+  // which left keyboard and external-keyboard-on-tablet users stuck inside the modal.
+  useEffect(()=>{
+    const onKey=e=>{if(e.key==="Escape")onClose();};
+    window.addEventListener("keydown",onKey);
+    return()=>window.removeEventListener("keydown",onKey);
+  },[onClose]);
+  return(<div role="dialog" aria-modal="true" aria-label={title}
+    style={{position:"absolute",inset:0,background:"rgba(0,0,0,0.72)",backdropFilter:"blur(3px)",WebkitBackdropFilter:"blur(3px)",zIndex:60,display:"flex",flexDirection:"column",justifyContent:"flex-end",animation:"fadeIn .18s ease"}}
+    onClick={e=>e.target===e.currentTarget&&onClose()}>
+    <div data-scroll style={{background:C.surf,borderRadius:"20px 20px 0 0",border:`1px solid ${C.border}`,borderBottom:"none",maxHeight:"92%",overflow:"auto",padding:`10px 18px calc(30px + ${SAFE_BOTTOM})`,animation:"sheetIn .26s cubic-bezier(.32,.72,0,1)",boxShadow:"0 -8px 40px rgba(0,0,0,.55)"}}>
+      {/* Grab handle — the standard affordance telling users this panel is dismissible. */}
+      <div aria-hidden="true" style={{width:38,height:4,borderRadius:4,background:C.faint,margin:"0 auto 12px"}}/>
+      {/* Sticky header so the title and the close button stay reachable in tall sheets
+          (the gym and recipe sheets scroll well past a screen height). */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,position:"sticky",top:0,background:C.surf,zIndex:2,paddingBottom:8}}>
+        <span style={{fontSize:18,fontWeight:700,color:C.text,letterSpacing:"-0.01em"}}>{title}</span>
+        <button onClick={onClose} aria-label="Close"
+          style={{background:C.card,border:`1px solid ${C.border}`,color:C.muted,fontSize:19,lineHeight:1,width:34,height:34,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>×</button>
       </div>
       {children}
     </div>
@@ -1336,7 +1510,7 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
                       "frozen blueberries" when it was actually fresh). Editing this and then
                       tapping "AI estimate" below will re-estimate using the corrected name. */}
                   <div style={{marginBottom:8}}>
-                    <div style={{fontSize:9,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:3}}>Name (edit if AI got it wrong)</div>
+                    <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:3}}>Name (edit if AI got it wrong)</div>
                     <input type="text" value={ing.name} onChange={e=>setIngredients(p=>p.map((x,j)=>j!==i?x:{...x,name:e.target.value}))}
                       style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 9px",color:C.text,fontSize:13,outline:"none"}}/>
                   </div>
@@ -1353,7 +1527,7 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
                     <button onClick={()=>{setSwapIdx(i);setSwapSearch("");setSwapDescMode(false);setSwapDescText("");setExpandedIdx(null);}} style={{flex:1,padding:"6px 8px",borderRadius:6,background:C.orange+"15",border:`1px solid ${C.orange}40`,color:C.orange,fontWeight:600,cursor:"pointer",fontSize:10,whiteSpace:"nowrap"}}>⇄ Swap label</button>
                     {(ing._pinned||m.matched) && <button onClick={()=>setIngredients(p=>p.map((x,j)=>j!==i?x:{...x,_pinned:false,_estimated:false,_kcal100:undefined,_p100:undefined,_c100:undefined,_f100:undefined,kcal:0,protein:0,carbs:0,fat:0}))} style={{flex:1,padding:"6px 8px",borderRadius:6,background:"none",border:`1px solid ${C.border}`,color:C.muted,fontWeight:500,cursor:"pointer",fontSize:10,whiteSpace:"nowrap"}}>🔄 Reset</button>}
                   </div>
-                  <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:5}}>per-100g (edit to override)</div>
+                  <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:5}}>per-100g (edit to override)</div>
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:5}}>
                     {[["kcal","kcal",C.lime],["p","P",C.blue],["c","C",C.orange],["f","F",C.purple]].map(([k,lbl,col])=>(
                       <div key={k}>
@@ -1443,7 +1617,7 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
             <input value={addSearch} onChange={e=>setAddSearch(e.target.value)} placeholder="Search labels…" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:13,outline:"none",marginBottom:7}} autoFocus/>
             <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:200,overflowY:"auto"}}>
               {(products||[]).filter(p=>!addSearch||p.name.toLowerCase().includes(addSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(addSearch.toLowerCase())).slice(0,12).map(prod=>(
-                <button key={prod.name} type="button" onClick={()=>{setAddPickedProd(prod);setAddPickedG(prod.servingG||prod.packageG?String(prod.servingG||prod.packageG):"100");}} style={{padding:"7px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
+                <button key={prod.name} type="button" onClick={()=>{setAddPickedProd(prod);setAddPickedG(defaultGramsFor(prod));}} style={{padding:"7px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
                   <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{prod.name}</span>
                   <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
                 </button>
@@ -1759,7 +1933,7 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
           </div>
           <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:240,overflowY:"auto"}}>
             {(products||[]).filter(p=>(!pickSearch||p.name.toLowerCase().includes(pickSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(pickSearch.toLowerCase()))&&(!pickCat||(p.categories||[]).includes(pickCat))).slice(0,15).map(prod=>(
-              <button key={prod.name} type="button" onClick={()=>{setPickedProd(prod);setPickedG(prod.servingG||prod.packageG?String(prod.servingG||prod.packageG):"100");}} style={{padding:"8px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
+              <button key={prod.name} type="button" onClick={()=>{setPickedProd(prod);setPickedG(defaultGramsFor(prod));}} style={{padding:"8px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
                 <span style={{flex:1,minWidth:0,overflow:"hidden"}}><span style={{fontSize:12,color:C.text,display:"block",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>{prod.subtitle&&<span style={{fontSize:9.5,color:C.muted,display:"block"}}>{prod.subtitle}</span>}</span>
                 <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
               </button>
@@ -1769,7 +1943,7 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
         </>):(<div>
           <div style={{fontSize:12,color:C.lime,marginBottom:4,fontWeight:600}}>{pickedProd.name}</div>
           <div style={{fontSize:10,color:C.muted,marginBottom:6,fontFamily:"monospace"}}>{pickedProd.kcal} kcal · {pickedProd.p}g P · {pickedProd.c}g C · {pickedProd.f}g F per 100g</div>
-          {(pickedProd.servingG||pickedProd.packageG)&&<div style={{fontSize:10,color:C.lime,marginBottom:6,fontStyle:"italic"}}>🍽 Usual serving: {pickedProd.servingG||pickedProd.packageG}g</div>}
+          {<PortionHint prod={pickedProd}/>}
           {!(pickedProd.servingG||pickedProd.packageG)&&<div style={{fontSize:10,color:C.muted,marginBottom:6}}>Serving: {pickedProd.servingG||pickedProd.packageG}g <button type="button" onClick={()=>setPickedG(String(pickedProd.servingG||pickedProd.packageG))} style={{background:"none",border:`1px solid ${C.border}`,color:C.lime,fontSize:9,cursor:"pointer",padding:"1px 6px",borderRadius:4,marginLeft:4}}>use</button></div>}
           <div style={{display:"flex",gap:7,alignItems:"center",marginBottom:8}}>
             <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" value={pickedG} onChange={e=>setPickedG(e.target.value.replace(",","."))} placeholder="100" autoFocus style={{width:70,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:6,padding:"6px 9px",color:C.lime,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
@@ -1815,7 +1989,7 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
 
     {/* Total preview */}
     {(Object.keys(selected).length>0||extras.length>0)&&<div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px",marginBottom:10}}>
-      <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:5}}>Total</div>
+      <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:5}}>Total</div>
       <div style={{display:"flex",gap:10}}><Chip val={Math.round(grandTotals.kcal)} label="kcal" color={C.lime}/><Chip val={Math.round(grandTotals.protein)} label="P" color={C.blue}/><Chip val={Math.round(grandTotals.carbs)} label="C" color={C.orange}/><Chip val={Math.round(grandTotals.fat)} label="F" color={C.purple}/></div>
     </div>}
 
@@ -1919,7 +2093,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
   return(<Sheet onClose={onClose} title="Log Meal">
     <div style={{display:"flex",gap:5,marginBottom:10,flexWrap:"wrap"}}>{[["📸 Photos","photos"],["🏷️ Labels","labels"],["✏️ Manual","manual"],["🍱 Prep","mealprep"]].map(([lbl,m])=>(<button key={m} onClick={()=>{setMode(m);setResult(null);}} style={{flex:1,minWidth:60,padding:"8px 4px",borderRadius:10,border:`1px solid ${mode===m?C.lime:C.border}`,background:mode===m?`${C.lime}20`:C.card,color:mode===m?C.lime:C.muted,fontWeight:mode===m?700:500,cursor:"pointer",fontSize:11}}>{lbl}</button>))}</div>
     <div style={{marginBottom:14}}>
-      <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Meal type</div>
+      <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Meal type</div>
       <div style={{display:"flex",gap:5}}>{[["🌅","breakfast","Breakfast"],["☀️","lunch","Lunch"],["🌙","dinner","Dinner"],["🍎","snack","Snack"],["🥤","drink","Drink"]].map(([ic,id,lbl])=>{const active=mealType===id;return(<button key={id} onClick={()=>{setMealType(id);setMealTypeTouched(true);}} style={{flex:1,padding:"6px 2px",borderRadius:8,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,fontWeight:active?700:400,cursor:"pointer",fontSize:9,lineHeight:1.5,textAlign:"center"}}><div style={{fontSize:13}}>{ic}</div><div>{lbl}</div></button>);})}</div>
     </div>
     {/* ── Labels mode (issue 2) ── */}
@@ -1947,7 +2121,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
         </div>
         <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:260,overflowY:"auto"}}>
           {(products||[]).filter(p=>(!lblSearch||p.name.toLowerCase().includes(lblSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(lblSearch.toLowerCase()))&&(!lblCat||(p.categories||[]).includes(lblCat))).slice(0,20).map(prod=>(
-            <button key={prod.name} type="button" onClick={()=>{setLblPicked(prod);setLblG(prod.servingG||prod.packageG?String(prod.servingG||prod.packageG):"");}} style={{padding:"8px 11px",borderRadius:8,background:C.bg,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
+            <button key={prod.name} type="button" onClick={()=>{setLblPicked(prod);setLblG(defaultGramsFor(prod));}} style={{padding:"8px 11px",borderRadius:8,background:C.bg,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
               <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>
               <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
             </button>
@@ -1957,7 +2131,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
       </>):(<div style={{background:C.faint,borderRadius:10,padding:"12px 14px"}}>
         <div style={{fontSize:13,fontWeight:700,color:C.lime,marginBottom:3}}>{lblPicked.name}</div>
         <div style={{fontSize:10,color:C.muted,marginBottom:6,fontFamily:"monospace"}}>{lblPicked.kcal} kcal · {lblPicked.p}g P · {lblPicked.c}g C · {lblPicked.f}g F per 100g</div>
-        {(lblPicked.servingG||lblPicked.packageG)&&<div style={{fontSize:10,color:C.lime,marginBottom:6,fontStyle:"italic"}}>🍽 Usual serving: {lblPicked.servingG||lblPicked.packageG}g</div>}
+        {<PortionHint prod={lblPicked}/>}
         {!(lblPicked.servingG||lblPicked.packageG)&&<div style={{fontSize:10,color:C.muted,marginBottom:6}}>Serving: {lblPicked.servingG||lblPicked.packageG}g <button type="button" onClick={()=>setLblG(String(lblPicked.servingG||lblPicked.packageG))} style={{background:"none",border:`1px solid ${C.border}`,color:C.lime,fontSize:9,cursor:"pointer",padding:"1px 6px",borderRadius:4,marginLeft:4}}>use full</button></div>}
         <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:8}}>
           <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" value={lblG} onChange={e=>setLblG(e.target.value.replace(",","."))} placeholder="grams" autoFocus style={{width:80,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:7,padding:"7px 9px",color:C.lime,fontSize:15,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
@@ -1977,7 +2151,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
     {mode==="photos"&&!result&&(<>
       <div style={{display:"flex",gap:6,marginBottom:10}}>{[["Home cooked","home"],["Canteen / Restaurant","canteen"]].map(([lbl,t])=>(<button key={t} onClick={()=>setMt(t)} style={{flex:1,padding:"8px 6px",borderRadius:8,border:`1px solid ${mt===t?C.lime:C.border}`,background:mt===t?`${C.lime}12`:C.bg,color:mt===t?C.lime:C.muted,fontWeight:mt===t?600:400,cursor:"pointer",fontSize:11}}>{lbl}</button>))}</div>
       <div style={{marginBottom:10}}>
-        <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>{mt==="canteen"?"Describe the meal (required)":"Meal name / description (optional)"}</div>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>{mt==="canteen"?"Describe the meal (required)":"Meal name / description (optional)"}</div>
         <textarea value={desc} onChange={e=>setDesc(e.target.value)} rows={2} placeholder={mt==="canteen"?"e.g. Grilled chicken ~150g, buckwheat, salad, butter sauce on side":"e.g. Overnight oats with banana and peanut butter"} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:13,outline:"none",resize:"none",fontFamily:"inherit"}}/>
       </div>
       <ImgZone imgs={imgs} setImgs={setImgs} maxPhotos={15}/>
@@ -2021,7 +2195,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
           <input value={mPickSearch} onChange={e=>setMPickSearch(e.target.value)} placeholder="Search your product labels…" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:13,outline:"none",marginBottom:7}} autoFocus/>
           <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:240,overflowY:"auto"}}>
             {(products||[]).filter(p=>!mPickSearch||p.name.toLowerCase().includes(mPickSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(mPickSearch.toLowerCase())).slice(0,15).map(prod=>(
-              <button key={prod.name} type="button" onClick={()=>{setMPickedProd(prod);setMPickedG(prod.servingG||prod.packageG?String(prod.servingG||prod.packageG):"100");}} style={{padding:"8px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
+              <button key={prod.name} type="button" onClick={()=>{setMPickedProd(prod);setMPickedG(defaultGramsFor(prod));}} style={{padding:"8px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
                 <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{prod.name}</span>
                 <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
               </button>
@@ -2174,11 +2348,11 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
     <div style={{fontSize:10,color:C.muted,marginTop:4,marginBottom:8,lineHeight:1.4}}>💡 Weigh the finished container now, before eating. Drives the portion-size suggestion. Macros are independent.</div>
 
     {/* Photos — optional now */}
-    <div style={{marginBottom:4,fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Photos (optional — AI can estimate from description alone)</div>
+    <div style={{marginBottom:4,fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Photos (optional — AI can estimate from description alone)</div>
     <ImgZone imgs={imgs} setImgs={setImgs} maxPhotos={15}/>
 
     {/* Description */}
-    <div style={{marginTop:10}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>Description <span style={{textTransform:"none",color:C.lime}}>← describe ingredients + weights for accurate AI estimate</span></div><textarea value={desc} onChange={e=>setDesc(e.target.value)} rows={3} placeholder={"e.g. 400g cooked chicken breast\nor: 500g raw chicken, 200g dry rice, 80g peas, 30ml soy sauce\nor: homemade cheesecake, 200g cream cheese, 150g biscuits, 50g butter"} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:13,outline:"none",resize:"none",fontFamily:"inherit"}}/></div>
+    <div style={{marginTop:10}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>Description <span style={{textTransform:"none",color:C.lime}}>← describe ingredients + weights for accurate AI estimate</span></div><textarea value={desc} onChange={e=>setDesc(e.target.value)} rows={3} placeholder={"e.g. 400g cooked chicken breast\nor: 500g raw chicken, 200g dry rice, 80g peas, 30ml soy sauce\nor: homemade cheesecake, 200g cream cheese, 150g biscuits, 50g butter"} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:13,outline:"none",resize:"none",fontFamily:"inherit"}}/></div>
 
     {/* Analyze — works with or without photos */}
     {!result&&!showPanel&&!buildMode&&<button onClick={analyze} disabled={loading||(!imgs.length&&!desc.trim())} style={{width:"100%",padding:"14px 0",borderRadius:10,background:loading?C.faint:(imgs.length||desc.trim())?C.lime:C.faint,color:"#000",fontWeight:800,border:"none",cursor:(loading||(!imgs.length&&!desc.trim()))?"default":"pointer",fontSize:15,marginTop:10,boxShadow:(!loading&&(imgs.length||desc.trim()))?`0 0 12px ${C.lime}40`:"none"}}>{loading?"Analyzing…":imgs.length?`🔍 Analyze ${imgs.length} photo${imgs.length!==1?"s":""}${desc.trim()?" + description":""}`:desc.trim()?"🔍 Estimate from description":"Add photos or a description first"}</button>}
@@ -2209,7 +2383,7 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
         </div>
         <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:220,overflowY:"auto"}}>
           {(products||[]).filter(p=>(!pickSearch||p.name.toLowerCase().includes(pickSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(pickSearch.toLowerCase()))&&(!pickCat||(p.categories||[]).includes(pickCat))).slice(0,15).map(prod=>(
-            <button key={prod.name} type="button" onClick={()=>{setPickedProd(prod);setPickedG(prod.servingG||prod.packageG?String(prod.servingG||prod.packageG):"100");}} style={{padding:"8px 11px",borderRadius:7,background:C.bg,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
+            <button key={prod.name} type="button" onClick={()=>{setPickedProd(prod);setPickedG(defaultGramsFor(prod));}} style={{padding:"8px 11px",borderRadius:7,background:C.bg,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
               <span style={{flex:1,minWidth:0,overflow:"hidden"}}><span style={{fontSize:12,color:C.text,display:"block",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>{prod.subtitle&&<span style={{fontSize:9.5,color:C.muted,display:"block"}}>{prod.subtitle}</span>}</span>
               <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
             </button>
@@ -2219,7 +2393,7 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
       </>):(<div>
         <div style={{fontSize:12,color:C.lime,marginBottom:4,fontWeight:600}}>{pickedProd.name}</div>
         <div style={{fontSize:10,color:C.muted,marginBottom:6,fontFamily:"monospace"}}>{pickedProd.kcal} kcal · {pickedProd.p}g P · {pickedProd.c}g C · {pickedProd.f}g F per 100g</div>
-        {(pickedProd.servingG||pickedProd.packageG)&&<div style={{fontSize:10,color:C.lime,marginBottom:6,fontStyle:"italic"}}>🍽 Usual serving: {pickedProd.servingG||pickedProd.packageG}g</div>}
+        {<PortionHint prod={pickedProd}/>}
         {!(pickedProd.servingG||pickedProd.packageG)&&<div style={{fontSize:10,color:C.muted,marginBottom:6}}>Serving: {pickedProd.servingG||pickedProd.packageG}g <button type="button" onClick={()=>setPickedG(String(pickedProd.servingG||pickedProd.packageG))} style={{background:"none",border:`1px solid ${C.border}`,color:C.lime,fontSize:9,cursor:"pointer",padding:"1px 6px",borderRadius:4,marginLeft:4}}>use</button></div>}
         <div style={{display:"flex",gap:7,alignItems:"center"}}>
           <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" value={pickedG} onChange={e=>setPickedG(e.target.value.replace(",","."))} placeholder="100" style={{width:80,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:6,padding:"6px 9px",color:C.lime,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none"}} autoFocus/>
@@ -2283,7 +2457,24 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
   const activePreps=mealPreps.filter(p=>p.remaining>0);
   const todayW=weights.find(w=>w.date===TODAY());const prevW=weights.find(w=>w.date!==TODAY());
   const wDelta=todayW&&prevW?todayW.weight-prevW.weight:null;
-  const logWeight=()=>{const w=parseNum(wInput);if(!w)return;const e={date:TODAY(),weight:w};setWeights(p=>[e,...p.filter(x=>x.date!==e.date)].sort((a,b)=>b.date.localeCompare(a.date)));setWInput("");};
+  // `saved` drives a brief inline confirmation. Logging a weight previously just cleared the
+  // input, which is ambiguous — you cannot tell a successful save from a rejected one, so
+  // people re-type it. `wErr` covers the silent-rejection case: anything unparseable (or a
+  // fat-fingered 842 instead of 84.2) was dropped with no message at all.
+  const [saved,setSaved]=useState(false);
+  const [wErr,setWErr]=useState("");
+  const logWeight=()=>{
+    const w=parseNum(wInput);
+    if(!wInput.trim()){setWErr("Enter a weight first.");return;}
+    if(!w||isNaN(w)){setWErr("That doesn't look like a number.");return;}
+    if(w<25||w>400){setWErr("Enter a weight between 25 and 400 kg.");return;}
+    setWErr("");
+    const e={date:TODAY(),weight:w};
+    setWeights(p=>[e,...p.filter(x=>x.date!==e.date)].sort((a,b)=>b.date.localeCompare(a.date)));
+    setWInput("");
+    setSaved(true);
+    setTimeout(()=>setSaved(false),1900);
+  };
   const handleAdd=entry=>{
     if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode}));}
     else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}));if(newProduct)setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,newProduct]);}
@@ -2309,10 +2500,13 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
           {todayW&&<div style={{display:"flex",alignItems:"baseline",gap:6}}><span style={{fontFamily:"monospace",fontSize:18,fontWeight:800,color:C.lime}}>{todayW.weight.toFixed(2)}</span><span style={{fontSize:12,color:C.muted}}>kg</span>{wDelta!==null&&<span style={{fontFamily:"monospace",fontSize:11,color:wDelta<0?C.lime:C.red}} title="Difference from previous logged weight">{wDelta<0?"↓":"↑"}{Math.abs(wDelta).toFixed(2)} vs prev</span>}</div>}
         </div>
         <div style={{display:"flex",gap:8}}>
-          <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" step="0.05" placeholder={todayW?"Update weight…":"e.g. 75.00"} value={wInput} onChange={e=>setWInput(e.target.value.replace(",","."))} onKeyDown={e=>e.key==="Enter"&&logWeight()} style={{flex:1,background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"7px 10px",color:C.text,fontSize:14,fontFamily:"monospace",outline:"none"}}/>
-          <button onClick={logWeight} style={{padding:"7px 14px",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Log</button>
+          <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" step="0.05" aria-label="Weight in kilograms" placeholder={todayW?"Update weight…":"e.g. 75.00"} value={wInput} onChange={e=>{setWInput(e.target.value.replace(",","."));if(wErr)setWErr("");}} onKeyDown={e=>e.key==="Enter"&&logWeight()} style={{flex:1,background:C.bg,border:`1px solid ${wErr?C.red:C.border}`,borderRadius:8,padding:"8px 11px",color:C.text,fontFamily:"monospace",outline:"none",minHeight:44}}/>
+          <button onClick={logWeight} style={{padding:"0 18px",minHeight:44,borderRadius:8,background:saved?C.dim:C.lime,border:"none",color:saved?C.lime:"#000",fontWeight:700,fontSize:13,flexShrink:0}}>{saved?"✓ Saved":"Log"}</button>
         </div>
-        {weights.slice(1,4).map(e=>(<div key={e.date} style={{display:"flex",justifyContent:"space-between",marginTop:3}}><span style={{fontSize:10,color:C.muted}}>{new Date(e.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span><span style={{fontFamily:"monospace",fontSize:10,color:C.muted}}>{e.weight.toFixed(2)} kg</span></div>))}
+        {/* Error sits next to the field it belongs to, not in a banner at the top of the
+            screen — role=alert so it is announced the moment it appears. */}
+        {wErr&&<div role="alert" style={{fontSize:12,color:C.red,marginTop:6,lineHeight:1.4}}>{wErr}</div>}
+        {weights.slice(1,4).map(e=>(<div key={e.date} style={{display:"flex",justifyContent:"space-between",marginTop:4}}><span style={{fontSize:11,color:C.muted}}>{new Date(e.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span><span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{e.weight.toFixed(2)} kg</span></div>))}
       </div>
 
       {!profileOK&&<button onClick={onGoToSettings} style={{width:"100%",marginBottom:10,background:"#1a1400",border:`1px solid ${C.yellow}40`,borderRadius:10,padding:"9px 14px",display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}}><span style={{fontSize:12,color:C.yellow}}>Complete profile for personalized targets</span><span style={{color:C.muted,fontSize:12}}>→</span></button>}
@@ -2333,14 +2527,14 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
 
       {/* Day type */}
       <div style={{marginBottom:10}}>
-        <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:7}}>Day Type</div>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:7}}>Day Type</div>
         <div style={{display:"flex",gap:5}}>{Object.entries(DAY_TYPES).map(([key,val])=>{const active=dayData.dayType===key;const tKcal=getDT(profile,key,latestWeight,0,false,dailySteps).kcal;return(<button key={key} onClick={()=>setDayData(p=>({...p,dayType:key,goalMode:profile.goal,goalSubmode:profile.goalSubmode}))} style={{flex:1,padding:"7px 3px",borderRadius:10,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.card,color:active?C.lime:C.muted,fontWeight:active?700:400,cursor:"pointer",fontSize:9.5,lineHeight:1.4,textAlign:"center"}}><div style={{fontSize:14}}>{val.icon}</div><div>{val.label}</div><div style={{fontFamily:"monospace",fontSize:10,opacity:0.75,marginTop:1}}>{tKcal}</div></button>);})}</div>
       </div>
 
       {/* Daily steps — optional but recalculates target when set */}
       <div style={{marginBottom:12,background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-          <span style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",display:"flex",alignItems:"center",gap:5}}>Daily Steps <InfoTip text="For background movement only — commuting, errands, walking around home. If you did a deliberate walk, log it as an Activity instead. Logging both double-counts."/></span>
+          <span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",display:"flex",alignItems:"center",gap:5}}>Daily Steps <InfoTip text="For background movement only — commuting, errands, walking around home. If you did a deliberate walk, log it as an Activity instead. Logging both double-counts."/></span>
           {dailySteps>0&&(()=>{const adj=stepsKcal(dailySteps,profile.activityLevel||"sedentary",latestWeight||70);if(adj===0)return <span style={{fontSize:10,color:C.muted,fontFamily:"monospace"}}>on baseline</span>;return <span style={{fontSize:10,color:adj>0?C.orange:C.muted,fontFamily:"monospace"}}>{adj>0?"+":"−"}{Math.abs(adj)} kcal {adj>0?"bonus":"vs baseline"}</span>;})()}
         </div>
         <div style={{display:"flex",gap:6,alignItems:"center"}}>
@@ -2355,22 +2549,22 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
       <div style={{background:C.card,borderRadius:14,padding:"16px 8px 14px",border:`1px solid ${C.border}`,marginBottom:12}}>
         <div style={{display:"flex",justifyContent:"space-around"}}><Ring value={tot.kcal} max={dt.kcal} color={C.lime} label="kcal"/><Ring value={tot.protein} max={dt.protein} color={C.blue} label="protein"/><Ring value={tot.carbs} max={dt.carbs} color={C.orange} label="carbs"/><Ring value={tot.fat} max={dt.fat} color={C.purple} label="fat"/></div>
         <div style={{marginTop:14,paddingTop:12,borderTop:`1px solid ${C.border}`,display:"flex",justifyContent:"space-around",textAlign:"center"}}>
-          <div><div style={{fontSize:22,fontWeight:800,fontFamily:"monospace",color:remKcal<0?C.red:C.lime,lineHeight:1}}>{Math.abs(Math.round(remKcal))}</div><div style={{fontSize:9,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginTop:3}}>{remKcal<0?"over":"left"} kcal</div></div>
+          <div><div style={{fontSize:22,fontWeight:800,fontFamily:"monospace",color:remKcal<0?C.red:C.lime,lineHeight:1}}>{Math.abs(Math.round(remKcal))}</div><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginTop:3}}>{remKcal<0?"over":"left"} kcal</div></div>
           <div style={{width:1,background:C.border}}/>
-          <div><div style={{fontSize:22,fontWeight:800,fontFamily:"monospace",color:remProt<0?C.lime:C.blue,lineHeight:1}}>{Math.abs(Math.round(remProt))}g</div><div style={{fontSize:9,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginTop:3}}>{remProt<0?"💪 extra":"left"} protein</div></div>
+          <div><div style={{fontSize:22,fontWeight:800,fontFamily:"monospace",color:remProt<0?C.lime:C.blue,lineHeight:1}}>{Math.abs(Math.round(remProt))}g</div><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginTop:3}}>{remProt<0?"💪 extra":"left"} protein</div></div>
           <div style={{width:1,background:C.border}}/>
-          <div><div style={{fontSize:22,fontWeight:800,fontFamily:"monospace",color:C.text,lineHeight:1}}>{Math.round(tot.kcal)}</div><div style={{fontSize:9,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginTop:3}}>consumed</div></div>
+          <div><div style={{fontSize:22,fontWeight:800,fontFamily:"monospace",color:C.text,lineHeight:1}}>{Math.round(tot.kcal)}</div><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginTop:3}}>consumed</div></div>
         </div>
       </div>
 
       {/* Tags */}
-      <div style={{marginBottom:12}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Tag today</div><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{DAY_TAGS.map(tag=>{const active=(dayData.tags||[]).includes(tag.id);return(<button key={tag.id} onClick={()=>toggleTag(tag.id)} style={{padding:"5px 10px",borderRadius:20,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,cursor:"pointer",fontSize:11}}>{tag.emoji} {tag.label}</button>);})}</div></div>
+      <div style={{marginBottom:12}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Tag today</div><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{DAY_TAGS.map(tag=>{const active=(dayData.tags||[]).includes(tag.id);return(<button key={tag.id} onClick={()=>toggleTag(tag.id)} style={{padding:"5px 10px",borderRadius:20,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,cursor:"pointer",fontSize:11}}>{tag.emoji} {tag.label}</button>);})}</div></div>
 
       {/* Active preps */}
-      {activePreps.length>0&&<div style={{marginBottom:12}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Active Preps</div><div style={{display:"flex",flexDirection:"column",gap:6}}>{activePreps.map(prep=>{const remGrams=Math.round(prep.remainingWeightG??prep.totalWeightG??0);const remPortions=Math.max(prep.remaining||1,1);const liveSuggested=remPortions>0?Math.round(remGrams/remPortions):0;return(<div key={prep.id} style={{background:C.card,border:`1px solid ${C.dim}`,borderRadius:10,padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontSize:13,fontWeight:600,color:C.text}}>{prep.name}</div><div style={{fontSize:10,color:C.muted,marginTop:2}}>{remGrams}g left · {remPortions} portion{remPortions!==1?"s":""} · <span style={{fontFamily:"monospace",color:C.lime}}>~{liveSuggested}g each</span></div></div><button onClick={()=>setModal("mealprep")} style={{padding:"7px 13px",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>+ Eat</button></div>);})}</div></div>}
+      {activePreps.length>0&&<div style={{marginBottom:12}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Active Preps</div><div style={{display:"flex",flexDirection:"column",gap:6}}>{activePreps.map(prep=>{const remGrams=Math.round(prep.remainingWeightG??prep.totalWeightG??0);const remPortions=Math.max(prep.remaining||1,1);const liveSuggested=remPortions>0?Math.round(remGrams/remPortions):0;return(<div key={prep.id} style={{background:C.card,border:`1px solid ${C.dim}`,borderRadius:10,padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontSize:13,fontWeight:600,color:C.text}}>{prep.name}</div><div style={{fontSize:10,color:C.muted,marginTop:2}}>{remGrams}g left · {remPortions} portion{remPortions!==1?"s":""} · <span style={{fontFamily:"monospace",color:C.lime}}>~{liveSuggested}g each</span></div></div><button onClick={()=>setModal("mealprep")} style={{padding:"7px 13px",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>+ Eat</button></div>);})}</div></div>}
 
       {/* Meals */}
-      <div><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>{dayData.meals.length} meals</div>
+      <div><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>{dayData.meals.length} meals</div>
         <div style={{display:"flex",flexDirection:"column",gap:7}}>
           {dayData.meals.map(m=>{
             const isExp=expandedMealId===m.id;
@@ -2406,11 +2600,25 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
               </div>}
             </div>);
           })}
-          {!dayData.meals.length&&<div style={{textAlign:"center",padding:"28px 0",color:C.muted,fontSize:14}}>Nothing logged yet.</div>}
+          {/* A dead-end empty state ("Nothing logged yet.") tells the user what is missing but
+              not what to do about it. This one names the next action and starts it. */}
+          {!dayData.meals.length&&<div style={{textAlign:"center",padding:"26px 18px",background:C.card,border:`1px dashed ${C.border}`,borderRadius:12}}>
+            <div style={{fontSize:30,marginBottom:8}}>🍽️</div>
+            <div style={{fontSize:15,color:C.text,fontWeight:600,marginBottom:5}}>No meals logged today</div>
+            <div style={{fontSize:13,color:C.muted,lineHeight:1.5,marginBottom:14}}>Snap a photo of your plate and the app works out the macros, or enter them by hand.</div>
+            <button onClick={()=>setModal("meal")} style={{padding:"11px 20px",minHeight:44,borderRadius:10,background:C.lime,border:"none",color:"#000",fontWeight:700,fontSize:14}}>+ Log your first meal</button>
+          </div>}
         </div>
       </div>
     </div>
-    <button onClick={()=>setModal("meal")} style={{position:"absolute",bottom:16,right:16,width:54,height:54,borderRadius:"50%",background:C.lime,border:"none",cursor:"pointer",fontSize:28,color:"#000",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 0 20px ${C.lime}55`,zIndex:10}}>+</button>
+    {/* Primary action. Kept circular on purpose: a wider "Log meal" pill reads better but
+        parks itself over the macro rings, and obscuring the day's numbers costs more than
+        the label gains. aria-label carries the meaning instead — announced as just "plus"
+        before, which told a screen-reader user nothing about what it adds. */}
+    <button onClick={()=>setModal("meal")} aria-label="Log a meal"
+      style={{position:"absolute",bottom:18,right:16,width:56,height:56,borderRadius:"50%",background:C.lime,border:"none",fontSize:29,color:"#000",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 6px 22px ${C.lime}40, 0 2px 8px rgba(0,0,0,.45)`,zIndex:10}}>
+      <span aria-hidden="true" style={{marginTop:-3,fontWeight:400}}>+</span>
+    </button>
     {(modal==="meal"||modal==="mealprep")&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleAdd} onClose={()=>setModal(null)} apiKey={profile.apiKey} initialMode={modal==="mealprep"?"mealprep":"photos"}/>}
   </div>);
 }
@@ -2688,6 +2896,66 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
     });
   };
 
+  // Move an exercise anywhere in the session — including into a different combo, so exercises
+  // for different muscle groups can be reordered against each other within the same day.
+  //
+  // The cursor stays POSITIONAL (the active slot remains the active slot) rather than following
+  // the moved exercise. That matches why people reorder mid-workout: the rack is busy, so they
+  // push an exercise back and want whatever moved up to become the one they do now. Tracking
+  // the moved exercise instead would leave you still "on" the exercise you just postponed.
+  // This is the same rule the ▲/▼ buttons follow, so both routes behave identically.
+  const moveExerciseTo = (fromCombo, fromIdx, toCombo, toIdx) => {
+    updateAction(s=>{
+      if(!s.combos[fromCombo]||!s.combos[toCombo]) return s;
+      const combos = s.combos.map(c=>({...c, exercises:[...(c.exercises||[])]}));
+      const [moved] = combos[fromCombo].exercises.splice(fromIdx,1);
+      if(!moved) return s;
+      combos[toCombo].exercises.splice(Math.max(0,Math.min(toIdx,combos[toCombo].exercises.length)),0,moved);
+      // Dragging the last exercise out of the active combo would leave the cursor pointing past
+      // the end of it; clamp so the panel always has a valid position to render.
+      const cur = combos[s.currentComboIdx];
+      const curEx = Math.min(s.currentExInRound, Math.max(0, (cur?.exercises.length||1)-1));
+      return {...s, combos, currentExInRound:curEx};
+    });
+  };
+
+  // Classify every exercise in the session for the always-visible list.
+  //  current  — the one being logged right now
+  //  done     — has logged sets
+  //  skipped  — the cursor has moved past it but nothing was logged
+  //  upcoming — still ahead
+  const exStatus = (ci, ei, ex) => {
+    if(ci===session.currentComboIdx && ei===session.currentExInRound && !session.resting) return "current";
+    if((ex.sets||[]).length>0) return "done";
+    if(ci<session.currentComboIdx || (ci===session.currentComboIdx && ei<session.currentExInRound)) return "skipped";
+    return "upcoming";
+  };
+
+  // ── Drag-to-reorder ──
+  // Pointer Events rather than HTML5 drag-and-drop: the latter does not fire on touch devices
+  // at all, and this is a phone-first screen. `touch-action:none` on the handle stops the
+  // browser claiming the gesture for scrolling.
+  const [drag, setDrag] = useState(null); // {fromCombo, fromIdx, toCombo, toIdx}
+  const beginDrag = (e, ci, ei) => {
+    try{ e.currentTarget.setPointerCapture(e.pointerId); }catch{}
+    setDrag({fromCombo:ci, fromIdx:ei, toCombo:ci, toIdx:ei});
+  };
+  const moveDrag = e => {
+    if(!drag) return;
+    e.preventDefault();
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const row = el?.closest?.("[data-exkey]");
+    if(!row) return;
+    const [ci,ei] = row.getAttribute("data-exkey").split(":").map(Number);
+    setDrag(d => (d && (d.toCombo!==ci || d.toIdx!==ei)) ? {...d, toCombo:ci, toIdx:ei} : d);
+  };
+  const endDrag = () => {
+    if(!drag) return;
+    const {fromCombo,fromIdx,toCombo,toIdx} = drag;
+    if(fromCombo!==toCombo || fromIdx!==toIdx) moveExerciseTo(fromCombo,fromIdx,toCombo,toIdx);
+    setDrag(null);
+  };
+
   // ── Warmup step ──
   if (session.warmup && !session.warmup.done) {
     const machine = CARDIO_MACHINES.find(m=>m.id===session.warmup.type)||CARDIO_MACHINES[0];
@@ -2734,7 +3002,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
 
       {/* Quick stretch timers — tap 30s/60s per stretch, re-tap for the next one */}
       <div style={{background:C.bg,borderRadius:10,padding:"12px 14px",marginBottom:12,textAlign:"center"}}>
-        <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:8}}>Stretch Timer</div>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:8}}>Stretch Timer</div>
         {stretchTarget?(<>
           <div style={{fontSize:34,fontWeight:900,fontFamily:"monospace",color:stretchRemaining<=0?C.lime:C.blue,marginBottom:4}}>{fmtTime(stretchRemaining)}</div>
           <div style={{fontSize:11,color:stretchRemaining<=0?C.lime:C.muted,marginBottom:10}}>{stretchRemaining<=0?"⏰ Time's up!":"holding…"}</div>
@@ -2756,10 +3024,13 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
     </div>);
   }
 
-  const combo = session.combos[session.currentComboIdx];
+  // Defensive: an empty-combo fallback. currentComboIdx should always be in range, but the
+  // plan is now editable mid-session (drag between combos, new combo, jump), and an undefined
+  // combo here would take the whole session panel down with it — losing an in-progress workout.
+  const combo = session.combos[session.currentComboIdx] || {id:"__none",exercises:[]};
   const isLastCombo = session.currentComboIdx >= session.combos.length-1;
   const atRoundStart = session.currentExInRound === 0;
-  const roundsDone = Math.max(0, ...combo.exercises.map(e=>(e.sets||[]).length), 0);
+  const roundsDone = Math.max(0, ...(combo.exercises||[]).map(e=>(e.sets||[]).length), 0);
   const targetSets = gymSettings?.targetSetsPerCombo;
   const nextCombo = !isLastCombo ? session.combos[session.currentComboIdx+1] : null;
 
@@ -2799,38 +3070,83 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       ))}</div>
     </div>)}
 
-    {/* Resting between rounds */}
-    {session.resting ? (
-      <div style={{textAlign:"center",padding:"14px 0 4px"}}>
-        <div style={{fontSize:13,color:C.lime,fontWeight:600,marginBottom:10}}>✅ Set {roundsDone} done for this combo</div>
-        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Resting</div>
-        <div style={{fontSize:38,fontWeight:900,fontFamily:"monospace",color:C.orange,marginBottom:12}}>{fmtTime(restElapsed)}</div>
-        {targetSets&&roundsDone>=targetSets&&<div style={{background:`${C.yellow}15`,border:`1px solid ${C.yellow}50`,borderRadius:8,padding:"7px 11px",marginBottom:12,fontSize:11,color:C.yellow}}>⚠ You've hit your usual {targetSets} sets — maybe move to the next combo</div>}
-        {nextCombo&&<div style={{background:C.bg,borderRadius:8,padding:"8px 11px",marginBottom:12,fontSize:11,color:C.muted,textAlign:"left"}}>👀 Coming up — Combo {session.currentComboIdx+2}: <span style={{color:C.text}}>{nextCombo.exercises.map(e=>e.name).join(" + ")||"(empty)"}</span></div>}
-        <div style={{display:"flex",gap:8}}>
-          <button onClick={()=>updateAction(s=>({...s,resting:false}))} style={{flex:1,padding:"12px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:14}}>▶ Start Next Round</button>
-        </div>
-        {!isLastCombo&&<button onClick={()=>updateAction(s=>({...s,resting:false,currentComboIdx:s.currentComboIdx+1,currentExInRound:0}))} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12}}>⏭ Next Combo →</button>}
-        {isLastCombo&&<button onClick={goToFinishOrCooldown} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.lime}60`,color:C.lime,cursor:"pointer",fontSize:12,fontWeight:600}}>🏁 That's it — Wrap Up</button>}
+    {/* Rest timer now sits ABOVE the plan instead of replacing it — resting used to swap the
+        whole screen out, so mid-workout you could not see what was still to come. */}
+    {session.resting&&(
+      <div style={{textAlign:"center",background:C.bg,border:`1px solid ${C.orange}55`,borderRadius:12,padding:"12px 14px",marginBottom:10}}>
+        <div style={{fontSize:13,color:C.lime,fontWeight:600,marginBottom:6}}>✅ Set {roundsDone} done for this combo</div>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:4}}>Resting</div>
+        <div style={{fontSize:38,fontWeight:900,fontFamily:"monospace",color:C.orange,marginBottom:10}}>{fmtTime(restElapsed)}</div>
+        {targetSets&&roundsDone>=targetSets&&<div style={{background:`${C.yellow}15`,border:`1px solid ${C.yellow}50`,borderRadius:8,padding:"7px 11px",marginBottom:10,fontSize:11,color:C.yellow}}>⚠ You've hit your usual {targetSets} sets — maybe move to the next combo</div>}
+        <button onClick={()=>updateAction(s=>({...s,resting:false}))} style={{width:"100%",padding:"12px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",fontSize:14}}>▶ Start Next Round</button>
+        {!isLastCombo&&<button onClick={()=>updateAction(s=>({...s,resting:false,currentComboIdx:s.currentComboIdx+1,currentExInRound:0}))} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12}}>⏭ Next Combo →</button>}
+        {isLastCombo&&<button onClick={goToFinishOrCooldown} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.lime}60`,color:C.lime,fontSize:12,fontWeight:600}}>🏁 That's it — Wrap Up</button>}
       </div>
-    ) : (<>
-      {/* Exercise list for current combo, current one highlighted */}
-      {combo.exercises.map((ex,ei)=>{
-        const isCurrent = ei===session.currentExInRound;
+    )}
+
+    {/* ── Full session plan ──
+        Every exercise in every combo, always on screen. Completed work greys out rather than
+        disappearing, so the list doubles as a record of what has been done so far. Rows can be
+        dragged by the ⠿ handle to any position in any combo. */}
+    <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:7,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+      <span>Session plan</span>
+      <span style={{textTransform:"none",letterSpacing:0,fontFamily:"inherit"}}>⠿ drag to reorder</span>
+    </div>
+    {session.combos.map((c,ci)=>{
+      const isCurCombo = ci===session.currentComboIdx;
+      return(<div key={c.id} style={{marginBottom:10,border:`1px solid ${isCurCombo?C.orange+"55":C.border}`,borderRadius:11,padding:"8px 9px",background:isCurCombo?`${C.orange}08`:"transparent"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7,paddingLeft:2}}>
+          <span style={{fontSize:11,fontFamily:"monospace",color:isCurCombo?C.orange:C.muted,fontWeight:isCurCombo?700:400}}>
+            COMBO {ci+1}{c.exercises.length>1?" · SUPERSET":""}{isCurCombo?" · NOW":""}
+          </span>
+          {!isCurCombo&&<button onClick={()=>jumpToCombo(ci)} style={{fontSize:11,color:C.blue,background:"none",border:`1px solid ${C.blue}40`,borderRadius:6,padding:"3px 9px"}}>jump here</button>}
+        </div>
+        {c.exercises.length===0&&<div style={{fontSize:11,color:C.muted,fontStyle:"italic",padding:"6px 4px"}}>Empty — drag an exercise here.</div>}
+        {c.exercises.map((ex,ei)=>{
+        const st = exStatus(ci,ei,ex);
+        const isCurrent = st==="current";
+        const isDone = st==="done";
+        const isSkipped = st==="skipped";
+        const beingDragged = drag&&drag.fromCombo===ci&&drag.fromIdx===ei;
+        const isDropTarget = drag&&drag.toCombo===ci&&drag.toIdx===ei&&!beingDragged;
         const last = getLastPerformance(ex.name, gymSessions);
         const suggestion = isCurrent ? suggestProgression(ex.name, gymSessions, gymSettings?.trainingMethod) : null;
         const lib = libFor(ex.name);
         const canSwap = (ex.sets||[]).length === 0 && lib; // only before this exercise has been started
-        return(<div key={ex.id} style={{background:isCurrent?`${C.lime}0d`:C.bg,border:`1px solid ${isCurrent?C.lime:C.border}`,borderRadius:10,padding:"11px 13px",marginBottom:8}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:2}}>
-            <span style={{fontSize:13,fontWeight:isCurrent?700:500,color:isCurrent?C.lime:C.text}}>{ex.name}</span>
-            {last&&<span style={{fontSize:9.5,color:C.muted}}>last: {last.weight}{ex.unit||"kg"} · {last.sets.map(s=>s.reps).join("/")} ({new Date(last.date+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"})})</span>}
+        // Finished and skipped work greys back rather than vanishing, so the plan doubles as
+        // a running record of the session without crowding the exercise you're actually on.
+        const rowOpacity = beingDragged?0.4:isDone?0.55:isSkipped?0.4:1;
+        const rowBorder = isDropTarget?C.blue:isCurrent?C.lime:isDone||isSkipped?C.border:C.dim;
+        return(<div key={ex.id} data-exkey={`${ci}:${ei}`}
+          style={{background:isCurrent?`${C.lime}0d`:C.bg,border:`1px solid ${rowBorder}`,borderRadius:10,padding:"10px 11px",marginBottom:7,opacity:rowOpacity,
+            transition:"opacity .2s ease, border-color .15s ease",
+            boxShadow:isDropTarget?`0 0 0 2px ${C.blue}55`:"none"}}>
+          <div style={{display:"flex",alignItems:"flex-start",gap:9}}>
+            {/* Drag handle. touch-action:none is what stops the browser turning the drag into
+                a page scroll on touch devices. */}
+            <span role="button" tabIndex={-1} aria-label={`Reorder ${ex.name}`}
+              onPointerDown={e=>beginDrag(e,ci,ei)} onPointerMove={moveDrag} onPointerUp={endDrag} onPointerCancel={endDrag}
+              style={{touchAction:"none",cursor:"grab",color:C.muted,fontSize:15,lineHeight:1,padding:"3px 4px",marginTop:1,flexShrink:0,userSelect:"none"}}>⠿</span>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",gap:8,marginBottom:2}}>
+                <span style={{fontSize:13,fontWeight:isCurrent?700:500,color:isCurrent?C.lime:isDone?C.muted:C.text,textDecoration:isSkipped?"line-through":"none"}}>{ex.name}</span>
+                {isDone&&<span style={{fontSize:10,color:C.lime,flexShrink:0}}>✓ done</span>}
+                {isSkipped&&<span style={{fontSize:10,color:C.muted,flexShrink:0}}>skipped</span>}
+              </div>
+              {/* Weight is surfaced on completed rows so you can see what you lifted earlier in
+                  the session without tapping anything. The active row is skipped — its weight
+                  is already in the editable input below. */}
+              {ex.weight&&isDone&&<div style={{fontSize:11,fontFamily:"monospace",color:C.muted,marginBottom:2}}>{ex.weight}{ex.unit||"kg"}</div>}
+              {last&&!isDone&&<div style={{fontSize:11,color:C.muted}}>last: {last.weight}{ex.unit||"kg"} · {last.sets.map(s=>s.reps).join("/")} ({new Date(last.date+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"})})</div>}
+              {lib?.note&&!isDone&&<div style={{fontSize:11,color:C.yellow,fontStyle:"italic",marginTop:3}}>📌 {lib.note}</div>}
+            </div>
           </div>
-          {lib?.note&&<div style={{fontSize:10,color:C.yellow,fontStyle:"italic",marginBottom:4}}>📌 {lib.note}</div>}
-          <div style={{display:"flex",gap:12,marginBottom:4,flexWrap:"wrap"}}>
-            {canSwap&&<button onClick={()=>setSwapOpenFor(swapOpenFor===ex.id?null:ex.id)} style={{fontSize:9.5,color:C.blue,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>⇄ swap exercise</button>}
-            {atRoundStart&&<button onClick={()=>moveExercise(session.currentComboIdx,ei,-1)} disabled={ei===0} style={{fontSize:9.5,color:ei===0?C.faint:C.muted,background:"none",border:"none",cursor:ei===0?"default":"pointer"}}>▲ move up</button>}
-            {atRoundStart&&<button onClick={()=>moveExercise(session.currentComboIdx,ei,1)} disabled={ei===combo.exercises.length-1} style={{fontSize:9.5,color:ei===combo.exercises.length-1?C.faint:C.muted,background:"none",border:"none",cursor:ei===combo.exercises.length-1?"default":"pointer"}}>▼ move down</button>}
+          <div style={{display:"flex",gap:12,marginTop:6,marginBottom:4,flexWrap:"wrap"}}>
+            {canSwap&&<button onClick={()=>setSwapOpenFor(swapOpenFor===ex.id?null:ex.id)} style={{fontSize:11,color:C.blue,background:"none",border:"none",textDecoration:"underline"}}>⇄ swap exercise</button>}
+            {/* Arrow controls kept alongside the drag handle: dragging is unreachable by
+                keyboard and by screen-reader users, so it can't be the only way to reorder. */}
+            {!isDone&&<button onClick={()=>moveExercise(ci,ei,-1)} disabled={ei===0} aria-label={`Move ${ex.name} up`} style={{fontSize:11,color:ei===0?C.faint:C.muted,background:"none",border:"none"}}>▲ up</button>}
+            {!isDone&&<button onClick={()=>moveExercise(ci,ei,1)} disabled={ei===c.exercises.length-1} aria-label={`Move ${ex.name} down`} style={{fontSize:11,color:ei===c.exercises.length-1?C.faint:C.muted,background:"none",border:"none"}}>▼ down</button>}
           </div>
           {swapOpenFor===ex.id&&lib&&(()=>{
             const alts = findAlternatives(lib.muscleGroup, gymExerciseLibrary, ex.name);
@@ -2839,33 +3155,39 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
               {alts.length===0&&<div style={{fontSize:10.5,color:C.muted}}>No alternatives found.</div>}
               <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{alts.map(a=>{
                 const altLast=getLastPerformance(a.name,gymSessions);
-                return(<button key={a.name} onClick={()=>{updateAction(s=>{const c={...s.combos[s.currentComboIdx]};c.exercises=c.exercises.map(x=>x.id===ex.id?{...x,name:a.name,weight:altLast?String(altLast.weight):""}:x);const combos=[...s.combos];combos[s.currentComboIdx]=c;return{...s,combos};});setSwapOpenFor(null);}} style={{padding:"4px 9px",borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,color:C.text,cursor:"pointer",fontSize:10.5}}>{a.name}</button>);
+                // Writes to `ci`, the row's own combo — rows are no longer guaranteed to be in
+                // the currently-active combo now that the whole plan is on screen.
+                return(<button key={a.name} onClick={()=>{updateAction(s=>{const cc={...s.combos[ci]};cc.exercises=cc.exercises.map(x=>x.id===ex.id?{...x,name:a.name,weight:altLast?String(altLast.weight):""}:x);const combos=[...s.combos];combos[ci]=cc;return{...s,combos};});setSwapOpenFor(null);}} style={{padding:"5px 10px",borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,color:C.text,fontSize:11}}>{a.name}</button>);
               })}</div>
             </div>);
           })()}
-          {ex.sets.length>0&&<div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:isCurrent?8:0}}>{ex.sets.map((s,si)=>(<span key={si} style={{fontSize:10,fontFamily:"monospace",background:C.card,color:C.muted,padding:"2px 7px",borderRadius:5}}>Set {si+1}: {s.reps}</span>))}</div>}
+          {(ex.sets||[]).length>0&&<div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:isCurrent?8:0}}>{ex.sets.map((s,si)=>(<span key={si} style={{fontSize:11,fontFamily:"monospace",background:C.card,color:C.muted,padding:"2px 7px",borderRadius:5}}>Set {si+1}: {s.reps}</span>))}</div>}
           {isCurrent&&(<>
             <div style={{display:"flex",gap:7,alignItems:"center"}}>
-              <input type="text" inputMode="decimal" value={ex.weight||""} onChange={e=>update(s=>{const c={...s.combos[s.currentComboIdx]};c.exercises=c.exercises.map(x=>x.id===ex.id?{...x,weight:e.target.value.replace(",",".")}:x);const combos=[...s.combos];combos[s.currentComboIdx]=c;return{...s,combos};})} placeholder="kg" style={{width:64,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:7,padding:"7px 8px",color:C.lime,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
-              <span style={{fontSize:11,color:C.muted}}>kg ×</span>
-              <input id={`reps-${ex.id}`} type="text" inputMode="numeric" placeholder="reps" style={{width:64,background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"7px 8px",color:C.text,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none"}} onKeyDown={e=>{
+              <input type="text" inputMode="decimal" aria-label="Weight" value={ex.weight||""} onChange={e=>update(s=>{const cc={...s.combos[ci]};cc.exercises=cc.exercises.map(x=>x.id===ex.id?{...x,weight:e.target.value.replace(",",".")}:x);const combos=[...s.combos];combos[ci]=cc;return{...s,combos};})} placeholder="kg" style={{width:70,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:7,padding:"8px",color:C.lime,fontFamily:"monospace",fontWeight:700,outline:"none",minHeight:44}}/>
+              <span style={{fontSize:12,color:C.muted}}>kg ×</span>
+              <input id={`reps-${ex.id}`} type="text" inputMode="numeric" aria-label="Reps" placeholder="reps" style={{width:70,background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"8px",color:C.text,fontFamily:"monospace",fontWeight:700,outline:"none",minHeight:44}} onKeyDown={e=>{
                 if(e.key==="Enter"){
                   const reps=parseInt(e.target.value)||0; if(!reps)return;
                   e.target.value="";
-                  advanceExercise(session.currentComboIdx, ex.id, reps);
+                  advanceExercise(ci, ex.id, reps);
                 }
               }}/>
               <button onClick={()=>{
                 const input=document.getElementById(`reps-${ex.id}`); const reps=parseInt(input?.value)||0; if(!reps)return; if(input)input.value="";
-                advanceExercise(session.currentComboIdx, ex.id, reps);
-              }} style={{padding:"7px 14px",borderRadius:7,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Log Set</button>
+                advanceExercise(ci, ex.id, reps);
+              }} style={{padding:"0 15px",minHeight:44,borderRadius:7,background:C.lime,border:"none",color:"#000",fontWeight:700,fontSize:13}}>Log Set</button>
             </div>
-            <button onClick={()=>advanceExercise(session.currentComboIdx, ex.id, null)} style={{marginTop:7,background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:10.5,textDecoration:"underline"}}>Skip this exercise</button>
-            {suggestion&&<div style={{fontSize:10,color:C.lime,marginTop:6,lineHeight:1.4}}>📈 {suggestion}</div>}
+            <button onClick={()=>advanceExercise(ci, ex.id, null)} style={{marginTop:7,background:"none",border:"none",color:C.muted,fontSize:11,textDecoration:"underline"}}>Skip this exercise</button>
+            {suggestion&&<div style={{fontSize:11,color:C.lime,marginTop:6,lineHeight:1.4}}>📈 {suggestion}</div>}
           </>)}
         </div>);
-      })}
-      {!isLastCombo&&<button onClick={skipCombo} style={{width:"100%",padding:"8px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11,marginBottom:8}}>⏭ Skip this combo entirely</button>}
+        })}
+      </div>);
+    })}
+
+    {!isLastCombo&&<button onClick={skipCombo} style={{width:"100%",padding:"9px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,fontSize:12,marginBottom:8}}>⏭ Skip current combo entirely</button>}
+    <>
       {/* Add exercise to this combo live — only between rounds to avoid awkward partial rounds */}
       {atRoundStart&&(addExMode?(
         <div style={{background:C.bg,border:`1px dashed ${C.border}`,borderRadius:9,padding:"9px 11px",marginBottom:8}}>
@@ -2884,8 +3206,25 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       ):(
         <button onClick={()=>setAddExMode(true)} style={{width:"100%",padding:"8px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11,marginBottom:8}}>+ Add exercise to this combo</button>
       ))}
-      {atRoundStart&&<button onClick={()=>updateAction(s=>({...s,combos:[...s.combos,{id:Date.now(),exercises:[]}],currentComboIdx:s.combos.length,currentExInRound:0}))} style={{width:"100%",padding:"8px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>+ New Combo</button>}
-    </>)}
+      {atRoundStart&&<button onClick={()=>updateAction(s=>({...s,combos:[...s.combos,{id:Date.now(),exercises:[]}],currentComboIdx:s.combos.length,currentExInRound:0}))} style={{width:"100%",padding:"9px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,fontSize:12}}>+ New Combo</button>}
+    </>
+  </div>);
+}
+
+// Inline "what you actually lifted" breakdown, rendered directly inside an activity row.
+// The exercise/weight/rep detail used to live only behind a tap in the Gym Log sheet, so
+// reviewing a past week meant opening one session at a time.
+function SessionExerciseList({session, compact=false}){
+  const items = sessionExerciseSummary(session);
+  if (!items.length) return null;
+  return(<div style={{marginTop:7,display:"flex",flexDirection:"column",gap:3}}>
+    {items.map((it,i)=>(
+      <div key={i} style={{display:"flex",alignItems:"baseline",gap:8,fontSize:compact?11:12}}>
+        <span style={{flex:1,minWidth:0,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{it.name}</span>
+        {it.weight&&<span style={{fontFamily:"monospace",color:C.lime,fontWeight:700,flexShrink:0}}>{it.weight}{it.unit}</span>}
+        <span style={{fontFamily:"monospace",color:C.muted,flexShrink:0}}>{it.reps.join("/")}</span>
+      </div>
+    ))}
   </div>);
 }
 
@@ -3001,7 +3340,7 @@ function GymManualLogSheet({gymExerciseLibrary, setGymExerciseLibrary, onSave, o
 
   return(<Sheet onClose={onClose} title="Log Past Session">
     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:14}}>
-      <div><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:4}}>Date</div><input type="date" value={date} max={TODAY()} onChange={e=>setDate(e.target.value)} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"7px 8px",color:C.lime,fontSize:12,fontFamily:"monospace",outline:"none"}}/></div>
+      <div><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:4}}>Date</div><input type="date" value={date} max={TODAY()} onChange={e=>setDate(e.target.value)} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"7px 8px",color:C.lime,fontSize:12,fontFamily:"monospace",outline:"none"}}/></div>
       <Field label="Duration min" value={durationMin} onChange={setDurationMin} type="number" placeholder="60"/>
       <Field label="Kcal burned" value={kcal} onChange={setKcal} type="number" placeholder="300"/>
     </div>
@@ -3065,11 +3404,11 @@ function GymSessionDetailSheet({session, onClose, onDelete}){
   return(<Sheet onClose={onClose} title={`${WEEKDAYS[session.weekday]?.full||""} · ${new Date(session.date+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}`}>
     <div style={{display:"flex",gap:10,marginBottom:16}}>
       <div style={{flex:1,background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 12px",textAlign:"center"}}>
-        <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>Duration</div>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>Duration</div>
         <div style={{fontSize:16,fontWeight:800,fontFamily:"monospace",color:C.text}}>{Math.round((session.durationSec||0)/60)}min</div>
       </div>
       <div style={{flex:1,background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 12px",textAlign:"center"}}>
-        <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>Burned</div>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>Burned</div>
         <div style={{fontSize:16,fontWeight:800,fontFamily:"monospace",color:C.orange}}>{Math.round(session.kcalBurned||0)}kcal</div>
       </div>
     </div>
@@ -3230,13 +3569,24 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
   const finishGymSession=({durationSec,kcal,method})=>{
     const sess=gymActiveSession;
     if(!sess)return;
-    const record={id:Date.now(),date:sess.date,weekday:sess.weekday,durationSec,warmup:sess.warmup,cooldown:sess.cooldown,combos:sess.combos,kcalBurned:kcal,kcalMethod:method};
+    const sessionId=Date.now();
+    const record={id:sessionId,date:sess.date,weekday:sess.weekday,durationSec,warmup:sess.warmup,cooldown:sess.cooldown,combos:sess.combos,kcalBurned:kcal,kcalMethod:method};
     setGymSessions(prev=>[record,...(prev||[])]);
     const durMin=Math.round(durationSec/60);
-    setDayData(p=>({...p,activities:[...(p.activities||[]),{id:Date.now(),type:"gym",label:`Gym — ${WEEKDAYS[sess.weekday].full}`,kcal,durationMin:durMin,time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}]}));
+    // sessionId links the day-log activity back to the full gym record, so activity lists can
+    // show the exercise breakdown inline. Older activities predate this field and are matched
+    // by date instead (see findSessionFor).
+    setDayData(p=>({...p,activities:[...(p.activities||[]),{id:sessionId,sessionId,type:"gym",label:`Gym — ${WEEKDAYS[sess.weekday].full}`,kcal,durationMin:durMin,time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}]}));
     setGymActiveSession(null);
   };
   useEffect(()=>{if(view==="history"&&!histLoaded){store.get("fit_dates",[]).then(async ds=>{const e={};for(const d of ds){const log=await store.get(`fit_day_${d}`,null);if(log&&(log.activities||[]).length>0)e[d]=log;}setHistLogs(e);setHistDates(Object.keys(e).sort((a,b)=>b.localeCompare(a)));setHistLoaded(true);});}},[view]);
+  // Resolve the gym record behind an activity row. Sessions logged since the sessionId link
+  // was added match exactly; older ones fall back to same-day matching.
+  const findSessionFor=(act,date)=>{
+    if(act.type!=="gym")return null;
+    const all=gymSessions||[];
+    return (act.sessionId&&all.find(s=>s.id===act.sessionId))||all.find(s=>s.date===date)||null;
+  };
   const addActivity=act=>{setDayData(p=>({...p,activities:[...(p.activities||[]),act]}));setModal(false);};
   const delActivity=id=>{setDayData(p=>({...p,activities:(p.activities||[]).filter(a=>a.id!==id)}));};
   const [wInput,setWInput]=useState("");const [editWIdx,setEditWIdx]=useState(null);const [editWVal,setEditWVal]=useState("");const [wDate,setWDate]=useState(TODAY());const [showAllW,setShowAllW]=useState(false);
@@ -3342,8 +3692,32 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
     </div>);
   };
 
+  // ── Gym focus mode ──
+  // While a session is live the tab renders ONLY the session. Everything else on this tab —
+  // current weight, weight history graph, phase deltas, coach chat — is personal, and a phone
+  // propped on a bench is visible to whoever is standing behind you. It also removes the
+  // chance of fat-fingering into an unrelated panel mid-set. The bottom tab bar is hidden by
+  // App for the same reason; "Finish" and "cancel session" are the ways out.
+  if (gymActiveSession) {
+    return(<div style={{height:"100%",display:"flex",flexDirection:"column",background:C.bg}}>
+      <div style={{padding:"14px 16px 10px",display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0,borderBottom:`1px solid ${C.border}`}}>
+        <div style={{display:"flex",alignItems:"center",gap:9,minWidth:0}}>
+          <span style={{fontSize:20}}>🏋️</span>
+          <div style={{minWidth:0}}>
+            <div style={{fontSize:16,fontWeight:800,color:C.text,letterSpacing:"-0.02em",lineHeight:1.2}}>Gym Mode</div>
+            <div style={{fontSize:11,color:C.muted,marginTop:1}}>{WEEKDAYS[gymActiveSession.weekday]?.full||"Session"} · in progress</div>
+          </div>
+        </div>
+        <span style={{fontSize:11,color:C.muted,border:`1px solid ${C.border}`,borderRadius:20,padding:"4px 10px",flexShrink:0}}>🔒 Private</span>
+      </div>
+      <div data-scroll style={{flex:1,overflowY:"auto",padding:"14px 16px calc(24px + "+SAFE_BOTTOM+")"}}>
+        <GymSessionPanel session={gymActiveSession} setSession={setGymActiveSession} gymSessions={gymSessions||[]} gymSettings={gymSettings} latestWeight={latestWeightForGym} gymExerciseLibrary={gymExerciseLibrary||[]} setGymExerciseLibrary={setGymExerciseLibrary} onFinish={finishGymSession} onCancel={cancelGymSession}/>
+      </div>
+    </div>);
+  }
+
   return(<div style={{height:"100%",position:"relative"}}>
-    <div style={{height:"100%",overflowY:"auto",padding:"0 16px 90px"}}>
+    <div data-scroll style={{height:"100%",overflowY:"auto",padding:"0 16px 90px"}}>
       <div style={{padding:"18px 0 8px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
         <div style={{fontSize:26,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>Activity</div>
         <div style={{display:"flex",gap:6}}>
@@ -3352,10 +3726,9 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
         </div>
       </div>
 
-      {/* ── Gym session area ── */}
-      {gymActiveSession ? (
-        <GymSessionPanel session={gymActiveSession} setSession={setGymActiveSession} gymSessions={gymSessions||[]} gymSettings={gymSettings} latestWeight={latestWeightForGym} gymExerciseLibrary={gymExerciseLibrary||[]} setGymExerciseLibrary={setGymExerciseLibrary} onFinish={finishGymSession} onCancel={cancelGymSession}/>
-      ) : todaysCompletedSession ? (
+      {/* ── Gym session area ──
+          An active session never reaches here; it takes over the whole tab in focus mode above. */}
+      {todaysCompletedSession ? (
         <div style={{background:C.card,border:`1px solid ${C.lime}60`,borderRadius:12,padding:"12px 16px",marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
           <div><div style={{fontSize:13,fontWeight:600,color:C.lime}}>✓ Session already completed today</div><div style={{fontSize:10,color:C.muted,marginTop:2}}>{Math.round((todaysCompletedSession.durationSec||0)/60)}min · +{Math.round(todaysCompletedSession.kcalBurned||0)}kcal</div></div>
           <button onClick={()=>startGymSession(todayWeekday,todayTemplate)} style={{padding:"7px 14px",borderRadius:8,background:C.card,border:`1px solid ${C.lime}`,color:C.lime,fontWeight:700,cursor:"pointer",fontSize:12,flexShrink:0}}>+ Log another</button>
@@ -3457,17 +3830,67 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
 
           {/* Closed phase history */}
           {closedPhases.length>0&&<div>
-            <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>History</div>
+            <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>History</div>
             {closedPhases.map(p=><PhaseCard key={p.id} phase={p}/>)}
           </div>}
         </div>}
       </div>
 
       <div style={{display:"flex",gap:6,marginBottom:14}}>{[["Today","today"],["Past Activity","history"]].map(([lbl,v])=>(<button key={v} onClick={()=>setView(v)} style={{flex:1,padding:"9px 0",borderRadius:10,border:`1px solid ${view===v?C.orange:C.border}`,background:view===v?`${C.orange}20`:C.card,color:view===v?C.orange:C.muted,fontWeight:view===v?700:500,cursor:"pointer",fontSize:12}}>{lbl}</button>))}</div>
-      {view==="today"&&(<>{totalBurned>0&&<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:"14px 18px",marginBottom:14}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Total burn bonus today</div><div style={{fontSize:40,fontWeight:900,fontFamily:"monospace",color:C.orange,lineHeight:1.1,marginTop:4}}>+{Math.round(totalBurned)}</div><div style={{fontSize:12,color:C.muted,marginTop:2}}>kcal added to daily target</div></div>}<div style={{display:"flex",flexDirection:"column",gap:7}}>{activities.map(a=><div key={a.id} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"10px 14px",display:"flex",alignItems:"center",gap:10}}><span style={{fontSize:22}}>{a.type==="gym"?"🏋️":a.type==="run"?"🏃":"🚶"}</span><div style={{flex:1,minWidth:0}}><div style={{display:"flex",alignItems:"baseline",gap:8}}><span style={{fontSize:14,fontWeight:600,color:C.text}}>{a.label}</span><span style={{fontSize:10,color:C.muted,fontFamily:"monospace"}}>{a.time}</span></div><div style={{display:"flex",gap:10,marginTop:4}}><span style={{fontFamily:"monospace",fontSize:12,color:C.orange}}>{Math.round(a.kcal)} kcal</span>{a.distanceKm&&<span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{a.distanceKm}km</span>}{a.durationMin&&<span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{a.durationMin}min</span>}</div></div><button onClick={()=>delActivity(a.id)} style={{background:"none",border:"none",cursor:"pointer",color:C.faint,fontSize:18,padding:"0 2px",lineHeight:1}}>×</button></div>)}{!activities.length&&<div style={{textAlign:"center",padding:"36px 0",color:C.muted}}><div style={{fontSize:32}}>{"🏋️"}</div><div style={{fontSize:14,marginTop:8}}>No activities today.</div></div>}</div></>)}
+      {view==="today"&&(<>{totalBurned>0&&<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:"14px 18px",marginBottom:14}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Total burn bonus today</div><div style={{fontSize:40,fontWeight:900,fontFamily:"monospace",color:C.orange,lineHeight:1.1,marginTop:4}}>+{Math.round(totalBurned)}</div><div style={{fontSize:12,color:C.muted,marginTop:2}}>kcal added to daily target</div></div>}<div style={{display:"flex",flexDirection:"column",gap:7}}>
+        {activities.map(a=>{
+          const sess=findSessionFor(a,TODAY());
+          return(<div key={a.id} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"10px 14px",display:"flex",alignItems:"flex-start",gap:10}}>
+            <span style={{fontSize:22,lineHeight:1.2}}>{a.type==="gym"?"🏋️":a.type==="run"?"🏃":"🚶"}</span>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{display:"flex",alignItems:"baseline",gap:8}}>
+                <span style={{fontSize:14,fontWeight:600,color:C.text}}>{a.label}</span>
+                <span style={{fontSize:11,color:C.muted,fontFamily:"monospace"}}>{a.time}</span>
+              </div>
+              <div style={{display:"flex",gap:10,marginTop:4}}>
+                <span style={{fontFamily:"monospace",fontSize:12,color:C.orange}}>{Math.round(a.kcal)} kcal</span>
+                {a.distanceKm&&<span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{a.distanceKm}km</span>}
+                {a.durationMin&&<span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{a.durationMin}min</span>}
+              </div>
+              <SessionExerciseList session={sess}/>
+            </div>
+            <button onClick={()=>delActivity(a.id)} aria-label={`Delete ${a.label}`} style={{background:"none",border:"none",color:C.faint,fontSize:18,padding:"0 2px",lineHeight:1}}>×</button>
+          </div>);
+        })}
+        {!activities.length&&<div style={{textAlign:"center",padding:"36px 0",color:C.muted}}><div style={{fontSize:32}}>{"🏋️"}</div><div style={{fontSize:14,marginTop:8}}>No activities today.</div></div>}
+      </div></>)}
       {view==="history"&&(<>
         <div style={{marginBottom:10,display:"flex",justifyContent:"flex-end"}}><span style={{fontSize:11,color:C.muted}}>To add activity to a past day, expand it in the History tab.</span></div>
-        {!histLoaded&&<div style={{textAlign:"center",padding:"40px 0",color:C.muted}}>Loading…</div>}{histLoaded&&histDates.length===0&&<div style={{textAlign:"center",padding:"40px 0",color:C.muted}}>No past activities found.</div>}{histDates.map(date=>{const log=histLogs[date];const acts=log.activities||[];const totalK=acts.reduce((s,a)=>s+a.kcal,0);return(<div key={date} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"12px 14px",marginBottom:7}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}><span style={{fontSize:13,fontWeight:600,color:C.text}}>{new Date(date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span><span style={{fontFamily:"monospace",fontSize:13,fontWeight:700,color:C.orange}}>+{Math.round(totalK)} kcal</span></div><div style={{display:"flex",flexDirection:"column",gap:5}}>{acts.map(a=><div key={a.id} style={{display:"flex",alignItems:"center",gap:8,background:C.bg,borderRadius:8,padding:"8px 10px"}}><span style={{fontSize:16}}>{a.type==="gym"?"🏋️":a.type==="run"?"🏃":"🚶"}</span><div style={{flex:1}}><div style={{fontSize:13,color:C.text}}>{a.label}</div><div style={{display:"flex",gap:8,marginTop:2}}>{a.distanceKm&&<span style={{fontFamily:"monospace",fontSize:10,color:C.muted}}>{a.distanceKm}km</span>}{a.durationMin&&<span style={{fontFamily:"monospace",fontSize:10,color:C.muted}}>{a.durationMin}min</span>}</div></div><span style={{fontFamily:"monospace",fontSize:12,color:C.orange}}>{Math.round(a.kcal)}kcal</span></div>)}</div></div>);})}</>)}
+        {!histLoaded&&<div style={{textAlign:"center",padding:"40px 0",color:C.muted}}>Loading…</div>}{histLoaded&&histDates.length===0&&<div style={{textAlign:"center",padding:"40px 0",color:C.muted}}>No past activities found.</div>}{histDates.map(date=>{
+          const log=histLogs[date];const acts=log.activities||[];const totalK=acts.reduce((s,a)=>s+a.kcal,0);
+          return(<div key={date} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"12px 14px",marginBottom:7}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <span style={{fontSize:13,fontWeight:600,color:C.text}}>{new Date(date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span>
+              <span style={{fontFamily:"monospace",fontSize:13,fontWeight:700,color:C.orange}}>+{Math.round(totalK)} kcal</span>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}>{acts.map(a=>{
+              const sess=findSessionFor(a,date);
+              const items=sessionExerciseSummary(sess);
+              return(<div key={a.id} style={{background:C.bg,borderRadius:8,padding:"8px 10px"}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <span style={{fontSize:16}}>{a.type==="gym"?"🏋️":a.type==="run"?"🏃":"🚶"}</span>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:13,color:C.text}}>{a.label}</div>
+                    <div style={{display:"flex",gap:8,marginTop:2}}>
+                      {a.distanceKm&&<span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{a.distanceKm}km</span>}
+                      {a.durationMin&&<span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{a.durationMin}min</span>}
+                      {items.length>0&&<span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{items.length} exercise{items.length!==1?"s":""}</span>}
+                    </div>
+                  </div>
+                  <span style={{fontFamily:"monospace",fontSize:12,color:C.orange,flexShrink:0}}>{Math.round(a.kcal)}kcal</span>
+                </div>
+                {/* Exercises + weights inline, no tap required — this used to live only inside
+                    the Gym Log sheet, one session at a time. */}
+                {items.length>0&&<div style={{marginTop:7,paddingTop:7,borderTop:`1px solid ${C.border}`}}><SessionExerciseList session={sess} compact/></div>}
+              </div>);
+            })}</div>
+          </div>);
+        })}</>)}
     </div>
     {view==="today"&&<button onClick={()=>setModal(true)} style={{position:"absolute",bottom:16,right:16,width:54,height:54,borderRadius:"50%",background:C.orange,border:"none",cursor:"pointer",fontSize:28,color:"#000",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 0 20px ${C.orange}55`,zIndex:10}}>+</button>}
     {modal&&<AddActSheet onAdd={addActivity} onClose={()=>setModal(false)} apiKey={profile.apiKey}/>}
@@ -3557,11 +3980,11 @@ function RecipeEditSheet({recipe, products, profile, onSave, onClose}){
 
     <Field label="Recipe name" value={name} onChange={setName} placeholder="e.g. Protein Pancakes"/>
     <div style={{marginTop:10,marginBottom:12}}>
-      <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Category</div>
+      <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Category</div>
       <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{RECIPE_CATEGORIES.map(c=>(<button key={c.id} onClick={()=>setCategory(c.id)} style={{padding:"7px 12px",borderRadius:10,border:`1px solid ${category===c.id?C.lime:C.border}`,background:category===c.id?`${C.lime}18`:C.bg,color:category===c.id?C.lime:C.muted,cursor:"pointer",fontSize:12,fontWeight:category===c.id?700:400}}>{c.emoji} {c.label}</button>))}</div>
     </div>
     <div style={{marginBottom:14}}>
-      <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Photo</div>
+      <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Photo</div>
       {photo ? (<>
         <div style={{position:"relative",marginBottom:8,width:"100%",height:160,borderRadius:10,overflow:"hidden",background:C.bg}}>
           <img src={photo} style={recipePhotoStyle(photoPos,photoZoom)}/>
@@ -3584,7 +4007,7 @@ function RecipeEditSheet({recipe, products, profile, onSave, onClose}){
       )}
     </div>
     <div style={{marginBottom:14}}>
-      <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Ingredients</div>
+      <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Ingredients</div>
       {ingredients.map(ing=>(<div key={ing.id} style={{display:"flex",alignItems:"center",gap:7,background:C.bg,borderRadius:7,padding:"7px 10px",marginBottom:5}}>
         <span style={{flex:1,fontSize:12,color:C.text}}>{ing.text}</span>
         <button onClick={()=>removeIngredient(ing.id)} style={{background:"none",border:"none",color:C.faint,fontSize:15,cursor:"pointer"}}>×</button>
@@ -3595,7 +4018,7 @@ function RecipeEditSheet({recipe, products, profile, onSave, onClose}){
       </div>
     </div>
     <div style={{marginBottom:16}}>
-      <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Instructions</div>
+      <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Instructions</div>
       {instructions.map((step,i)=>(<div key={step.id} style={{background:C.bg,borderRadius:7,padding:"8px 10px",marginBottom:5}}>
         <div style={{display:"flex",alignItems:"center",gap:7}}>
           <span style={{fontSize:11,color:C.muted,flexShrink:0}}>{i+1}.</span>
@@ -3761,11 +4184,11 @@ function RecipeSuggestSheet({products, profile, onSave, onClose}){
       <div style={{fontSize:17,fontWeight:700,color:C.text,marginBottom:6}}>{result.name}</div>
       <div style={{fontSize:12,color:C.muted,marginBottom:14}}>{cat.emoji} {cat.label}</div>
       <div style={{marginBottom:14}}>
-        <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Ingredients</div>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Ingredients</div>
         {result.ingredients.map(ing=>(<div key={ing.id} style={{fontSize:13,color:C.text,padding:"6px 0",borderBottom:`1px solid ${C.border}`}}>• {ing.text}</div>))}
       </div>
       <div style={{marginBottom:16}}>
-        <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Instructions</div>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Instructions</div>
         {result.instructions.map((s,i)=>(<div key={s.id} style={{fontSize:13,color:C.text,padding:"6px 0",borderBottom:`1px solid ${C.border}`}}>{i+1}. {s.text}{s.timerMin?` (⏱ ${s.timerMin}min)`:""}</div>))}
       </div>
       <div style={{display:"flex",gap:8}}>
@@ -3784,7 +4207,7 @@ function RecipeSuggestSheet({products, profile, onSave, onClose}){
       <div><div style={{fontSize:12,fontWeight:600,color:C.text}}>Only use my product labels</div><div style={{fontSize:10,color:C.muted,marginTop:1}}>{(products||[]).length} products in your pantry — otherwise the AI can suggest anything</div></div>
     </label>
 
-    <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Nutritional focus</div>
+    <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Nutritional focus</div>
     <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:16}}>{FOCUS_OPTIONS.map(f=>(
       <button key={f.id} onClick={()=>setFocus(f.id)} style={{padding:"9px 12px",borderRadius:9,border:`1px solid ${focus===f.id?C.lime:C.border}`,background:focus===f.id?`${C.lime}12`:C.bg,cursor:"pointer",textAlign:"left",fontSize:12,color:focus===f.id?C.lime:C.text,fontWeight:focus===f.id?700:400}}>{f.emoji} {f.label}</button>
     ))}</div>
@@ -3864,12 +4287,49 @@ function RecipesSection({recipes, setRecipes, products, profile}){
   </div>);
 }
 
+// Blank product form. Previously this literal was written out at five separate reset sites
+// and had already drifted (one of them still set a legacy `supermarket:""` string field),
+// so a new form key had to be remembered in five places or it would silently go undefined.
+const EMPTY_PFORM = {name:"",kcal:"",p:"",c:"",f:"",servingG:"",packSizeG:"",alwaysFullPack:false,categories:[],supermarkets:[],subtitle:""};
+
+// Form → stored product record.
+// `packageG` is written alongside `servingG` purely for backward compatibility: every existing
+// read site in the app resolves a serving as `p.servingG || p.packageG`, and older records only
+// have the latter. New code should read `servingG` (portion) and `packSizeG` (whole pack) —
+// those are two genuinely different quantities that the old single field conflated.
+const buildProductFromForm = f => {
+  const alwaysFullPack = !!f.alwaysFullPack;
+  const packSizeG = parseFloat(f.packSizeG)||null;
+  // When the product is always eaten whole, the serving IS the pack — storing a stale
+  // half-portion here would make the log-time prefill contradict the toggle.
+  const servingG = alwaysFullPack ? packSizeG : (parseFloat(f.servingG)||null);
+  return {
+    name:f.name.trim(),
+    kcal:parseFloat(f.kcal)||0, p:parseFloat(f.p)||0, c:parseFloat(f.c)||0, f:parseFloat(f.f)||0,
+    servingG, packSizeG, alwaysFullPack,
+    packageG:servingG, // legacy alias — see note above
+    categories:f.categories||[], supermarkets:f.supermarkets||[],
+    subtitle:(f.subtitle||"").trim()||null,
+  };
+};
+
+// How many grams to pre-fill when logging this product.
+// A product marked "always eaten in full" is portioned by the pack, so the pack size wins;
+// otherwise fall back to the stated serving, then the legacy `packageG` field (which, despite
+// its name, has always held the *serving* size in older records), then 100g.
+const defaultGramsFor = prod => {
+  if(!prod) return "100";
+  if(prod.alwaysFullPack && prod.packSizeG) return String(prod.packSizeG);
+  const serving = prod.servingG || prod.packageG;
+  return serving ? String(serving) : "100";
+};
+
 function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,weightPhases,recipes,setRecipes}){
   const [modal,setModal]=useState(false);const [editPrep,setEditPrep]=useState(null);const [showProd,setShowProd]=useState(false);
   const [search,setSearch]=useState("");const [showAdd,setShowAdd]=useState(false);const [editPIdx,setEditPIdx]=useState(null);
   const formRef=useRef(null); // ref on the add/edit form div — scrolled to on edit
   const savedScrollRef=useRef(0); // saves scroll position before opening edit
-  const [pForm,setPForm]=useState({name:"",kcal:"",p:"",c:"",f:"",servingG:"",categories:[],supermarkets:[],subtitle:""});const [scanImgs,setScanImgs]=useState([]);const [scanning,setScanning]=useState(false);const [scanErr,setScanErr]=useState(null);
+  const [pForm,setPForm]=useState(EMPTY_PFORM);const [scanImgs,setScanImgs]=useState([]);const [scanning,setScanning]=useState(false);const [scanErr,setScanErr]=useState(null);
   const [subtitleLoading,setSubtitleLoading]=useState(false);
   const [marketInput,setMarketInput]=useState(""); // text field for typing a new supermarket name
   const [saveToast,setSaveToast]=useState(null);
@@ -3879,7 +4339,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
   const pff=k=>v=>setPForm(p=>({...p,[k]:v}));
   const active=mealPreps.filter(p=>p.remaining>0);const done=mealPreps.filter(p=>p.remaining===0);
   const [showDone,setShowDone]=useState(false);
-  const clearForm=()=>{setPForm({name:"",kcal:"",p:"",c:"",f:"",servingG:"",categories:[],supermarkets:[],subtitle:""});setScanImgs([]);setMarketInput("");};
+  const clearForm=()=>{setPForm(EMPTY_PFORM);setScanImgs([]);setMarketInput("");};
   const toggleCat=id=>setPForm(p=>({...p,categories:(p.categories||[]).includes(id)?p.categories.filter(c=>c!==id):[...(p.categories||[]),id]}));
   const toggleMarket=m=>setPForm(p=>({...p,supermarkets:(p.supermarkets||[]).includes(m)?p.supermarkets.filter(x=>x!==m):[...(p.supermarkets||[]),m]}));
   const addTypedMarket=()=>{const m=marketInput.trim();if(!m)return;setPForm(p=>(p.supermarkets||[]).some(x=>x.toLowerCase()===m.toLowerCase())?p:{...p,supermarkets:[...(p.supermarkets||[]),m]});setMarketInput("");};
@@ -3890,7 +4350,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
     setSubtitleLoading(false);
   };
   const addProduct=()=>{
-    const np={name:pForm.name.trim(),kcal:parseFloat(pForm.kcal)||0,p:parseFloat(pForm.p)||0,c:parseFloat(pForm.c)||0,f:parseFloat(pForm.f)||0,packageG:parseFloat(pForm.servingG)||null,categories:pForm.categories||[],supermarkets:pForm.supermarkets||[],subtitle:pForm.subtitle.trim()||null};
+    const np=buildProductFromForm(pForm);
     if(!np.name)return;
     const dupIdx=products.findIndex(x=>x.name.toLowerCase()===np.name.toLowerCase());
     if(dupIdx>=0){
@@ -3907,13 +4367,17 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
     const p=products[i];
     // Backward-compat: older products stored a single `supermarket` string instead of an array.
     const existingMarkets=p.supermarkets||(p.supermarket?[p.supermarket]:[]);
-    setPForm({name:p.name,kcal:String(p.kcal),p:String(p.p),c:String(p.c),f:String(p.f),servingG:(p.servingG||p.packageG)?String(p.servingG||p.packageG):"",categories:p.categories||[],supermarkets:existingMarkets,subtitle:p.subtitle||""});
+    setPForm({...EMPTY_PFORM,name:p.name,kcal:String(p.kcal),p:String(p.p),c:String(p.c),f:String(p.f),
+      servingG:(p.servingG||p.packageG)?String(p.servingG||p.packageG):"",
+      packSizeG:p.packSizeG?String(p.packSizeG):"",
+      alwaysFullPack:!!p.alwaysFullPack,
+      categories:p.categories||[],supermarkets:existingMarkets,subtitle:p.subtitle||""});
     setEditPIdx(i);setShowAdd(false);setSaveToast(null);setMarketInput("");
     // Scroll to form after it renders
     setTimeout(()=>formRef.current?.scrollIntoView({behavior:"smooth",block:"start"}),60);
   };
   const saveEditP=()=>{
-    const np={name:pForm.name.trim(),kcal:parseFloat(pForm.kcal)||0,p:parseFloat(pForm.p)||0,c:parseFloat(pForm.c)||0,f:parseFloat(pForm.f)||0,packageG:parseFloat(pForm.servingG)||null,categories:pForm.categories||[],supermarkets:pForm.supermarkets||[],subtitle:pForm.subtitle.trim()||null};
+    const np=buildProductFromForm(pForm);
     if(!np.name)return;
     setProducts(prev=>prev.map((x,i)=>i===editPIdx?np:x));
     setSaveToast({type:"updated",name:np.name});
@@ -3941,9 +4405,19 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
     const t=setTimeout(()=>setSaveToast(null),4000);
     return ()=>clearTimeout(t);
   },[saveToast]);
-  const scanLabelFn=async()=>{setScanning(true);setScanErr(null);try{const res=await aLabel(scanImgs,profile.apiKey);if(res._unreadable){setPForm(f=>({...f,name:res.name||f.name}));setScanErr("Label was not clear enough to read — product name detected: \""+res.name+"\". Please enter macros manually.");}else{const name=res.name||"";setPForm(f=>({...f,name,kcal:String(Math.round(res.kcal)||""),p:String(res.p||""),c:String(res.c||""),f:String(res.f||""),packageG:res.packageG?String(res.packageG):f.packageG,subtitle:res.subtitle||f.subtitle}));// Check for duplicate immediately so user sees it before filling the form
+  const scanLabelFn=async()=>{setScanning(true);setScanErr(null);try{const res=await aLabel(scanImgs,profile.apiKey);if(res._unreadable){setPForm(f=>({...f,name:res.name||f.name}));setScanErr("Label was not clear enough to read — product name detected: \""+res.name+"\". Please enter macros manually.");}else{const name=res.name||"";
+      // The scanned sizes used to be written to `f.packageG`, a key the product form does not
+      // have — so a scanned size silently vanished and the size fields stayed blank. They now
+      // land on the real form keys.
+      const scannedPack=res.packSizeG?String(res.packSizeG):"";
+      const scannedServing=res.servingG?String(res.servingG):"";
+      setPForm(f=>({...f,name,kcal:String(Math.round(res.kcal)||""),p:String(res.p||""),c:String(res.c||""),f:String(res.f||""),
+        packSizeG:scannedPack||f.packSizeG,
+        servingG:scannedServing||f.servingG,
+        subtitle:res.subtitle||f.subtitle}));
+      // Check for duplicate immediately so user sees it before filling the form
       const dupIdx=products.findIndex(x=>x.name.trim().toLowerCase()===name.trim().toLowerCase());
-      if(dupIdx>=0){const np={name:name.trim(),kcal:Math.round(res.kcal)||0,p:res.p||0,c:res.c||0,f:res.f||0,servingG:res.packageG||null,packageG:res.packageG||null,subtitle:res.subtitle||null};setSaveToast({type:"duplicate",name:name,dupIdx,np});}
+      if(dupIdx>=0){const np=buildProductFromForm({name,kcal:res.kcal,p:res.p,c:res.c,f:res.f,servingG:scannedServing,packSizeG:scannedPack,alwaysFullPack:false,categories:[],supermarkets:[],subtitle:res.subtitle||""});setSaveToast({type:"duplicate",name:name,dupIdx,np});}
       // If the label scan didn't produce a subtitle, generate one in the background so the
       // field isn't left empty — silently skip on failure, it's a nice-to-have not a blocker.
       if(!res.subtitle&&name){aSubtitle(name,profile.apiKey).then(s=>{if(s)setPForm(f=>(f.name===name&&!f.subtitle)?{...f,subtitle:s}:f);}).catch(()=>{});}
@@ -4005,12 +4479,12 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
       <div style={{marginBottom:16}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Meal Preps</div>{mealPreps.length===0&&<div style={{textAlign:"center",padding:"16px 0",color:C.muted,fontSize:13}}>No meal preps yet. Tap + to create.</div>}{active.length>0&&<div style={{marginBottom:8}}><div style={{display:"flex",flexDirection:"column",gap:8}}>{active.map(p=><PrepCard key={p.id} prep={p}/>)}</div></div>}{done.length>0&&<div><button onClick={()=>setShowDone(p=>!p)} style={{width:"100%",padding:"8px 12px",borderRadius:10,background:C.card,border:`1px solid ${showDone?C.border:C.dim}`,color:C.muted,fontWeight:600,cursor:"pointer",fontSize:11,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:showDone?8:0,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}><span>Finished ({done.length})</span><span>{showDone?"▲":"▼"}</span></button>{showDone&&<div style={{display:"flex",flexDirection:"column",gap:8}}>{done.map(p=><PrepCard key={p.id} prep={p}/>)}</div>}</div>}</div>
       <RecipesSection recipes={recipes} setRecipes={setRecipes} products={products} profile={profile}/>
       <button onClick={()=>setShowProd(p=>!p)} style={{width:"100%",padding:"12px 16px",borderRadius:12,background:C.card,border:`1px solid ${showProd?C.lime:C.border}`,color:showProd?C.lime:C.text,fontWeight:600,cursor:"pointer",fontSize:13,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:showProd?10:0}}><span>Product Labels ({products.length})</span><span style={{fontSize:11}}>{showProd?"▲":"▼"}</span></button>
-      {showProd&&<div><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}><span style={{fontSize:11,color:C.muted}}>per 100g</span><button onClick={()=>{setShowAdd(p=>!p);setEditPIdx(null);setPForm({name:"",kcal:"",p:"",c:"",f:"",servingG:"",categories:[],supermarket:""});setScanImgs([]);}} style={{padding:"7px 14px",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>+ Add</button></div><input placeholder="Search products…" value={search} onChange={e=>setSearch(e.target.value)} style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"9px 14px",color:C.text,fontSize:13,outline:"none",marginBottom:8}}/>
+      {showProd&&<div><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}><span style={{fontSize:11,color:C.muted}}>per 100g</span><button onClick={()=>{setShowAdd(p=>!p);setEditPIdx(null);setPForm(EMPTY_PFORM);setScanImgs([]);}} style={{padding:"7px 14px",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>+ Add</button></div><input placeholder="Search products…" value={search} onChange={e=>setSearch(e.target.value)} style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"9px 14px",color:C.text,fontSize:13,outline:"none",marginBottom:8}}/>
       {saveToast&&(saveToast.type==="added"||saveToast.type==="updated")&&<div style={{background:`${C.lime}15`,border:`1px solid ${C.lime}66`,borderRadius:10,padding:"9px 13px",marginBottom:10,display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}><div style={{fontSize:12,color:C.lime,fontWeight:600}}>✓ {saveToast.type==="added"?"Added":"Updated"}: <span style={{fontFamily:"monospace"}}>{saveToast.name}</span></div><button onClick={()=>setSaveToast(null)} style={{background:"none",border:"none",color:C.lime,fontSize:16,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button></div>}
       {saveToast&&saveToast.type==="duplicate"&&<div style={{background:`${C.yellow}12`,border:`1px solid ${C.yellow}66`,borderRadius:10,padding:"10px 13px",marginBottom:10}}><div style={{fontSize:12,color:C.yellow,fontWeight:600,marginBottom:7,lineHeight:1.4}}>⚠ A product named <span style={{fontFamily:"monospace"}}>"{saveToast.name}"</span> already exists.</div><div style={{display:"flex",gap:6}}><button onClick={()=>resolveDup("update")} style={{flex:1,padding:"7px 0",borderRadius:7,background:C.yellow,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>Update existing</button><button onClick={()=>resolveDup("new")} style={{flex:1,padding:"7px 0",borderRadius:7,background:C.bg,border:`1px solid ${C.yellow}66`,color:C.yellow,fontWeight:600,cursor:"pointer",fontSize:11}}>Save as new (2)</button><button onClick={()=>setSaveToast(null)} style={{padding:"7px 10px",borderRadius:7,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button></div></div>}
       {(showAdd||editPIdx!==null)&&<div ref={formRef} style={{background:C.card,border:`1px solid ${editPIdx!==null?C.lime:C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:10}}>
         <div style={{fontSize:11,color:editPIdx!==null?C.lime:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>{editPIdx!==null?"Editing product":"New product"}</div>
-        {showAdd&&editPIdx===null&&<div style={{marginBottom:10}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Scan Nutrition Label</div><ImgZone imgs={scanImgs} setImgs={setScanImgs} compact/>{scanImgs.length>0&&<button onClick={scanLabelFn} disabled={scanning} style={{width:"100%",padding:"9px 0",borderRadius:8,background:scanning?C.faint:C.blue,color:"#000",fontWeight:700,border:"none",cursor:scanning?"default":"pointer",fontSize:13,marginTop:8}}>{scanning?"Reading label…":"Read Label"}</button>}{scanErr&&<div style={{fontSize:11,color:"#ff8080",marginTop:6,wordBreak:"break-word"}}>{scanErr.includes("unreadable")?"Label unreadable — please enter values manually below":scanErr}</div>}</div>}
+        {showAdd&&editPIdx===null&&<div style={{marginBottom:10}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Scan Nutrition Label</div><ImgZone imgs={scanImgs} setImgs={setScanImgs} compact/>{scanImgs.length>0&&<button onClick={scanLabelFn} disabled={scanning} style={{width:"100%",padding:"9px 0",borderRadius:8,background:scanning?C.faint:C.blue,color:"#000",fontWeight:700,border:"none",cursor:scanning?"default":"pointer",fontSize:13,marginTop:8}}>{scanning?"Reading label…":"Read Label"}</button>}{scanErr&&<div style={{fontSize:11,color:"#ff8080",marginTop:6,wordBreak:"break-word"}}>{scanErr.includes("unreadable")?"Label unreadable — please enter values manually below":scanErr}</div>}</div>}
         <div style={{display:"flex",flexDirection:"column",gap:8}}>
           <Field label="Product name" value={pForm.name} onChange={pff("name")} placeholder="e.g. Lidl Greek Yogurt"/>
           <div>
@@ -4021,13 +4495,55 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
             {pForm.subtitle&&<div style={{fontSize:10,color:C.muted,marginTop:4}}>Shown under the name and searchable — e.g. searching "beef" will find this.</div>}
           </div>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}><Field label="Kcal/100g" value={pForm.kcal} onChange={pff("kcal")} type="number" placeholder="0"/><Field label="Protein g" value={pForm.p} onChange={pff("p")} type="number" placeholder="0"/><Field label="Carbs g" value={pForm.c} onChange={pff("c")} type="number" placeholder="0"/><Field label="Fat g" value={pForm.f} onChange={pff("f")} type="number" placeholder="0"/></div>
-          <div style={{marginTop:4}}><Field label="Usual serving size g (optional — pre-fills when logging)" value={pForm.servingG} onChange={pff("servingG")} type="number" placeholder="e.g. 55 for a protein bar"/>{pForm.servingG&&<div style={{fontSize:10,color:C.lime,marginTop:4,fontStyle:"italic"}}>🍽 Will default to {pForm.servingG}g when you log this item.</div>}</div>
+          {/* ── Portion sizes ──
+              Pack size and serving size are two different numbers and the app used to have
+              only one field for both. For anything eaten whole — a protein bar, a yoghurt pot,
+              a single-serve drink — a serving size is meaningless busywork, so the toggle
+              collapses it away and the pack size becomes the logging default. */}
+          <div style={{marginTop:4,background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:"11px 13px"}}>
+            <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Portion sizes (optional)</div>
+            <Field label="Whole pack size g" value={pForm.packSizeG} onChange={pff("packSizeG")} type="number" placeholder="e.g. 330 for a whole tub"/>
+
+            <button type="button" onClick={()=>setPForm(p=>({...p,alwaysFullPack:!p.alwaysFullPack}))}
+              aria-pressed={!!pForm.alwaysFullPack}
+              style={{width:"100%",marginTop:10,padding:"10px 12px",minHeight:44,borderRadius:9,textAlign:"left",display:"flex",alignItems:"center",gap:10,
+                border:`1px solid ${pForm.alwaysFullPack?C.lime:C.border}`,background:pForm.alwaysFullPack?`${C.lime}14`:C.card}}>
+              {/* Checkbox drawn rather than native: a native checkbox can't be styled to match
+                  the dark theme consistently across iOS and Android. */}
+              <span aria-hidden="true" style={{width:20,height:20,borderRadius:6,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",
+                border:`1.5px solid ${pForm.alwaysFullPack?C.lime:C.muted}`,background:pForm.alwaysFullPack?C.lime:"transparent",color:"#000",fontSize:13,fontWeight:900}}>
+                {pForm.alwaysFullPack?"✓":""}
+              </span>
+              <span style={{flex:1,minWidth:0}}>
+                <span style={{display:"block",fontSize:13,fontWeight:600,color:pForm.alwaysFullPack?C.lime:C.text}}>I always eat the whole pack</span>
+                <span style={{display:"block",fontSize:11,color:C.muted,marginTop:2,lineHeight:1.4}}>Logging this jumps straight to the full pack — no serving size needed.</span>
+              </span>
+            </button>
+
+            {/* Serving size is hidden, not disabled, when the pack is always eaten whole —
+                a greyed-out field still reads as something you were supposed to fill in. */}
+            {!pForm.alwaysFullPack&&<div style={{marginTop:10}}>
+              <Field label="Usual serving size g" value={pForm.servingG} onChange={pff("servingG")} type="number" placeholder="e.g. 55 for one bar"/>
+            </div>}
+
+            {(()=>{
+              const pack=parseFloat(pForm.packSizeG)||0, serv=parseFloat(pForm.servingG)||0;
+              if(pForm.alwaysFullPack){
+                return pack
+                  ? <div style={{fontSize:11,color:C.lime,marginTop:8,fontStyle:"italic"}}>🍽 Logging defaults to the full {pack}g pack{parseFloat(pForm.kcal)?` · ${Math.round(parseFloat(pForm.kcal)*pack/100)} kcal`:""}.</div>
+                  : <div style={{fontSize:11,color:C.yellow,marginTop:8}}>⚠ Enter the pack size above, otherwise there's nothing to default to.</div>;
+              }
+              if(serv&&pack&&serv>pack) return <div style={{fontSize:11,color:C.yellow,marginTop:8}}>⚠ Serving ({serv}g) is larger than the whole pack ({pack}g) — one of these is probably a typo.</div>;
+              if(serv) return <div style={{fontSize:11,color:C.lime,marginTop:8,fontStyle:"italic"}}>🍽 Logging defaults to {serv}g{pack?` · ${(pack/serv).toFixed(1)} servings per pack`:""}.</div>;
+              return null;
+            })()}
+          </div>
           <div style={{marginTop:4}}>
-            <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Categories (tap to toggle)</div>
+            <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Categories (tap to toggle)</div>
             <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{PRODUCT_CATEGORIES.map(cat=>{const on=(pForm.categories||[]).includes(cat.id);return(<button key={cat.id} type="button" onClick={()=>toggleCat(cat.id)} style={{padding:"5px 9px",borderRadius:16,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:10.5,fontWeight:on?600:400}}>{cat.emoji} {cat.label}</button>);})}</div>
           </div>
           <div style={{marginTop:4}}>
-            <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Supermarkets (optional — pick any that apply)</div>
+            <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Supermarkets (optional — pick any that apply)</div>
             {(pForm.supermarkets||[]).length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:6}}>{pForm.supermarkets.map(m=>(<span key={m} style={{display:"flex",alignItems:"center",gap:5,padding:"4px 8px",borderRadius:12,background:`${C.blue}18`,border:`1px solid ${C.blue}60`,color:C.blue,fontSize:11,fontWeight:600}}>🏪 {m}<button type="button" onClick={()=>toggleMarket(m)} style={{background:"none",border:"none",color:C.blue,cursor:"pointer",fontSize:13,padding:0,lineHeight:1}}>×</button></span>))}</div>}
             <div style={{display:"flex",gap:6}}>
               <input value={marketInput} onChange={e=>setMarketInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addTypedMarket();}}} placeholder="Type a supermarket name…" style={{flex:1,boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"7px 10px",color:C.text,fontSize:12,outline:"none"}}/>
@@ -4037,7 +4553,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
           </div>
           {(()=>{const k=parseFloat(pForm.kcal)||0,p=parseFloat(pForm.p)||0,c=parseFloat(pForm.c)||0,fv=parseFloat(pForm.f)||0;if(k<10)return null;const calc=Math.round(p*4+c*4+fv*9);const diff=Math.abs(k-calc);const pct=k>0?diff/k:0;if(pct<=0.25)return null;return(<div style={{background:"#1a1400",border:`1px solid ${C.yellow}40`,borderRadius:8,padding:"7px 11px",fontSize:11,color:C.yellow,lineHeight:1.4}}>⚠ Numbers don't add up: macros suggest <span style={{fontFamily:"monospace",fontWeight:700}}>~{calc} kcal</span> but you entered <span style={{fontFamily:"monospace",fontWeight:700}}>{k}</span> ({Math.round(pct*100)}% off). Double-check the label — likely one row was misread.</div>);})()}
           <div style={{display:"flex",gap:8}}>
-            <button onClick={()=>{setShowAdd(false);setEditPIdx(null);setPForm({name:"",kcal:"",p:"",c:"",f:"",servingG:"",categories:[],supermarkets:[],subtitle:""});setScanImgs([]);setMarketInput("");setTimeout(()=>window.scrollTo({top:savedScrollRef.current,behavior:"smooth"}),60);}} style={{flex:1,padding:"9px 0",borderRadius:8,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:13}}>Cancel</button>
+            <button onClick={()=>{setShowAdd(false);setEditPIdx(null);setPForm(EMPTY_PFORM);setScanImgs([]);setMarketInput("");setTimeout(()=>window.scrollTo({top:savedScrollRef.current,behavior:"smooth"}),60);}} style={{flex:1,padding:"9px 0",borderRadius:8,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:13}}>Cancel</button>
             <button onClick={editPIdx!==null?saveEditP:addProduct} style={{flex:2,padding:"9px 0",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:13}}>{editPIdx!==null?"Save":"Save Product"}</button>
           </div>
         </div>
@@ -4047,7 +4563,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
         {PRODUCT_CATEGORIES.filter(cat=>products.some(p=>(p.categories||[]).includes(cat.id))).map(cat=>{const on=catFilter===cat.id;return(<button key={cat.id} onClick={()=>setCatFilter(on?null:cat.id)} style={{padding:"4px 9px",borderRadius:14,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:10,fontWeight:on?600:400}}>{cat.emoji} {cat.label}</button>);})}
         {uncategorizedCount>0&&<button onClick={()=>setCatFilter(catFilter==="uncategorized"?null:"uncategorized")} style={{padding:"4px 9px",borderRadius:14,border:`1px solid ${catFilter==="uncategorized"?C.yellow:C.border}`,background:catFilter==="uncategorized"?`${C.yellow}18`:C.bg,color:catFilter==="uncategorized"?C.yellow:C.muted,cursor:"pointer",fontSize:10,fontWeight:catFilter==="uncategorized"?600:400}}>⚠ No category ({uncategorizedCount})</button>}
       </div>
-      {supermarkets.length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:8,alignItems:"center"}}><span style={{fontSize:9,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>🏪</span>{supermarkets.map(m=>{const on=martFilter===m;return(<button key={m} onClick={()=>setMartFilter(on?null:m)} style={{padding:"4px 9px",borderRadius:14,border:`1px solid ${on?C.blue:C.border}`,background:on?`${C.blue}18`:C.bg,color:on?C.blue:C.muted,cursor:"pointer",fontSize:10,fontWeight:on?600:400}}>{m}</button>);})}</div>}
+      {supermarkets.length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:8,alignItems:"center"}}><span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase"}}>🏪</span>{supermarkets.map(m=>{const on=martFilter===m;return(<button key={m} onClick={()=>setMartFilter(on?null:m)} style={{padding:"4px 9px",borderRadius:14,border:`1px solid ${on?C.blue:C.border}`,background:on?`${C.blue}18`:C.bg,color:on?C.blue:C.muted,cursor:"pointer",fontSize:10,fontWeight:on?600:400}}>{m}</button>);})}</div>}
       {confirmDelete!==null&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:10,padding:"10px 14px",marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
         <span style={{fontSize:12,color:"#ff8080",flex:1,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>Delete <b>{products[confirmDelete]?.name}</b>?</span>
         <div style={{display:"flex",gap:7,flexShrink:0}}>
@@ -4055,7 +4571,9 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
           <button onClick={()=>{setProducts(prev=>prev.filter((_,j)=>j!==confirmDelete));if(editPIdx===confirmDelete){clearForm();setEditPIdx(null);}setConfirmDelete(null);}} style={{padding:"5px 11px",borderRadius:6,background:"#3a0a0a",border:"1px solid #ff4040",color:"#ff6060",fontWeight:700,cursor:"pointer",fontSize:12}}>Delete</button>
         </div>
       </div>}
-      <div style={{display:"flex",flexDirection:"column",gap:5}}>{filtered.map((p,i)=>{const ri=products.indexOf(p);const pMarkets=p.supermarkets||(p.supermarket?[p.supermarket]:[]);return(<div key={i} style={{background:C.card,border:`1px solid ${editPIdx===ri?C.lime:confirmDelete===ri?"#5a1a1a":C.border}`,borderRadius:10,padding:"9px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div style={{flex:1,marginRight:8,minWidth:0}}><span style={{fontSize:12,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",display:"block"}}>{p.name}</span>{p.subtitle&&<span style={{fontSize:10,color:C.muted,display:"block",marginTop:1}}>{p.subtitle}</span>}<div style={{display:"flex",gap:5,alignItems:"center",marginTop:2,flexWrap:"wrap"}}>{(p.servingG||p.packageG)&&<span style={{fontSize:9,color:C.lime,fontFamily:"monospace"}}>🍽{p.servingG||p.packageG}g</span>}{(p.categories||[]).map(cid=>{const cat=catById(cid);return cat?<span key={cid} style={{fontSize:9}} title={cat.label}>{cat.emoji}</span>:null;})}{pMarkets.map(m=>(<span key={m} style={{fontSize:8.5,color:C.blue,fontFamily:"monospace"}}>🏪{m}</span>))}</div></div><div style={{display:"flex",gap:5,alignItems:"center",flexShrink:0}}><div style={{display:"flex",gap:6}}><Chip val={p.kcal} label="k" color={C.lime}/><Chip val={p.p} label="P" color={C.blue}/><Chip val={p.c} label="C" color={C.orange}/><Chip val={p.f} label="F" color={C.purple}/></div><button onClick={()=>startEditP(ri)} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:11,cursor:"pointer",padding:"3px 6px",borderRadius:5,marginLeft:3}}>✎</button><button onClick={()=>setConfirmDelete(confirmDelete===ri?null:ri)} style={{background:"none",border:"none",color:confirmDelete===ri?"#ff4040":C.faint,fontSize:14,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div></div>);})}</div></div>}
+      <div style={{display:"flex",flexDirection:"column",gap:5}}>{filtered.map((p,i)=>{const ri=products.indexOf(p);const pMarkets=p.supermarkets||(p.supermarket?[p.supermarket]:[]);return(<div key={i} style={{background:C.card,border:`1px solid ${editPIdx===ri?C.lime:confirmDelete===ri?"#5a1a1a":C.border}`,borderRadius:10,padding:"9px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div style={{flex:1,marginRight:8,minWidth:0}}><span style={{fontSize:12,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",display:"block"}}>{p.name}</span>{p.subtitle&&<span style={{fontSize:10,color:C.muted,display:"block",marginTop:1}}>{p.subtitle}</span>}<div style={{display:"flex",gap:5,alignItems:"center",marginTop:2,flexWrap:"wrap"}}>{p.alwaysFullPack&&p.packSizeG
+  ?<span style={{fontSize:10,color:C.lime,fontFamily:"monospace"}} title="Always eaten as a full pack">📦{p.packSizeG}g</span>
+  :(p.servingG||p.packageG)&&<span style={{fontSize:10,color:C.lime,fontFamily:"monospace"}}>🍽{p.servingG||p.packageG}g</span>}{(p.categories||[]).map(cid=>{const cat=catById(cid);return cat?<span key={cid} style={{fontSize:9}} title={cat.label}>{cat.emoji}</span>:null;})}{pMarkets.map(m=>(<span key={m} style={{fontSize:8.5,color:C.blue,fontFamily:"monospace"}}>🏪{m}</span>))}</div></div><div style={{display:"flex",gap:5,alignItems:"center",flexShrink:0}}><div style={{display:"flex",gap:6}}><Chip val={p.kcal} label="k" color={C.lime}/><Chip val={p.p} label="P" color={C.blue}/><Chip val={p.c} label="C" color={C.orange}/><Chip val={p.f} label="F" color={C.purple}/></div><button onClick={()=>startEditP(ri)} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:11,cursor:"pointer",padding:"3px 6px",borderRadius:5,marginLeft:3}}>✎</button><button onClick={()=>setConfirmDelete(confirmDelete===ri?null:ri)} style={{background:"none",border:"none",color:confirmDelete===ri?"#ff4040":C.faint,fontSize:14,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div></div>);})}</div></div>}
     </div>
     <button onClick={()=>setModal(true)} style={{position:"absolute",bottom:16,right:16,width:54,height:54,borderRadius:"50%",background:C.lime,border:"none",cursor:"pointer",fontSize:28,color:"#000",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 0 20px ${C.lime}55`,zIndex:10}}>+</button>
     {modal&&<CreatePrepSheet products={products} onSave={prep=>{setMealPreps(p=>[prep,...p]);setModal(false);}} onClose={()=>setModal(false)} apiKey={profile.apiKey}/>}
@@ -4406,7 +4924,7 @@ function HistoryTab({weights,products,profile}){
             <span style={{color:C.muted,fontSize:11}}>{isExp?"▲":"▼"}</span>
           </button>
           {isExp&&<div style={{padding:"0 14px 14px",borderTop:`1px solid ${C.border}`}}>
-            <div style={{marginTop:10,marginBottom:10}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Day type</div><div style={{display:"flex",gap:5}}>{Object.entries(DAY_TYPES).map(([key,val])=>{const active=log.dayType===key;return(<button key={key} onClick={()=>updateLog(date,{...log,dayType:key})} style={{flex:1,padding:"6px 3px",borderRadius:8,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,fontWeight:active?700:400,cursor:"pointer",fontSize:9,lineHeight:1.3,textAlign:"center"}}><div style={{fontSize:13}}>{val.icon}</div><div>{val.label}</div></button>);})}</div></div>
+            <div style={{marginTop:10,marginBottom:10}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Day type</div><div style={{display:"flex",gap:5}}>{Object.entries(DAY_TYPES).map(([key,val])=>{const active=log.dayType===key;return(<button key={key} onClick={()=>updateLog(date,{...log,dayType:key})} style={{flex:1,padding:"6px 3px",borderRadius:8,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,fontWeight:active?700:400,cursor:"pointer",fontSize:9,lineHeight:1.3,textAlign:"center"}}><div style={{fontSize:13}}>{val.icon}</div><div>{val.label}</div></button>);})}</div></div>
             {/* Steps for past days — affects the displayed target retroactively */}
             <div style={{marginBottom:10,display:"flex",alignItems:"center",gap:8,background:C.bg,borderRadius:8,padding:"8px 11px"}}>
               <span style={{fontSize:11,color:C.muted,flexShrink:0}}>👣 Steps</span>
@@ -4414,12 +4932,12 @@ function HistoryTab({weights,products,profile}){
               <span style={{fontSize:10,color:C.muted}}>steps</span>
               {(log.dailySteps||0)>0&&(()=>{const adj=stepsKcal(log.dailySteps,profile?.activityLevel||"sedentary",wForDay);return <span style={{fontSize:10,color:adj>0?C.orange:C.muted,fontFamily:"monospace",marginLeft:"auto"}}>{adj===0?"on baseline":`${adj>0?"+":"−"}${Math.abs(adj)}kcal`}</span>;})()}
             </div>
-            <div style={{marginBottom:10}}><div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Tags</div><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{DAY_TAGS.map(tag=>{const active=(log.tags||[]).includes(tag.id);return(<button key={tag.id} onClick={()=>toggleTag(date,tag.id)} style={{padding:"5px 10px",borderRadius:20,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,cursor:"pointer",fontSize:11}}>{tag.emoji} {tag.label}</button>);})}</div></div>
-            <div style={{marginBottom:10}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}><span style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Meals ({log.meals?.length||0})</span><button onClick={()=>setAddMealDate(addMealDate===date?null:date)} style={{fontSize:11,color:C.lime,background:"none",border:`1px solid ${C.lime}`,borderRadius:6,padding:"3px 10px",cursor:"pointer",fontWeight:600}}>+ Add</button></div>{addMealDate===date&&<div style={{marginBottom:8}}><AddMealManual onAdd={meal=>addMeal(date,meal)} onCancel={()=>setAddMealDate(null)}/></div>}<div style={{display:"flex",flexDirection:"column",gap:6}}>{log.meals?.map(m=>{
+            <div style={{marginBottom:10}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Tags</div><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{DAY_TAGS.map(tag=>{const active=(log.tags||[]).includes(tag.id);return(<button key={tag.id} onClick={()=>toggleTag(date,tag.id)} style={{padding:"5px 10px",borderRadius:20,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,cursor:"pointer",fontSize:11}}>{tag.emoji} {tag.label}</button>);})}</div></div>
+            <div style={{marginBottom:10}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}><span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Meals ({log.meals?.length||0})</span><button onClick={()=>setAddMealDate(addMealDate===date?null:date)} style={{fontSize:11,color:C.lime,background:"none",border:`1px solid ${C.lime}`,borderRadius:6,padding:"3px 10px",cursor:"pointer",fontWeight:600}}>+ Add</button></div>{addMealDate===date&&<div style={{marginBottom:8}}><AddMealManual onAdd={meal=>addMeal(date,meal)} onCancel={()=>setAddMealDate(null)}/></div>}<div style={{display:"flex",flexDirection:"column",gap:6}}>{log.meals?.map(m=>{
               const mtEmoji=["🌅","☀️","🌙","🍎","🥤"][["breakfast","lunch","dinner","snack","drink"].indexOf(m.mealType)]||"";
               return(<div key={m.id}>{editMeal?.date===date&&editMeal?.id===m.id?<EditMealInline meal={m} onSave={meal=>updateMeal(date,meal)} onCancel={()=>setEditMeal(null)} products={products} apiKey={profile?.apiKey}/>:<div style={{background:C.bg,borderRadius:10,padding:"9px 12px"}}><div style={{display:"flex",alignItems:"center",gap:8}}><div style={{flex:1,minWidth:0}}><div style={{display:"flex",alignItems:"baseline",gap:6,marginBottom:3,flexWrap:"wrap"}}><span style={{fontSize:13,fontWeight:600,color:C.text,wordBreak:"break-word"}}>{mtEmoji} {m.name}</span><span style={{fontSize:10,color:C.muted,fontFamily:"monospace",flexShrink:0}}>{m.time}</span></div><div style={{display:"flex",gap:8}}><Chip val={m.kcal} label="k" color={C.lime}/><Chip val={m.protein} label="P" color={C.blue}/><Chip val={m.carbs} label="C" color={C.orange}/><Chip val={m.fat} label="F" color={C.purple}/></div></div><button onClick={()=>setEditMeal({date,id:m.id})} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12,cursor:"pointer",padding:"4px 7px",borderRadius:6,lineHeight:1}}>✎</button><button onClick={()=>deleteMeal(date,m.id)} style={{background:"none",border:"none",color:C.faint,fontSize:16,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div>{m.notes&&<div style={{fontSize:10,color:C.muted,marginTop:5,lineHeight:1.4,wordBreak:"break-word"}}>📋 {m.notes}</div>}</div>}</div>);
             })}{!log.meals?.length&&<div style={{fontSize:12,color:C.muted,padding:"4px 0"}}>No meals.</div>}</div></div>
-            <div><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}><span style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Activities{actKcal>0&&<span style={{color:C.orange,marginLeft:6}}>+{Math.round(actKcal)}kcal</span>}</span><button onClick={()=>setAddActDate(addActDate===date?null:date)} style={{fontSize:11,color:C.orange,background:"none",border:`1px solid ${C.orange}`,borderRadius:6,padding:"3px 10px",cursor:"pointer",fontWeight:600}}>+ Add</button></div>{addActDate===date&&<div style={{marginBottom:8}}><AddActManual onAdd={act=>addAct(date,act)} onCancel={()=>setAddActDate(null)}/></div>}<div style={{display:"flex",flexDirection:"column",gap:6}}>{(log.activities||[]).map(a=><div key={a.id}>{editAct?.date===date&&editAct?.id===a.id?<EditActInline act={a} onSave={act=>updateAct(date,act)} onCancel={()=>setEditAct(null)}/>:<div style={{background:C.bg,borderRadius:10,padding:"9px 12px",display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:18}}>{a.type==="gym"?"🏋️":a.type==="run"?"🏃":"🚶"}</span><div style={{flex:1}}><span style={{fontSize:13,color:C.text}}>{a.label}</span><div style={{display:"flex",gap:8,marginTop:2}}><span style={{fontFamily:"monospace",fontSize:11,color:C.orange}}>{Math.round(a.kcal)}kcal</span>{a.distanceKm&&<span style={{fontFamily:"monospace",fontSize:10,color:C.muted}}>{a.distanceKm}km</span>}{a.durationMin&&<span style={{fontFamily:"monospace",fontSize:10,color:C.muted}}>{a.durationMin}min</span>}</div></div><button onClick={()=>setEditAct({date,id:a.id})} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12,cursor:"pointer",padding:"4px 7px",borderRadius:6,lineHeight:1}}>✎</button><button onClick={()=>deleteAct(date,a.id)} style={{background:"none",border:"none",color:C.faint,fontSize:16,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div>}</div>)}{!(log.activities||[]).length&&<div style={{fontSize:12,color:C.muted,padding:"4px 0"}}>No activities.</div>}</div></div>
+            <div><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}><span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Activities{actKcal>0&&<span style={{color:C.orange,marginLeft:6}}>+{Math.round(actKcal)}kcal</span>}</span><button onClick={()=>setAddActDate(addActDate===date?null:date)} style={{fontSize:11,color:C.orange,background:"none",border:`1px solid ${C.orange}`,borderRadius:6,padding:"3px 10px",cursor:"pointer",fontWeight:600}}>+ Add</button></div>{addActDate===date&&<div style={{marginBottom:8}}><AddActManual onAdd={act=>addAct(date,act)} onCancel={()=>setAddActDate(null)}/></div>}<div style={{display:"flex",flexDirection:"column",gap:6}}>{(log.activities||[]).map(a=><div key={a.id}>{editAct?.date===date&&editAct?.id===a.id?<EditActInline act={a} onSave={act=>updateAct(date,act)} onCancel={()=>setEditAct(null)}/>:<div style={{background:C.bg,borderRadius:10,padding:"9px 12px",display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:18}}>{a.type==="gym"?"🏋️":a.type==="run"?"🏃":"🚶"}</span><div style={{flex:1}}><span style={{fontSize:13,color:C.text}}>{a.label}</span><div style={{display:"flex",gap:8,marginTop:2}}><span style={{fontFamily:"monospace",fontSize:11,color:C.orange}}>{Math.round(a.kcal)}kcal</span>{a.distanceKm&&<span style={{fontFamily:"monospace",fontSize:10,color:C.muted}}>{a.distanceKm}km</span>}{a.durationMin&&<span style={{fontFamily:"monospace",fontSize:10,color:C.muted}}>{a.durationMin}min</span>}</div></div><button onClick={()=>setEditAct({date,id:a.id})} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12,cursor:"pointer",padding:"4px 7px",borderRadius:6,lineHeight:1}}>✎</button><button onClick={()=>deleteAct(date,a.id)} style={{background:"none",border:"none",color:C.faint,fontSize:16,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div>}</div>)}{!(log.activities||[]).length&&<div style={{fontSize:12,color:C.muted,padding:"4px 0"}}>No activities.</div>}</div></div>
           </div>}
         </div>);
       })}
@@ -4675,17 +5193,23 @@ function OnboardingScreen({onDone}){
     {title:"Your Goal",subtitle:"This determines your calorie targets each day."},
   ];
 
+  // Starting weight is collected here on purpose. getTDEE() returns null without a weight,
+  // so a user who finished onboarding and had not yet logged one silently fell back to the
+  // hardcoded FB targets (a flat 1700–2150 kcal) — presented identically to a real
+  // personalised target, with nothing on screen saying it was a generic placeholder.
+  const [startWeight,setStartWeight]=useState("");
+
   const canNext=[
     true,
-    name.trim().length>0&&birthday.length>0&&heightCm>0,
+    name.trim().length>0&&birthday.length>0&&heightCm>0&&parseNum(startWeight)>0,
     true,
     goal.length>0,
   ];
 
-  const finish=()=>{onDone({name:name.trim()||"User",birthday,heightCm:parseFloat(heightCm)||null,sex,activityLevel,goal,targetWeightKg:parseFloat(targetWeightKg)||null,goalNote:goalNote.trim(),apiKey:""});};
+  const finish=()=>{onDone({name:name.trim()||"User",birthday,heightCm:parseFloat(heightCm)||null,sex,activityLevel,goal,targetWeightKg:parseFloat(targetWeightKg)||null,goalNote:goalNote.trim(),apiKey:""},parseNum(startWeight)||null);};
 
-  return(<div style={{background:C.bg,height:"100vh",display:"flex",flexDirection:"column",fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",maxWidth:520,margin:"0 auto"}}>
-    <style>{`*{-webkit-tap-highlight-color:transparent;box-sizing:border-box}input{color-scheme:dark}::-webkit-scrollbar{display:none}`}</style>
+  return(<div style={{background:C.bg,height:"100vh",minHeight:"100dvh",maxHeight:"100dvh",display:"flex",flexDirection:"column",fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",maxWidth:520,margin:"0 auto",paddingTop:SAFE_TOP}}>
+    <style>{GLOBAL_CSS}</style>
     {/* Progress bar */}
     <div style={{height:3,background:C.dim,flexShrink:0}}>
       <div style={{height:"100%",width:`${((step+1)/steps.length)*100}%`,background:C.lime,transition:"width 0.3s"}}/>
@@ -4712,8 +5236,9 @@ function OnboardingScreen({onDone}){
           <Field label="Birthday" value={birthday} onChange={setBirthday} type="date" placeholder="YYYY-MM-DD"/>
           <Field label="Height (cm)" value={heightCm} onChange={setHeightCm} type="number" placeholder="178"/>
         </div>
+        <Field label="Current weight (kg)" value={startWeight} onChange={setStartWeight} type="number" placeholder="e.g. 78.5"/>
         <div>
-          <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Sex</div>
+          <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Sex</div>
           <div style={{display:"flex",gap:8}}>{[["male","Male"],["female","Female"]].map(([val,lbl])=>(<button key={val} onClick={()=>setSex(val)} style={{flex:1,padding:"12px 0",borderRadius:10,border:`1px solid ${sex===val?C.lime:C.border}`,background:sex===val?`${C.lime}18`:C.bg,color:sex===val?C.lime:C.muted,fontWeight:sex===val?700:500,cursor:"pointer",fontSize:14}}>{lbl}</button>))}</div>
         </div>
         <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px"}}><div style={{fontSize:11,color:C.muted}}>Used only to calculate your BMR and personalized kcal targets. Not shared with anyone.</div></div>
@@ -4733,7 +5258,7 @@ function OnboardingScreen({onDone}){
       </div>)}
     </div>
 
-    <div style={{padding:"16px 24px 32px",flexShrink:0,borderTop:`1px solid ${C.border}`}}>
+    <div style={{padding:`16px 24px calc(24px + ${SAFE_BOTTOM})`,flexShrink:0,borderTop:`1px solid ${C.border}`}}>
       <div style={{display:"flex",gap:10}}>
         {step>0&&<button onClick={()=>setStep(s=>s-1)} style={{flex:1,padding:"14px 0",borderRadius:12,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer",fontSize:15}}>Back</button>}
         <button onClick={()=>{if(step<steps.length-1)setStep(s=>s+1);else finish();}} disabled={!canNext[step]} style={{flex:step>0?2:1,padding:"14px 0",borderRadius:12,background:canNext[step]?C.lime:C.faint,border:"none",color:"#000",fontWeight:800,cursor:canNext[step]?"pointer":"default",fontSize:15}}>
@@ -4744,9 +5269,40 @@ function OnboardingScreen({onDone}){
   </div>);
 }
 
+// ── Icons ─────────────────────────────────────────────────────────────────────
+// The tab bar previously mixed three unrelated visual languages — geometric glyphs (◉ ▤ ⚙),
+// a symbol (⚡) and a colour emoji (🍱). Emoji render differently on every OS, can't be
+// recoloured to match the active state, and read as decoration rather than navigation.
+// These are a single Lucide-style family: one 24px grid, one 1.75 stroke weight, currentColor.
+const NavIcon = ({name, size=23}) => {
+  const p = {fill:"none",stroke:"currentColor",strokeWidth:1.75,strokeLinecap:"round",strokeLinejoin:"round"};
+  const paths = {
+    today:    <><circle cx="12" cy="12" r="8.5" {...p}/><path d="M12 7.5v4.8l3 1.8" {...p}/></>,
+    activity: <path d="M3 12h3.5l2.5-7 4 14 2.5-7H21" {...p}/>,
+    food:     <><path d="M4 3.5v6a2.5 2.5 0 0 0 5 0v-6" {...p}/><path d="M6.5 9.5V20.5" {...p}/><path d="M17.5 3.5c-1.6 1.2-2.3 3-2.3 5.2 0 1.6.6 2.6 2.3 2.9V20.5" {...p}/></>,
+    history:  <><path d="M3.5 6.5h17M3.5 12h17M3.5 17.5h17" {...p}/></>,
+    settings: <><circle cx="12" cy="12" r="3.1" {...p}/><path d="M19.4 14.5a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1v.3a2 2 0 1 1-4 0v-.2a1.6 1.6 0 0 0-2.8-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7H3a2 2 0 1 1 0-4h.2a1.6 1.6 0 0 0 1.1-2.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3h.1a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.2a1.6 1.6 0 0 0 2.7 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8v.1a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.2a1.6 1.6 0 0 0-1.4 1z" {...p}/></>,
+  };
+  return <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" style={{display:"block",flexShrink:0}}>{paths[name]}</svg>;
+};
+
 function Nav({tab,setTab}){
-  const tabs=[["today","◉","Today"],["activity","⚡","Activity"],["food","🍱","Food"],["history","▤","History"],["settings","⚙","Settings"]];
-  return(<div style={{height:52,background:C.surf,borderTop:`1px solid ${C.border}`,display:"flex",flexShrink:0}}>{tabs.map(([id,icon,label])=>(<button key={id} onClick={()=>setTab(id)} style={{flex:1,background:"none",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1,padding:"3px 0"}}><span style={{fontSize:13,color:tab===id?C.lime:C.muted,lineHeight:1}}>{icon}</span><span style={{fontSize:7.5,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.03em",color:tab===id?C.lime:C.muted,fontWeight:tab===id?700:400}}>{label}</span></button>))}</div>);
+  const tabs=[["today","Today"],["activity","Activity"],["food","Food"],["history","History"],["settings","Settings"]];
+  // Height is 58 + the iOS home-indicator inset. Previously a flat 52px with no inset, which
+  // put the bottom of every tab button underneath the home indicator on notched iPhones.
+  return(<nav aria-label="Main" style={{background:C.surf,borderTop:`1px solid ${C.border}`,display:"flex",flexShrink:0,paddingBottom:SAFE_BOTTOM}}>
+    {tabs.map(([id,label])=>{
+      const active=tab===id;
+      return(<button key={id} onClick={()=>setTab(id)} aria-label={label} aria-current={active?"page":undefined}
+        style={{flex:1,minHeight:58,background:"none",border:"none",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:3,padding:"7px 0 6px",position:"relative",color:active?C.lime:C.muted}}>
+        {/* Active indicator: a second, non-colour cue so the selected tab isn't communicated
+            by hue alone (fails for the ~8% of men with red-green colour deficiency). */}
+        <span aria-hidden="true" style={{position:"absolute",top:0,left:"50%",transform:"translateX(-50%)",width:active?26:0,height:2.5,borderRadius:"0 0 3px 3px",background:C.lime,transition:"width .2s ease"}}/>
+        <NavIcon name={id}/>
+        <span style={{fontSize:10,letterSpacing:"0.01em",fontWeight:active?700:500,lineHeight:1}}>{label}</span>
+      </button>);
+    })}
+  </nav>);
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -4931,27 +5487,53 @@ function App(){
   const handleImportDone=async(n)=>{setShowImport(false);window.location.reload();};
   if(!ready||!profile||showImport===null)return(<div style={{background:C.bg,height:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}}><div style={{color:C.muted,fontFamily:"monospace",fontSize:13}}>Loading…</div></div>);
   if(showImport===true)return(<ImportScreen onImport={handleImportDone} onSkip={()=>setShowImport(false)}/>);
-  if(needsOnboarding)return(<OnboardingScreen onDone={p=>{setProfile(p);setTab("today");}}/>);
-  return(<div style={{background:C.bg,height:"100vh",display:"flex",flexDirection:"column",fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",maxWidth:520,margin:"0 auto"}}>
-    <style>{`*{-webkit-tap-highlight-color:transparent;box-sizing:border-box}input,textarea{color-scheme:dark}::-webkit-scrollbar{display:none}button:active{opacity:0.82}`}</style>
+  // A live gym session pins the view to Activity and hides the tab bar (see below). Resolving
+  // the tab here rather than guarding each branch keeps exactly one tab mounted — guarding
+  // them individually let Food/History/Settings render *alongside* the pinned Activity tab.
+  const viewTab = gymActiveSession ? "activity" : tab;
+  if(needsOnboarding)return(<OnboardingScreen onDone={(p,startWeight)=>{
+    setProfile(p);
+    // Seed the weight log with the starting weight so day-one targets are computed from the
+    // user's real BMR instead of the generic fallback table.
+    if(startWeight)setWeights(prev=>{const d=TODAY();return [{date:d,weight:startWeight},...prev.filter(x=>x.date!==d)];});
+    setTab("today");
+  }}/>);
+  // 100dvh, not 100vh: on mobile browsers 100vh is measured against the viewport with the
+  // URL bar *hidden*, so with the bar showing the layout is taller than the screen and the
+  // bottom of the tab bar is pushed off-screen. 100vh stays as the fallback for old browsers.
+  return(<div style={{background:C.bg,height:"100vh",minHeight:"100dvh",maxHeight:"100dvh",display:"flex",flexDirection:"column",fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",maxWidth:520,margin:"0 auto",paddingTop:SAFE_TOP}}>
+    <style>{GLOBAL_CSS}</style>
     {rolloverBanner&&<div style={{background:`${C.lime}18`,borderBottom:`1px solid ${C.lime}`,padding:"10px 14px",display:"flex",alignItems:"center",gap:8}}>
       <span style={{fontSize:16}}>🌅</span>
       <div style={{flex:1,fontSize:12,color:C.lime,lineHeight:1.4}}>It's a new day — you're now logging for <b>{new Date(rolloverBanner.toDate+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</b>. Late-night meals can be moved to yesterday from the History tab.</div>
       <button onClick={()=>setRolloverBanner(null)} style={{background:"none",border:"none",color:C.lime,fontSize:18,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button>
     </div>}
     <div style={{flex:1,overflow:"hidden"}}>
-      {tab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")}/>}
-      {tab==="activity"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary}/>}
-      {tab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes}/>}
-      {tab==="history"&&<HistoryTab weights={weights} products={products} profile={profile}/>}
-      {tab==="settings"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight}/>}
+      {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")}/>}
+      {viewTab==="activity"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary}/>}
+      {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes}/>}
+      {viewTab==="history"&&<HistoryTab weights={weights} products={products} profile={profile}/>}
+      {viewTab==="settings"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight}/>}
     </div>
-    <Nav tab={tab} setTab={setTab}/>
+    {/* The tab bar is hidden while a gym session is live so "gym mode" is genuinely modal:
+        no stray tap can reveal weight or food data to someone standing behind you, and no
+        accidental swipe loses your place mid-set. Finishing or cancelling the session in the
+        Activity tab brings it straight back. */}
+    {!gymActiveSession&&<Nav tab={tab} setTab={setTab}/>}
   </div>);
 }
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(<App/>);
+// Tear down the boot splash now that React has mounted. Fade rather than cut, so the
+// hand-off from splash to app doesn't read as a flash of broken layout.
+(() => {
+  const boot = document.getElementById("boot");
+  if (!boot) return;
+  boot.style.transition = "opacity 0.28s ease";
+  boot.style.opacity = "0";
+  setTimeout(() => boot.remove(), 300);
+})();
 </script>
 </body>
 </html>

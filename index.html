@@ -285,6 +285,18 @@ button[disabled]:active,button:disabled:active{transform:none;opacity:.45}
   *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
 }
 
+/* App shell. Anchored with position:fixed + inset:0 rather than a height value, because
+   height on mobile is the unreliable part: 100vh is measured against the viewport with the
+   browser chrome hidden, and mixing it with a 100dvh max leaves the shell a different height
+   than the visible area depending on which unit the browser honours. That mismatch is what
+   left the tab bar floating short of the bottom edge. A fixed box pinned to all four sides is
+   exactly the visual viewport on every engine, with no unit arithmetic to disagree about. */
+.app-shell{
+  position:fixed; inset:0; margin:0 auto; max-width:520px;
+  display:flex; flex-direction:column; overflow:hidden;
+  background:${C.bg};
+}
+
 @keyframes sheetIn{from{transform:translateY(100%)}to{transform:translateY(0)}}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 @keyframes toastIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
@@ -393,17 +405,73 @@ const DEFAULT_EXERCISES = [
   {name:"Ab Wheel Rollout",category:"Abs",muscleGroup:"Abs"},
   {name:"Cable Crunch",category:"Abs",muscleGroup:"Abs"},
 ];
-// Estimate active kcal burned during a gym session from duration alone, when the user doesn't
-// enter a manual figure. Resistance training with typical rest periods between sets averages
-// out to roughly 5 METs (vigorous during the working sets, near-zero during rest) — this is a
-// commonly cited blended average for weight-training sessions (ACSM figures put straight lifting
-// at 3.5-6 METs depending on rest length; 5 is a reasonable session-wide midpoint).
-// kcal = METs × 3.5 × weight(kg) / 200 × minutes
+// ── Energy model ──────────────────────────────────────────────────────────────
+// Every number produced here is NET of resting metabolism, and every number scales with
+// bodyweight. Both of those were previously wrong in ways that inflated the eating target:
+//
+//   1. Gross vs net. TDEE already pays for resting metabolism during the hour you spend in
+//      the gym. Crediting the gross MET figure on top bills that hour twice. The standard MET
+//      formula returns gross, so the resting share is subtracted here: (METs − 1).
+//
+//   2. Too high a MET value for lifting. The old estimate used 5 METs session-wide. That is
+//      the vigorous, short-rest end; the Compendium of Physical Activities puts resistance
+//      training at multiple exercises / 8-15 reps at 3.5 METs, and 6.0 only for genuinely
+//      vigorous effort. A typical hypertrophy session is mostly rest, so 3.5 is the honest
+//      session-wide average.
+//
+//   3. Fixed day-type burns. `gym: 300, run_short: 400, run_long: 600` were the same for a
+//      55kg and a 110kg athlete. Running cost is close to linear in bodyweight, so those
+//      constants were only ever right for a ~70kg person.
+//
+// Together (1) and (2) roughly halve the credited burn for a gym session — a 60-minute
+// session at 84kg goes from 441 kcal to 220. That is the intended correction, not a
+// regression: over-credited exercise reads as permission to eat more.
+const ENERGY = {
+  // Net kcal per kg of bodyweight per km run. Gross running cost is ~1.03 kcal/kg/km and is
+  // famously near-independent of pace; subtracting the resting share over the same period
+  // leaves ~0.9.
+  RUN_KCAL_PER_KG_KM: 0.9,
+  // Net kcal per kg per km walked. Walking is a good deal cheaper per km than running — the
+  // old form charged 48 kcal/km flat, which is roughly a 70kg *run*, not a walk.
+  WALK_KCAL_PER_KG_KM: 0.5,
+  // Session-wide average for resistance training including rest between sets.
+  LIFT_METS: 3.5,
+  // Assumed duration of a planned (not yet logged) gym day, in minutes.
+  PLANNED_LIFT_MIN: 60,
+  // Planned running distances, in km. These take the BOTTOM of each day type's stated range
+  // (5-8km and 10km+) on purpose: it is a pre-commitment estimate made before anything is
+  // logged, and under-crediting is the safe direction. Logging the actual activity replaces
+  // it — dayBurnTotal() takes the larger of planned and logged.
+  PLANNED_RUN_SHORT_KM: 5,
+  PLANNED_RUN_LONG_KM: 10,
+};
+
+// Net kcal from a MET value: the standard kcal = METs × 3.5 × kg / 200 × minutes, with the
+// resting 1 MET removed so this can be added on top of TDEE without double-counting.
+function netMetKcal(mets, weightKg, minutes) {
+  return Math.max(0, (mets - 1)) * 3.5 * (weightKg || 75) / 200 * (minutes || 0);
+}
+
+// Net kcal for a run of a given distance. Duration is deliberately not a factor — running
+// cost per km barely changes with pace, so a slower 5km does not burn meaningfully more.
+function runKcal(km, weightKg) {
+  return ENERGY.RUN_KCAL_PER_KG_KM * (weightKg || 75) * (km || 0);
+}
+function walkKcal(km, weightKg) {
+  return ENERGY.WALK_KCAL_PER_KG_KM * (weightKg || 75) * (km || 0);
+}
+// Net kcal for a distance activity of a given type. Used wherever a logged distance should
+// suggest a burn, so run/walk estimates can't drift apart between entry forms.
+function distanceKcal(type, km, weightKg) {
+  if (type === "run") return Math.round(runKcal(km, weightKg));
+  if (type === "walk") return Math.round(walkKcal(km, weightKg));
+  return 0;
+}
+
+// Estimate active kcal burned during a gym session from duration, when the user doesn't enter
+// a manual figure. Deliberately conservative — see the note above.
 function estimateGymKcal(durationSec, bodyWeightKg) {
-  const minutes = (durationSec||0) / 60;
-  const weight = bodyWeightKg || 75;
-  const METS = 5;
-  return Math.round(METS * 3.5 * weight / 200 * minutes);
+  return Math.round(netMetKcal(ENERGY.LIFT_METS, bodyWeightKg, (durationSec||0)/60));
 }
 // Normalize an exercise name for matching across sessions (case/whitespace/accent insensitive).
 const normExName = s => (s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/\s+/g," ").trim();
@@ -452,6 +520,39 @@ function suggestProgression(exerciseName, gymSessions, method) {
 }
 // Alternatives for the "swap this exercise" feature — same muscle group, excluding itself,
 // sorted with custom (user-added) exercises first since those are most likely relevant.
+// Force a gym session into a shape the panel can always render.
+//
+// The panel indexes into `combos[i].exercises` and `ex.sets` in dozens of places. A combo that
+// reached storage without an `exercises` array (an empty weekday template, a partial write, an
+// older schema) threw on the first `.length` read — and because the session is persisted on
+// every change, that same throw repeated on every reload and locked the user out of the app
+// entirely. Normalising on read and on write means a malformed session degrades to an empty
+// one instead of taking the app down.
+function normalizeGymSession(s) {
+  if (!s || typeof s !== "object") return null;
+  const combos = (Array.isArray(s.combos) ? s.combos : []).map((c, i) => ({
+    ...c,
+    id: c?.id ?? `combo-${i}`,
+    exercises: (Array.isArray(c?.exercises) ? c.exercises : []).map((ex, j) => ({
+      ...ex,
+      id: ex?.id ?? `ex-${i}-${j}`,
+      name: ex?.name || "Exercise",
+      unit: ex?.unit || "kg",
+      sets: Array.isArray(ex?.sets) ? ex.sets.filter(x => x && typeof x === "object") : [],
+    })),
+  }));
+  const safeCombos = combos.length ? combos : [{ id: Date.now(), exercises: [] }];
+  const comboIdx = Math.min(Math.max(0, Number(s.currentComboIdx) || 0), safeCombos.length - 1);
+  const exCount = safeCombos[comboIdx].exercises.length;
+  return {
+    ...s,
+    combos: safeCombos,
+    currentComboIdx: comboIdx,
+    currentExInRound: Math.min(Math.max(0, Number(s.currentExInRound) || 0), Math.max(0, exCount - 1)),
+    resting: !!s.resting,
+  };
+}
+
 // Flatten a completed session's combos into a plain list of performed exercises, so a summary
 // can render "what I lifted and how much" without the reader having to open a detail sheet.
 // Exercises with no logged sets are dropped — they were skipped, not performed.
@@ -461,12 +562,18 @@ function sessionExerciseSummary(session) {
   (session.combos||[]).forEach(c => (c.exercises||[]).forEach(ex => {
     const sets = ex.sets || [];
     if (!sets.length) return;
+    // Weight is per set. Sessions logged before that was tracked only have the exercise-level
+    // value, so fall back to it. When every set used the same weight show one figure; when it
+    // varied, show it per set (that variation is the useful part of the record).
+    const weights = sets.map(s => (s.weight ?? ex.weight) || null);
+    const uniq = [...new Set(weights.map(w => String(w)))];
     out.push({
       name: ex.name,
-      weight: ex.weight || null,
+      weight: uniq.length === 1 ? weights[0] : null,
+      perSetWeights: uniq.length > 1 ? weights : null,
       unit: ex.unit || "kg",
       reps: sets.map(s => s.reps),
-      volume: (parseFloat(ex.weight)||0) * sets.reduce((a,s)=>a+(s.reps||0),0),
+      volume: sets.reduce((a, s) => a + (parseFloat(s.weight ?? ex.weight) || 0) * (s.reps || 0), 0),
     });
   }));
   return out;
@@ -485,22 +592,75 @@ const DEFAULT_PROFILE = {
 };
 
 // ── TDEE helpers ──────────────────────────────────────────────────────────────
-function calcAge(b){if(!b)return null;return Math.floor((Date.now()-new Date(b))/(365.25*24*3600*1000));}
+// Age in whole years. Returns null only when there is no birthday at all — 0 is a real value
+// and must not be treated as "unknown". The old `if(!age)` test conflated the two, so an
+// under-1 birthday silently fell through to the fixed fallback table below.
+function calcAge(b){
+  if(!b) return null;
+  const t = new Date(b).getTime();
+  if(!Number.isFinite(t)) return null;
+  const a = Math.floor((Date.now()-t)/(365.25*24*3600*1000));
+  return Number.isFinite(a) ? a : null;
+}
+
+// Bounds on what this app is willing to calculate for. Mifflin-St Jeor is derived from and
+// validated on adults; it is not valid for children, and outside these ranges the output stops
+// being a nutrition target and becomes a number that merely looks like one. Refusing is the
+// correct behaviour — see targetIssues().
+const PROFILE_LIMITS = {ageMin:16, ageMax:100, heightMin:130, heightMax:230, weightMin:35, weightMax:300};
+
+// Why a profile can't produce a trustworthy target. Empty array = good to go.
+// `blocking` issues suppress the numbers entirely; non-blocking ones are shown as a caution.
+function targetIssues(profile, weight){
+  const out=[];
+  const age=calcAge(profile?.birthday);
+  const h=Number(profile?.heightCm)||0;
+  const w=Number(weight)||0;
+  if(age==null) out.push({blocking:true, msg:"Add your birthday in Settings."});
+  else if(age<PROFILE_LIMITS.ageMin) out.push({blocking:true, msg:`These targets are calculated with a formula validated on adults, so the app won't estimate for age ${age}. Under ${PROFILE_LIMITS.ageMin}s should get targets from a doctor or dietitian.`});
+  else if(age>PROFILE_LIMITS.ageMax) out.push({blocking:true, msg:"That birthday doesn't look right — check it in Settings."});
+  if(!h) out.push({blocking:true, msg:"Add your height in Settings."});
+  else if(h<PROFILE_LIMITS.heightMin||h>PROFILE_LIMITS.heightMax) out.push({blocking:true, msg:`Height of ${h}cm is outside the range this app can calculate for.`});
+  if(!w) out.push({blocking:true, msg:"Log a weight so targets can be based on your actual bodyweight."});
+  else if(w<PROFILE_LIMITS.weightMin||w>PROFILE_LIMITS.weightMax) out.push({blocking:true, msg:`Weight of ${w}kg is outside the range this app can calculate for.`});
+  // BMI sanity — a plausible height and weight can still be an implausible pair.
+  if(h&&w&&!out.length){
+    const bmi=w/Math.pow(h/100,2);
+    if(bmi<15) out.push({blocking:true, msg:`That height and weight give a BMI of ${bmi.toFixed(1)}, which is severely underweight. Please work with a doctor rather than an app.`});
+    else if(bmi<17) out.push({blocking:false, msg:`Your BMI is ${bmi.toFixed(1)} (underweight). A cut is not advisable here — consider speaking to a professional.`});
+    else if(bmi>45) out.push({blocking:false, msg:`At a BMI of ${bmi.toFixed(1)}, bodyweight-based protein targets overshoot. This app scales protein down accordingly, but a dietitian will do better.`});
+  }
+  return out;
+}
+
 function getTDEE(profile,weight){
-  const age=calcAge(profile?.birthday);if(!age||!profile?.heightCm||!weight)return null;
+  if(targetIssues(profile,weight).some(i=>i.blocking)) return null;
+  const age=calcAge(profile?.birthday);
   const bmr=profile.sex==="female"?10*weight+6.25*profile.heightCm-5*age-161:10*weight+6.25*profile.heightCm-5*age+5;
   const lev=ACT_LEVELS.find(l=>l.id===(profile.activityLevel||"light"));
   return Math.round(bmr*(lev?.m||1.35));
 }
-const DAY_BURN={rest:0,gym:300,run_short:400,run_long:600};
-const FB={rest:{kcal:1700,protein:140,carbs:165,fat:55},gym:{kcal:2000,protein:140,carbs:200,fat:60},run_short:{kcal:1950,protein:140,carbs:195,fat:58},run_long:{kcal:2150,protein:140,carbs:220,fat:62}};
+// Expected net burn for a planned day type, scaled to the person.
+// Replaces the old fixed `DAY_BURN = {gym:300, run_short:400, run_long:600}` table, which
+// charged a 55kg and a 110kg athlete identically. Those constants happened to be about right
+// at 70kg, so a 70kg user sees little change here; lighter users get less, heavier users more.
+function plannedDayBurn(dayType, weightKg) {
+  const w = weightKg || 75;
+  switch (dayType) {
+    case "gym":       return Math.round(netMetKcal(ENERGY.LIFT_METS, w, ENERGY.PLANNED_LIFT_MIN));
+    case "run_short": return Math.round(runKcal(ENERGY.PLANNED_RUN_SHORT_KM, w));
+    case "run_long":  return Math.round(runKcal(ENERGY.PLANNED_RUN_LONG_KM, w));
+    default:          return 0; // rest, and anything unrecognised
+  }
+}
+
 // Compute the total "above-TDEE" burn for the day. TDEE already includes baseline activity
-// from the activity multiplier; DAY_BURN is the additional burn expected for a planned hard
-// day. If the user logged actual activities, we use the larger of (logged, planned) so that
+// from the activity multiplier; this is the additional burn expected for a planned hard day.
+// If the user logged actual activities, we use the larger of (logged, planned) so that
 // partial-logging doesn't silently lower the target. extraBurn here is the total kcal of
 // logged activities + any manual burnedExtra.
-function dayBurnTotal(dayType, extraBurn, hasLoggedActivity) {
-  const planned = DAY_BURN[dayType] || 0;
+function dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weightKg) {
+  const planned = plannedDayBurn(dayType, weightKg);
   const logged = extraBurn || 0;
   if (!hasLoggedActivity) return planned;
   // User logged activity — use the larger of what they actually burned vs the planned baseline.
@@ -524,23 +684,85 @@ function stepsKcal(steps, activityLevel, weight) {
   const kcalPerStep = (weight||70) * 0.0005;
   return Math.round(delta * kcalPerStep);
 }
+// Protein target, in g/kg of bodyweight, by goal.
+// Ranges follow the resistance-training literature: highest on a deficit (protein is what
+// protects lean mass when energy is short), lowest on a surplus (energy is doing that work).
+const PROTEIN_G_PER_KG = {cut:2.2, maintain:1.8, bulk:1.6};
+
+// Daily targets.
+//
+// Every number here is now derived from the person. The previous version applied absolute
+// floors — 1200 kcal, 130g protein, 40g fat, 50g carbs — which is where the reported
+// "140g of protein for a 14kg body" came from: an invalid profile fell through to a fixed
+// fallback table, and even a valid small body hit the 130g protein floor. Floors that do not
+// scale with the person are wrong for anyone the author was not picturing.
+//
+// Returns `{kcal,protein,carbs,fat,unavailable?,issues}`. When the profile can't support a
+// calculation the numbers come back zeroed with `unavailable:true`, so callers show
+// "complete your profile" rather than a plausible-looking invention.
 function getDT(profile,dayType,weight,extraBurn=0,hasLoggedActivity=false,dailySteps=0){
-  const tdee=getTDEE(profile,weight);if(!tdee)return FB[dayType]||FB.rest;
-  const burn = dayBurnTotal(dayType, extraBurn, hasLoggedActivity);
+  const issues=targetIssues(profile,weight);
+  const tdee=getTDEE(profile,weight);
+  if(!tdee) return {kcal:0,protein:0,carbs:0,fat:0,unavailable:true,issues};
+
+  const burn = dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weight);
   const stepBonus = stepsKcal(dailySteps, profile.activityLevel||"sedentary", weight);
-  const base=tdee+burn+stepBonus;
-  const adj=GOAL_DEFICIT[profile.goalSubmode||profile.goal||"cut"]??GOAL_DEFICIT[profile.goal||"cut"]??-400;
-  const kcal=Math.max(1200,Math.round(base+adj));
-  const pPerKg={cut:2.2,bulk:1.8,maintain:2.0}[profile.goal||"cut"];
-  const protein=Math.max(130,Math.round((weight||70)*pPerKg));
-  const fat=Math.max(40,Math.round(kcal*0.27/9));
-  const carbs=Math.max(50,Math.round((kcal-protein*4-fat*9)/4));
-  return{kcal,protein,carbs,fat};
+  const base = tdee + burn + stepBonus;
+
+  // Energy. The configured adjustment is an absolute kcal figure, which is a reasonable unit
+  // for an average adult but is a huge fraction of a small person's day — a −600 cut on a
+  // 1400 kcal maintenance is a 43% deficit. Cap the adjustment at 25% of maintenance in
+  // either direction so the aggressiveness of a goal scales with the body it applies to.
+  const requested = GOAL_DEFICIT[profile.goalSubmode||profile.goal||"cut"] ?? GOAL_DEFICIT[profile.goal||"cut"] ?? 0;
+  const maxSwing = Math.round(base*0.25);
+  const adj = Math.max(-maxSwing, Math.min(maxSwing, requested));
+  const kcal = Math.round(base + adj);
+
+  // Sitting below BMR is the meaningful red line, and unlike a flat "never under 1200 kcal"
+  // it scales with the body: 1200 is starvation for a large man and unreachable for a small
+  // woman. Flagged, not clamped — the user chose the aggressiveness, so say so and let them.
+  const bmrNow = profile.sex==="female"
+    ? 10*weight+6.25*profile.heightCm-5*calcAge(profile.birthday)-161
+    : 10*weight+6.25*profile.heightCm-5*calcAge(profile.birthday)+5;
+  if(kcal < bmrNow) issues.push({blocking:false, msg:`This target (${kcal} kcal) is below your resting requirement of about ${Math.round(bmrNow)} kcal. Consider a gentler deficit or more activity instead.`});
+
+  const goal = profile.goal||"maintain";
+  const w = weight;
+
+  // Protein. Bodyweight-scaled, then bounded by two constraints that matter at the extremes:
+  //  - it may not exceed 40% of the day's energy, which is what stops a high g/kg figure from
+  //    crowding out everything else on a small or heavily-cut day;
+  //  - for a high BMI it is scaled toward a lean-mass proxy, because g/kg of total bodyweight
+  //    overestimates protein need when a large share of that weight is fat mass.
+  const h = Number(profile.heightCm)||0;
+  const bmi = h ? w/Math.pow(h/100,2) : 22;
+  const proteinRefWeight = bmi>30 ? (w*0.75 + (25*Math.pow(h/100,2))*0.25) : w;
+  const proteinFromBW = proteinRefWeight * (PROTEIN_G_PER_KG[goal] ?? 1.8);
+  const proteinCap = (kcal*0.40)/4;
+  const protein = Math.max(0, Math.round(Math.min(proteinFromBW, proteinCap)));
+
+  // Fat. 27% of energy, but never below ~0.5 g/kg — that lower bound is the essential-fatty-acid
+  // and hormone floor, and unlike a flat 40g it scales with the person.
+  const fatFloor = w*0.5;
+  const fat = Math.max(0, Math.round(Math.max(kcal*0.27/9, fatFloor)));
+
+  // Carbs take the remainder. If protein and fat have already spent the budget the remainder
+  // would go negative; clamping it to a floor (as before) silently made the macros sum to more
+  // than the kcal target. Trim fat back toward its floor instead, so the three always reconcile.
+  let carbs = Math.round((kcal - protein*4 - fat*9)/4);
+  let finalFat = fat;
+  if(carbs < 0){
+    const overspend = -carbs*4;
+    const trimmable = Math.max(0, (fat - fatFloor)*9);
+    finalFat = Math.round(fat - Math.min(overspend, trimmable)/9);
+    carbs = Math.max(0, Math.round((kcal - protein*4 - finalFat*9)/4));
+  }
+  return {kcal, protein, carbs, fat:finalFat, issues};
 }
 function getMaint(profile,dayType,weight,extraBurn=0,hasLoggedActivity=false,dailySteps=0){
   const tdee=getTDEE(profile,weight);if(!tdee)return null;
   const stepBonus = stepsKcal(dailySteps, profile.activityLevel||"sedentary", weight);
-  return Math.round(tdee + dayBurnTotal(dayType, extraBurn, hasLoggedActivity) + stepBonus);
+  return Math.round(tdee + dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weight) + stepBonus);
 }
 // Trend over the last ~21 days (or up to 14 entries if you weigh more often).
 // Requires at least 4 entries spanning at least 3 days. Returns kg/week (negative = losing).
@@ -662,8 +884,18 @@ function extractJSON(text) {
 
 const inClaudeAI = () => { try { return typeof window.storage !== "undefined"; } catch { return false; } };
 // Vision model for scale/label reading, Haiku for simple text
-const VISION_MODEL = "claude-sonnet-4-6";
-const TEXT_MODEL   = "claude-haiku-4-5-20251001"; // text-only calls
+// Models. Both were a generation behind; these are the current IDs.
+//   vision  claude-sonnet-4-6 → claude-sonnet-5
+//           Near-Opus quality on the photo work this app leans on, and notably better at
+//           reading nutrition labels and meal photos. First Sonnet with high-resolution
+//           vision (2576px long edge, up from 1568), which is what a phone photo of a
+//           label actually needs.
+//   text    pinned snapshot → the rolling `claude-haiku-4-5` alias, so it stops being
+//           pinned to one dated build.
+// Neither request sends temperature/top_p/top_k, which Sonnet 5 rejects — nothing else
+// in callAI() had to change.
+const VISION_MODEL = "claude-sonnet-5";
+const TEXT_MODEL   = "claude-haiku-4-5"; // text-only calls
 async function callAI(content, apiKey, model, maxTokens) {
   // Claude.ai artifact proxy: no extra headers, just Content-Type + .json() response
   // Standalone with API key: add auth headers
@@ -2278,13 +2510,13 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
   </Sheet>);
 }
 
-function AddActSheet({onAdd,onClose,apiKey}){
+function AddActSheet({onAdd,onClose,apiKey,weightKg}){
   const [type,setType]=useState("run");const [dist,setDist]=useState("");const [dur,setDur]=useState("");const [kcal,setKcal]=useState("");const [imgs,setImgs]=useState([]);const [loading,setLoading]=useState(false);const [err,setErr]=useState(null);
-  const est=type==="run"?Math.round((parseFloat(dist)||0)*62):type==="walk"?Math.round((parseFloat(dist)||0)*48):0;const finalKcal=parseFloat(kcal)||est;
+  const est=distanceKcal(type,parseFloat(dist)||0,weightKg);const finalKcal=parseFloat(kcal)||est;
   const scan=async()=>{if(!imgs.length)return;setLoading(true);setErr(null);try{const res=await aAct(imgs,apiKey);if(res.kcal)setKcal(String(Math.round(res.kcal)));if(res.distanceKm)setDist(String(res.distanceKm));if(res.durationMin)setDur(String(res.durationMin));if(res.actType&&["run","walk","gym"].includes(res.actType))setType(res.actType);}catch(e){setErr(String(e.message||e));}setLoading(false);};
   const confirm=()=>{if(!finalKcal)return;const labels={gym:"Gym Session",run:`Run${dist?` ${parseFloat(dist)}km`:""}`,walk:`Walk${dist?` ${parseFloat(dist)}km`:""}`};onAdd({id:Date.now(),type,label:labels[type],kcal:finalKcal,distanceKm:parseFloat(dist)||null,durationMin:parseFloat(dur)||null,time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})});};
   return(<Sheet onClose={onClose} title="Log Activity"><div style={{display:"flex",gap:6,marginBottom:type==="walk"?6:16}}>{[["🏋️ Gym","gym"],["🏃 Run","run"],["🚶 Walk","walk"]].map(([lbl,t])=>(<button key={t} onClick={()=>setType(t)} style={{flex:1,padding:"9px 4px",borderRadius:10,border:`1px solid ${type===t?C.lime:C.border}`,background:type===t?`${C.lime}20`:C.card,color:type===t?C.lime:C.muted,fontWeight:type===t?700:500,cursor:"pointer",fontSize:12}}>{lbl}</button>))}</div>
-    {type==="walk"&&<div style={{fontSize:11,color:C.muted,marginBottom:12,lineHeight:1.5,display:"flex",alignItems:"flex-start",gap:6}}><span style={{flexShrink:0}}>ⓘ</span><span>For a <b style={{color:C.text}}>deliberate walk</b> — a separate outing you went on. Don't also count those steps in Daily Steps. Use Daily Steps only for incidental movement (errands, around home) that doesn't get its own activity entry.</span></div>}<div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:9,marginBottom:6}}>{(type==="run"||type==="walk")&&<Field label="Distance km" value={dist} onChange={setDist} type="number" placeholder="10"/>}<Field label="Duration min" value={dur} onChange={setDur} type="number" placeholder="45"/><Field label="Active kcal" value={kcal} onChange={setKcal} type="number" placeholder={est?String(est):"0"}/></div><div style={{fontSize:10,color:C.muted,marginBottom:12,lineHeight:1.4}}>💡 Enter <b>active calories</b> (the burn above your resting baseline). On Garmin/Apple/Strava use "Active Calories", not "Total Calories" — your daily TDEE already counts the resting burn.</div>{est>0&&!parseFloat(kcal)&&<div style={{fontSize:11,color:C.muted,fontFamily:"monospace",marginBottom:10}}>Auto-estimated: ~{est} kcal</div>}<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 14px",marginBottom:12}}><div style={{fontSize:11,color:C.muted,marginBottom:8}}>Or scan Strava / Apple Fitness / Garmin screenshot</div><ImgZone imgs={imgs} setImgs={setImgs} compact/>{imgs.length>0&&<button onClick={scan} disabled={loading} style={{width:"100%",padding:"9px 0",borderRadius:8,background:loading?C.faint:C.orange,color:"#000",fontWeight:700,border:"none",cursor:loading?"default":"pointer",fontSize:13,marginTop:8}}>{loading?"Scanning…":"Read App Screenshot"}</button>}</div>{err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ff8080",marginBottom:10,wordBreak:"break-word"}}>{err}</div>}{finalKcal>0&&<div style={{background:"#140e03",border:"1px solid #2e1e07",borderRadius:10,padding:"10px 14px",marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{fontSize:12,color:C.muted}}>Adds to daily target</span><span style={{fontFamily:"monospace",fontSize:18,fontWeight:800,color:C.orange}}>+{finalKcal} kcal</span></div>}<div style={{display:"flex",gap:8}}><button onClick={onClose} style={{flex:1,padding:"11px 0",borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer"}}>Cancel</button><button onClick={confirm} disabled={!finalKcal} style={{flex:2,padding:"11px 0",borderRadius:10,background:finalKcal?C.lime:C.faint,color:"#000",fontWeight:700,border:"none",cursor:finalKcal?"pointer":"default",fontSize:15}}>Log Activity</button></div></Sheet>);
+    {type==="walk"&&<div style={{fontSize:11,color:C.muted,marginBottom:12,lineHeight:1.5,display:"flex",alignItems:"flex-start",gap:6}}><span style={{flexShrink:0}}>ⓘ</span><span>For a <b style={{color:C.text}}>deliberate walk</b> — a separate outing you went on. Don't also count those steps in Daily Steps. Use Daily Steps only for incidental movement (errands, around home) that doesn't get its own activity entry.</span></div>}<div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:9,marginBottom:6}}>{(type==="run"||type==="walk")&&<Field label="Distance km" value={dist} onChange={setDist} type="number" placeholder="10"/>}<Field label="Duration min" value={dur} onChange={setDur} type="number" placeholder="45"/><Field label="Active kcal" value={kcal} onChange={setKcal} type="number" placeholder={est?String(est):"0"}/></div><div style={{fontSize:10,color:C.muted,marginBottom:12,lineHeight:1.4}}>💡 Enter <b>active calories</b> (the burn above your resting baseline). On Garmin/Apple/Strava use "Active Calories", not "Total Calories" — your daily TDEE already counts the resting burn.</div>{est>0&&!parseFloat(kcal)&&<div style={{fontSize:11,color:C.muted,marginBottom:10,lineHeight:1.45}}><span style={{fontFamily:"monospace"}}>Auto-estimated: ~{est} kcal</span>{weightKg?<span> — net of resting burn, at {Math.round(weightKg)}kg.</span>:<span> — log a weight for a figure based on your bodyweight.</span>}</div>}<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 14px",marginBottom:12}}><div style={{fontSize:11,color:C.muted,marginBottom:8}}>Or scan Strava / Apple Fitness / Garmin screenshot</div><ImgZone imgs={imgs} setImgs={setImgs} compact/>{imgs.length>0&&<button onClick={scan} disabled={loading} style={{width:"100%",padding:"9px 0",borderRadius:8,background:loading?C.faint:C.orange,color:"#000",fontWeight:700,border:"none",cursor:loading?"default":"pointer",fontSize:13,marginTop:8}}>{loading?"Scanning…":"Read App Screenshot"}</button>}</div>{err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ff8080",marginBottom:10,wordBreak:"break-word"}}>{err}</div>}{finalKcal>0&&<div style={{background:"#140e03",border:"1px solid #2e1e07",borderRadius:10,padding:"10px 14px",marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{fontSize:12,color:C.muted}}>Adds to daily target</span><span style={{fontFamily:"monospace",fontSize:18,fontWeight:800,color:C.orange}}>+{finalKcal} kcal</span></div>}<div style={{display:"flex",gap:8}}><button onClick={onClose} style={{flex:1,padding:"11px 0",borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer"}}>Cancel</button><button onClick={confirm} disabled={!finalKcal} style={{flex:2,padding:"11px 0",borderRadius:10,background:finalKcal?C.lime:C.faint,color:"#000",fontWeight:700,border:"none",cursor:finalKcal?"pointer":"default",fontSize:15}}>Log Activity</button></div></Sheet>);
 }
 
 function CreatePrepSheet({products,onSave,onClose,apiKey}){
@@ -2510,6 +2742,20 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
       </div>
 
       {!profileOK&&<button onClick={onGoToSettings} style={{width:"100%",marginBottom:10,background:"#1a1400",border:`1px solid ${C.yellow}40`,borderRadius:10,padding:"9px 14px",display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}}><span style={{fontSize:12,color:C.yellow}}>Complete profile for personalized targets</span><span style={{color:C.muted,fontSize:12}}>→</span></button>}
+
+      {/* Target trustworthiness. The app used to fall back to a fixed table whenever the
+          profile couldn't support a calculation, and rendered those invented numbers exactly
+          like real ones — which is how an under-age, 14kg profile got told to eat 140g of
+          protein. Blocking problems now suppress the targets and say why; softer ones are
+          shown as a caution alongside real numbers. */}
+      {dt.unavailable&&<div style={{marginBottom:10,background:"#1a1400",border:`1px solid ${C.yellow}`,borderRadius:10,padding:"12px 14px"}}>
+        <div style={{fontSize:13,color:C.yellow,fontWeight:700,marginBottom:5}}>⚠ No targets to show</div>
+        {(dt.issues||[]).filter(i=>i.blocking).map((i,n)=>(<div key={n} style={{fontSize:12,color:C.text,lineHeight:1.5,marginBottom:4}}>{i.msg}</div>))}
+        <button onClick={onGoToSettings} style={{marginTop:6,padding:"9px 14px",minHeight:44,borderRadius:8,background:C.yellow,border:"none",color:"#000",fontWeight:700,fontSize:13}}>Open Settings</button>
+      </div>}
+      {!dt.unavailable&&(dt.issues||[]).filter(i=>!i.blocking).map((i,n)=>(
+        <div key={n} style={{marginBottom:10,background:`${C.yellow}12`,border:`1px solid ${C.yellow}55`,borderRadius:10,padding:"9px 13px",fontSize:12,color:C.yellow,lineHeight:1.5}}>⚠ {i.msg}</div>
+      ))}
 
       {/* Maintenance */}
       {profile.temporaryGoal&&(()=>{const daysLeft=Math.max(0,Math.round((new Date(profile.temporaryGoal.revertDate+"T12:00:00")-Date.now())/(24*3600*1000)));return(<div style={{marginBottom:10,background:`${C.orange}10`,border:`1px solid ${C.orange}40`,borderRadius:10,padding:"8px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontSize:11,color:C.orange,fontWeight:600}}>🔄 {profile.temporaryGoal.label}</div><div style={{fontSize:10,color:C.muted,marginTop:1}}>Reverts to <b>{profile.temporaryGoal.originalGoal}</b> {daysLeft===0?"today":`in ${daysLeft} day${daysLeft!==1?"s":""}`}</div></div><span style={{fontFamily:"monospace",fontSize:18,fontWeight:900,color:C.orange}}>{daysLeft}d</span></div>);})()}
@@ -2869,7 +3115,13 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
   const advanceExercise = (comboIdx, exId, loggedReps) => {
     updateAction(s=>{
       const c={...s.combos[comboIdx]};
-      c.exercises=c.exercises.map(x=>x.id===exId&&loggedReps!=null?{...x,sets:[...x.sets,{reps:loggedReps}]}:x);
+      // The weight in use at the moment the set is logged is stored ON the set, not just on
+      // the exercise. Weight is routinely dropped across sets (or ramped up), and with a
+      // single per-exercise field every set after a change silently rewrote history — the
+      // saved session showed one weight for the whole exercise.
+      c.exercises=c.exercises.map(x=>x.id===exId&&loggedReps!=null
+        ? {...x, sets:[...(x.sets||[]), {reps:loggedReps, weight:x.weight||null, unit:x.unit||"kg"}]}
+        : x);
       const combos=[...s.combos]; combos[comboIdx]=c;
       let nextEx=s.currentExInRound+1; let resting=false; let restStartedAt=s.restStartedAt;
       if(nextEx>=c.exercises.length){ nextEx=0; resting=true; restStartedAt=Date.now(); }
@@ -2919,17 +3171,52 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
     });
   };
 
+  // Correct a logged set. Mistyping reps was previously unrecoverable — the only way to fix
+  // "1" typed instead of "10" was to cancel the whole session.
+  const updateSet = (comboIdx, exId, setIdx, patch) => {
+    updateAction(s=>{
+      const c={...s.combos[comboIdx]};
+      c.exercises=c.exercises.map(x=>x.id!==exId?x:{...x, sets:(x.sets||[]).map((st,i)=>i===setIdx?{...st,...patch}:st)});
+      const combos=[...s.combos]; combos[comboIdx]=c;
+      return {...s, combos};
+    });
+  };
+  const deleteSet = (comboIdx, exId, setIdx) => {
+    updateAction(s=>{
+      const c={...s.combos[comboIdx]};
+      c.exercises=c.exercises.map(x=>x.id!==exId?x:{...x, sets:(x.sets||[]).filter((_,i)=>i!==setIdx)});
+      const combos=[...s.combos]; combos[comboIdx]=c;
+      return {...s, combos};
+    });
+  };
+
+  // An exercise counts as finished only once it has hit the configured set target, not after
+  // a single set. With no target configured there is nothing to count toward, so any logged
+  // set completes it — but the row shows "2/3 sets" either way, so progress is never a guess.
+  const targetSetsCfg = Number(gymSettings?.targetSetsPerCombo) || 0;
+  const isExComplete = ex => {
+    const n = (ex.sets||[]).length;
+    return targetSetsCfg > 0 ? n >= targetSetsCfg : n > 0;
+  };
+
   // Classify every exercise in the session for the always-visible list.
   //  current  — the one being logged right now
-  //  done     — has logged sets
-  //  skipped  — the cursor has moved past it but nothing was logged
+  //  done     — hit the set target
+  //  partial  — some sets logged, target not reached
+  //  skipped  — the cursor has moved past it and nothing was logged
   //  upcoming — still ahead
   const exStatus = (ci, ei, ex) => {
     if(ci===session.currentComboIdx && ei===session.currentExInRound && !session.resting) return "current";
-    if((ex.sets||[]).length>0) return "done";
+    if(isExComplete(ex)) return "done";
+    if((ex.sets||[]).length>0) return "partial";
     if(ci<session.currentComboIdx || (ci===session.currentComboIdx && ei<session.currentExInRound)) return "skipped";
     return "upcoming";
   };
+
+  // Completed work collapses out of the way by default so the plan shows what is left to do.
+  const [showCompleted, setShowCompleted] = useState(false);
+  const [editingSet, setEditingSet] = useState(null); // {exId, setIdx} currently being corrected
+  const completedCount = (session.combos||[]).reduce((n,c)=>n+(c.exercises||[]).filter(isExComplete).length, 0);
 
   // ── Drag-to-reorder ──
   // Pointer Events rather than HTML5 drag-and-drop: the latter does not fire on touch devices
@@ -3041,7 +3328,14 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       <div style={{fontSize:14,fontWeight:700,color:C.lime,marginBottom:10}}>🏁 Finish Session</div>
       <div style={{fontSize:12,color:C.muted,marginBottom:10}}>Duration: <span style={{color:C.text,fontFamily:"monospace",fontWeight:700}}>{fmtTime(elapsed)}</span></div>
       <Field label="Active kcal burned (optional)" value={finishKcal} onChange={setFinishKcal} type="number" placeholder={String(est)}/>
-      <div style={{fontSize:10,color:C.muted,marginTop:5,marginBottom:12}}>{finishKcal?"Using your entry.":`No entry — will use estimate: ~${est} kcal`}</div>
+      {/* The estimate is deliberately conservative — it is net of resting burn and uses a
+          session-wide 3.5 METs, because this number is added to what you're allowed to eat.
+          Saying so stops the low figure reading like a bug. */}
+      <div style={{fontSize:11,color:C.muted,marginTop:5,marginBottom:12,lineHeight:1.45}}>
+        {finishKcal
+          ? "Using your entry."
+          : <>No entry — will use <span style={{fontFamily:"monospace",color:C.text}}>~{est} kcal</span>{latestWeight?<> for {Math.round(latestWeight)}kg over {Math.round(elapsed/60)}min</>:null}. This counts only the burn <i>above</i> resting, and lifting is mostly rest between sets — so it's lower than most watches report.</>}
+      </div>
       <div style={{display:"flex",gap:8}}>
         <button onClick={()=>setShowFinish(false)} style={{flex:1,padding:"10px 0",borderRadius:9,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:13}}>← Back</button>
         <button onClick={()=>onFinish({durationSec:elapsed, kcal:parseFloat(finishKcal)||est, method:finishKcal?"manual":"estimated"})} style={{flex:2,padding:"10px 0",borderRadius:9,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:14}}>Save Session</button>
@@ -3092,6 +3386,15 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       <span>Session plan</span>
       <span style={{textTransform:"none",letterSpacing:0,fontFamily:"inherit"}}>⠿ drag to reorder</span>
     </div>
+    {/* Finished exercises fold away by default so the list answers "what's left" at a glance,
+        and expand when you want to review or correct what you already logged. */}
+    {completedCount>0&&(
+      <button onClick={()=>setShowCompleted(v=>!v)} aria-expanded={showCompleted}
+        style={{width:"100%",minHeight:44,marginBottom:9,padding:"9px 12px",borderRadius:10,background:`${C.lime}0f`,border:`1px solid ${C.lime}45`,color:C.lime,display:"flex",justifyContent:"space-between",alignItems:"center",fontSize:13,fontWeight:600}}>
+        <span>✓ {completedCount} completed</span>
+        <span style={{fontSize:12,color:C.muted}}>{showCompleted?"hide ▲":"show ▼"}</span>
+      </button>
+    )}
     {session.combos.map((c,ci)=>{
       const isCurCombo = ci===session.currentComboIdx;
       return(<div key={c.id} style={{marginBottom:10,border:`1px solid ${isCurCombo?C.orange+"55":C.border}`,borderRadius:11,padding:"8px 9px",background:isCurCombo?`${C.orange}08`:"transparent"}}>
@@ -3102,7 +3405,13 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
           {!isCurCombo&&<button onClick={()=>jumpToCombo(ci)} style={{fontSize:11,color:C.blue,background:"none",border:`1px solid ${C.blue}40`,borderRadius:6,padding:"3px 9px"}}>jump here</button>}
         </div>
         {c.exercises.length===0&&<div style={{fontSize:11,color:C.muted,fontStyle:"italic",padding:"6px 4px"}}>Empty — drag an exercise here.</div>}
+        {(()=>{const hidden=c.exercises.filter(isExComplete).length;
+          return (!showCompleted&&hidden>0)?<div style={{fontSize:11,color:C.muted,padding:"3px 4px 7px",fontStyle:"italic"}}>✓ {hidden} completed hidden</div>:null;})()}
         {c.exercises.map((ex,ei)=>{
+        // Completed rows are removed from the flow unless expanded. The current exercise is
+        // never hidden, even if it has already hit its target.
+        const hideThis = !showCompleted && isExComplete(ex) && !(ci===session.currentComboIdx && ei===session.currentExInRound && !session.resting);
+        if(hideThis) return null;
         const st = exStatus(ci,ei,ex);
         const isCurrent = st==="current";
         const isDone = st==="done";
@@ -3130,8 +3439,12 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
             <div style={{flex:1,minWidth:0}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",gap:8,marginBottom:2}}>
                 <span style={{fontSize:13,fontWeight:isCurrent?700:500,color:isCurrent?C.lime:isDone?C.muted:C.text,textDecoration:isSkipped?"line-through":"none"}}>{ex.name}</span>
-                {isDone&&<span style={{fontSize:10,color:C.lime,flexShrink:0}}>✓ done</span>}
-                {isSkipped&&<span style={{fontSize:10,color:C.muted,flexShrink:0}}>skipped</span>}
+                {/* Set progress rather than a binary badge: "done" used to appear after a
+                    single set, ignoring the set target configured in gym settings. */}
+                {isDone&&<span style={{fontSize:11,color:C.lime,flexShrink:0,fontWeight:600}}>✓ {(ex.sets||[]).length}{targetSetsCfg?`/${targetSetsCfg}`:""} sets</span>}
+                {st==="partial"&&<span style={{fontSize:11,color:C.yellow,flexShrink:0,fontWeight:600}}>{(ex.sets||[]).length}/{targetSetsCfg} sets</span>}
+                {isCurrent&&targetSetsCfg>0&&<span style={{fontSize:11,color:C.muted,flexShrink:0}}>{(ex.sets||[]).length}/{targetSetsCfg} sets</span>}
+                {isSkipped&&<span style={{fontSize:11,color:C.muted,flexShrink:0}}>skipped</span>}
               </div>
               {/* Weight is surfaced on completed rows so you can see what you lifted earlier in
                   the session without tapping anything. The active row is skipped — its weight
@@ -3161,7 +3474,40 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
               })}</div>
             </div>);
           })()}
-          {(ex.sets||[]).length>0&&<div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:isCurrent?8:0}}>{ex.sets.map((s,si)=>(<span key={si} style={{fontSize:11,fontFamily:"monospace",background:C.card,color:C.muted,padding:"2px 7px",borderRadius:5}}>Set {si+1}: {s.reps}</span>))}</div>}
+          {/* Logged sets. Each chip is tappable to correct it — a mistyped rep count used to be
+              permanent, with cancelling the whole session as the only way out. Weight is shown
+              per set because it legitimately varies between sets. */}
+          {(ex.sets||[]).length>0&&<div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:isCurrent?8:0,marginTop:4}}>
+            {ex.sets.map((s,si)=>{
+              const key=`${ex.id}:${si}`;
+              const setW=s.weight??ex.weight;
+              if(editingSet===key){
+                return(<div key={si} style={{width:"100%",background:C.card,border:`1px solid ${C.lime}`,borderRadius:8,padding:"9px 10px",marginBottom:4}}>
+                  <div style={{fontSize:11,color:C.muted,marginBottom:6}}>Set {si+1}</div>
+                  <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                    <input type="text" inputMode="decimal" aria-label={`Set ${si+1} weight`} defaultValue={setW||""} placeholder="kg"
+                      onChange={e=>updateSet(ci,ex.id,si,{weight:e.target.value.replace(",",".")})}
+                      style={{width:74,minHeight:44,background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"8px",color:C.text,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
+                    <span style={{fontSize:12,color:C.muted}}>{ex.unit||"kg"} ×</span>
+                    <input type="text" inputMode="numeric" aria-label={`Set ${si+1} reps`} defaultValue={s.reps ?? ""} placeholder="reps"
+                      onChange={e=>updateSet(ci,ex.id,si,{reps:parseInt(e.target.value)||0})}
+                      style={{width:74,minHeight:44,background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"8px",color:C.text,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
+                    <button onClick={()=>setEditingSet(null)} style={{minHeight:44,padding:"0 14px",borderRadius:7,background:C.lime,border:"none",color:"#000",fontWeight:700,fontSize:13}}>Done</button>
+                    <button onClick={()=>{deleteSet(ci,ex.id,si);setEditingSet(null);}} aria-label={`Delete set ${si+1}`}
+                      style={{minHeight:44,padding:"0 12px",borderRadius:7,background:"none",border:`1px solid ${C.red}55`,color:C.red,fontSize:13}}>Delete</button>
+                  </div>
+                </div>);
+              }
+              return(<button key={si} onClick={()=>setEditingSet(key)} aria-label={`Edit set ${si+1}`}
+                style={{fontSize:11,fontFamily:"monospace",background:C.card,color:C.muted,padding:"5px 9px",borderRadius:6,border:`1px solid ${C.border}`}}>
+                <span style={{color:C.muted}}>S{si+1}</span>{" "}
+                {setW?<span style={{color:C.lime}}>{setW}{ex.unit||"kg"}</span>:null}
+                {setW?<span style={{color:C.muted}}>×</span>:null}
+                <span style={{color:C.text,fontWeight:700}}>{s.reps}</span>
+                <span style={{color:C.muted,marginLeft:4}}>✎</span>
+              </button>);
+            })}
+          </div>}
           {isCurrent&&(<>
             <div style={{display:"flex",gap:7,alignItems:"center"}}>
               <input type="text" inputMode="decimal" aria-label="Weight" value={ex.weight||""} onChange={e=>update(s=>{const cc={...s.combos[ci]};cc.exercises=cc.exercises.map(x=>x.id===ex.id?{...x,weight:e.target.value.replace(",",".")}:x);const combos=[...s.combos];combos[ci]=cc;return{...s,combos};})} placeholder="kg" style={{width:70,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:7,padding:"8px",color:C.lime,fontFamily:"monospace",fontWeight:700,outline:"none",minHeight:44}}/>
@@ -3222,7 +3568,12 @@ function SessionExerciseList({session, compact=false}){
       <div key={i} style={{display:"flex",alignItems:"baseline",gap:8,fontSize:compact?11:12}}>
         <span style={{flex:1,minWidth:0,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{it.name}</span>
         {it.weight&&<span style={{fontFamily:"monospace",color:C.lime,fontWeight:700,flexShrink:0}}>{it.weight}{it.unit}</span>}
-        <span style={{fontFamily:"monospace",color:C.muted,flexShrink:0}}>{it.reps.join("/")}</span>
+        {/* Weight varied across sets, so pair each weight with its reps rather than hiding it. */}
+        <span style={{fontFamily:"monospace",color:C.muted,flexShrink:0}}>
+          {it.perSetWeights
+            ? it.reps.map((r,n)=>`${it.perSetWeights[n]||"?"}×${r}`).join(" ")
+            : it.reps.join("/")}
+        </span>
       </div>
     ))}
   </div>);
@@ -3893,7 +4244,7 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
         })}</>)}
     </div>
     {view==="today"&&<button onClick={()=>setModal(true)} style={{position:"absolute",bottom:16,right:16,width:54,height:54,borderRadius:"50%",background:C.orange,border:"none",cursor:"pointer",fontSize:28,color:"#000",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 0 20px ${C.orange}55`,zIndex:10}}>+</button>}
-    {modal&&<AddActSheet onAdd={addActivity} onClose={()=>setModal(false)} apiKey={profile.apiKey}/>}
+    {modal&&<AddActSheet onAdd={addActivity} onClose={()=>setModal(false)} apiKey={profile.apiKey} weightKg={latestWeightForGym}/>}
     {undoEntry&&<div style={{position:"absolute",bottom:80,left:16,right:16,background:C.card,border:`1px solid ${C.lime}`,borderRadius:10,padding:"10px 14px",display:"flex",alignItems:"center",justifyContent:"space-between",zIndex:20,boxShadow:`0 4px 16px rgba(0,0,0,0.4)`}}><div><div style={{fontSize:12,color:C.text,fontWeight:600}}>Deleted {undoEntry.entry.weight.toFixed(2)} kg</div><div style={{fontSize:10,color:C.muted}}>{new Date(undoEntry.entry.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</div></div><button onClick={undoDelete} style={{padding:"6px 12px",borderRadius:7,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>↶ Undo</button></div>}
   </div>);
 }
@@ -5045,7 +5396,7 @@ function TestAPIButton({apiKey}) {
     } catch(e) { setStatus({ok:false,msg:"Connection error: " + e.message}); setLoading(false); return; }
     if (data.error) { setStatus({ok:false,msg:"API error: "+data.error.message+" (type: "+data.error.type+")"}); setLoading(false); return; }
     if (!data.content) { setStatus({ok:false,msg:"No content field. Raw: "+JSON.stringify(data).slice(0,120)}); setLoading(false); return; }
-    setStatus({ok:true,msg:"Connected! Sonnet: "+VISION_MODEL+" | "+data.content[0]?.text}); setLoading(false);
+    setStatus({ok:true,msg:"Connected — "+VISION_MODEL+" replied: "+(data.content[0]?.text||"")}); setLoading(false);
   };
   return (<div>
     <button onClick={test} disabled={loading} style={{width:"100%",padding:"9px 0",borderRadius:8,background:loading?C.faint:C.blue,border:"none",color:"#000",fontWeight:700,cursor:loading?"default":"pointer",fontSize:13}}>{loading?"Testing…":"Test AI Connection"}</button>
@@ -5208,7 +5559,7 @@ function OnboardingScreen({onDone}){
 
   const finish=()=>{onDone({name:name.trim()||"User",birthday,heightCm:parseFloat(heightCm)||null,sex,activityLevel,goal,targetWeightKg:parseFloat(targetWeightKg)||null,goalNote:goalNote.trim(),apiKey:""},parseNum(startWeight)||null);};
 
-  return(<div style={{background:C.bg,height:"100vh",minHeight:"100dvh",maxHeight:"100dvh",display:"flex",flexDirection:"column",fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",maxWidth:520,margin:"0 auto",paddingTop:SAFE_TOP}}>
+  return(<div className="app-shell" style={{fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",paddingTop:SAFE_TOP}}>
     <style>{GLOBAL_CSS}</style>
     {/* Progress bar */}
     <div style={{height:3,background:C.dim,flexShrink:0}}>
@@ -5303,6 +5654,73 @@ function Nav({tab,setTab}){
       </button>);
     })}
   </nav>);
+}
+
+// ── Crash recovery ────────────────────────────────────────────────────────────
+// Everything in this app renders inside one component tree with no boundary, so a single
+// render error blanked the screen — and because the offending state (an in-progress gym
+// session) is written to storage on every change, the same error re-threw on every reload.
+// That is a permanent brick with no way out from inside the app, which is exactly what
+// happened with a malformed combo.
+//
+// This boundary catches the error, shows what broke, and offers escalating recovery that
+// starts by discarding the most likely culprit rather than the user's data. Export is offered
+// first at every level so nothing is ever thrown away blind.
+class ErrorBoundary extends React.Component {
+  constructor(props){ super(props); this.state = {error:null, info:null}; }
+  static getDerivedStateFromError(error){ return {error}; }
+  componentDidCatch(error, info){ this.setState({info}); try{ console.error("[crash]", error, info); }catch{} }
+
+  exportBackup = () => {
+    const dump = {};
+    for(let i=0;i<localStorage.length;i++){
+      const k = localStorage.key(i);
+      if(!k || !k.startsWith("fit_")) continue;
+      // Storage keys carry a doubled prefix ("fit_" + "fit_x"); strip one so the file matches
+      // the format Settings → Export writes and Import expects.
+      try{ dump[k.replace(/^fit_/, "")] = JSON.parse(localStorage.getItem(k)); }catch{}
+    }
+    const blob = new Blob([JSON.stringify(dump,null,2)], {type:"application/json"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `kcal-backup-${TODAY()}.json`;
+    a.click();
+  };
+  clearKeys = (keys) => { keys.forEach(k=>{ try{ localStorage.removeItem("fit_"+k); }catch{} }); window.location.reload(); };
+  hardReset = () => {
+    if(!this.state.confirmReset){ this.setState({confirmReset:true}); return; }
+    for(let i=localStorage.length-1;i>=0;i--){ const k=localStorage.key(i); if(k&&k.startsWith("fit_")) localStorage.removeItem(k); }
+    window.location.reload();
+  };
+
+  render(){
+    if(!this.state.error) return this.props.children;
+    const msg = String(this.state.error?.message || this.state.error);
+    const btn = (bg,bd,col)=>({width:"100%",padding:"12px 14px",minHeight:44,borderRadius:10,background:bg,border:`1px solid ${bd}`,color:col,fontWeight:600,fontSize:14,marginBottom:9,textAlign:"left"});
+    return(<div style={{background:C.bg,minHeight:"100vh",padding:"36px 20px",fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",maxWidth:520,margin:"0 auto",color:C.text}}>
+      <div style={{fontSize:34,marginBottom:10}}>🛠️</div>
+      <div style={{fontSize:22,fontWeight:800,marginBottom:8,letterSpacing:"-0.02em"}}>Something broke</div>
+      <div style={{fontSize:14,color:C.muted,lineHeight:1.6,marginBottom:16}}>
+        The app hit an error while drawing the screen. <b style={{color:C.text}}>Your data is still saved.</b> Start with the first option — it only discards an in-progress workout, which is the usual cause.
+      </div>
+      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 12px",marginBottom:18,fontFamily:"monospace",fontSize:11,color:C.red,wordBreak:"break-word",lineHeight:1.5}}>{msg}</div>
+
+      <button onClick={this.exportBackup} style={btn(C.card,C.lime,C.lime)}>
+        ⬇ Save a backup first<span style={{display:"block",fontSize:12,color:C.muted,fontWeight:400,marginTop:2}}>Downloads everything as a .json file</span>
+      </button>
+      <button onClick={()=>this.clearKeys(["fit_gym_active_session"])} style={btn(C.card,C.border,C.text)}>
+        1 · Discard the in-progress workout<span style={{display:"block",fontSize:12,color:C.muted,fontWeight:400,marginTop:2}}>Keeps every finished session, meal and weight</span>
+      </button>
+      <button onClick={()=>this.clearKeys(["fit_gym_active_session","fit_gym_templates","fit_gym_schedule"])} style={btn(C.card,C.border,C.text)}>
+        2 · Also reset the gym plan<span style={{display:"block",fontSize:12,color:C.muted,fontWeight:400,marginTop:2}}>Clears weekday templates and schedule. Session history is kept.</span>
+      </button>
+      <button onClick={()=>window.location.reload()} style={btn(C.card,C.border,C.muted)}>3 · Just reload and try again</button>
+      <button onClick={this.hardReset} style={btn(this.state.confirmReset?"#3a0a0a":"none",this.state.confirmReset?"#ff4040":C.border,this.state.confirmReset?"#ff6060":C.muted)}>
+        {this.state.confirmReset?"⚠ Tap again to erase everything":"4 · Erase all app data (last resort)"}
+        <span style={{display:"block",fontSize:12,color:C.muted,fontWeight:400,marginTop:2}}>{this.state.confirmReset?"This cannot be undone. Export above first.":"Only if nothing above works"}</span>
+      </button>
+    </div>);
+  }
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -5436,7 +5854,7 @@ function App(){
     }
     const rRecipes=await store.get("fit_recipes",[]);
     setProducts_(prods);setDayData_(day);setWeights_(wts);setMealPreps_(preps);setProfile_(prof);setProgressPhotos_(photos);setWeightPhases_(Array.isArray(phases)?phases:[]);
-    setGymSchedule_(Array.isArray(gSchedule)?gSchedule:[]);setGymTemplates_(gTemplates||{});setGymSessions_(Array.isArray(gSessions)?gSessions:[]);setGymSettings_(gSettings||{trainingMethod:"maintain",customNote:""});setGymActiveSession_(gActive||null);setGymExerciseLibrary_(gLibrary);setRecipes_(Array.isArray(rRecipes)?rRecipes:[]);
+    setGymSchedule_(Array.isArray(gSchedule)?gSchedule:[]);setGymTemplates_(gTemplates||{});setGymSessions_(Array.isArray(gSessions)?gSessions:[]);setGymSettings_(gSettings||{trainingMethod:"maintain",customNote:""});setGymActiveSession_(normalizeGymSession(gActive));setGymExerciseLibrary_(gLibrary);setRecipes_(Array.isArray(rRecipes)?rRecipes:[]);
     setToday(bootDate); // Make sure state matches what we just loaded
     lastLoadedDate.current = bootDate;
     setReady(true);
@@ -5469,7 +5887,9 @@ function App(){
   const setGymTemplates=useCallback(upd=>{setGymTemplates_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_templates",n);return n;});},[]);
   const setGymSessions=useCallback(upd=>{setGymSessions_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_sessions",n);return n;});},[]);
   const setGymSettings=useCallback(upd=>{setGymSettings_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_settings",n);return n;});},[]);
-  const setGymActiveSession=useCallback(upd=>{setGymActiveSession_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_active_session",n);return n;});},[]);
+  // Normalised on every write as well as on load: a reducer that produced a malformed combo
+  // would otherwise persist it and brick the next launch.
+  const setGymActiveSession=useCallback(upd=>{setGymActiveSession_(p=>{const raw=typeof upd==="function"?upd(p):upd;const n=raw?normalizeGymSession(raw):null;store.set("fit_gym_active_session",n);return n;});},[]);
   const setGymExerciseLibrary=useCallback(upd=>{setGymExerciseLibrary_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_exercise_library",n);return n;});},[]);
   const setRecipes=useCallback(upd=>{setRecipes_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_recipes",n);return n;});},[]);
   const latestWeight=weights[0]?.weight;
@@ -5501,7 +5921,7 @@ function App(){
   // 100dvh, not 100vh: on mobile browsers 100vh is measured against the viewport with the
   // URL bar *hidden*, so with the bar showing the layout is taller than the screen and the
   // bottom of the tab bar is pushed off-screen. 100vh stays as the fallback for old browsers.
-  return(<div style={{background:C.bg,height:"100vh",minHeight:"100dvh",maxHeight:"100dvh",display:"flex",flexDirection:"column",fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",maxWidth:520,margin:"0 auto",paddingTop:SAFE_TOP}}>
+  return(<div className="app-shell" style={{fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",paddingTop:SAFE_TOP}}>
     <style>{GLOBAL_CSS}</style>
     {rolloverBanner&&<div style={{background:`${C.lime}18`,borderBottom:`1px solid ${C.lime}`,padding:"10px 14px",display:"flex",alignItems:"center",gap:8}}>
       <span style={{fontSize:16}}>🌅</span>
@@ -5524,7 +5944,7 @@ function App(){
 }
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(<App/>);
+root.render(<ErrorBoundary><App/></ErrorBoundary>);
 // Tear down the boot splash now that React has mounted. Fade rather than cut, so the
 // hand-off from splash to app doesn't read as a flash of broken layout.
 (() => {

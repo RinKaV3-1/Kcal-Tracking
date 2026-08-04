@@ -97,6 +97,12 @@ const PRODUCT_CATEGORIES = [
   { id:"frozen",    label:"Frozen",             emoji:"🧊" },
 ];
 const catById=id=>PRODUCT_CATEGORIES.find(c=>c.id===id);
+// Product labels were never sorted anywhere — every list (the Food tab, every "pick a label"
+// picker) just rendered `products` in whatever order entries happened to land in storage
+// (scan order), which for a few hundred labels reads as effectively random. Applying this once
+// in setProducts (and once to whatever was already in storage at boot) fixes every consumer at
+// once instead of patching a dozen render sites individually.
+const sortProducts = arr => [...(arr||[])].sort((a,b)=>(a.name||"").localeCompare(b.name||"",undefined,{sensitivity:"base"}));
 // Recipe categories — shown as a dedicated icon on each recipe card even before opening it.
 const RECIPE_CATEGORIES = [
   { id:"breakfast", label:"Breakfast",   emoji:"🥞" },
@@ -121,6 +127,40 @@ function mealTypeByTime(d=new Date()){
   if(h>=11&&h<17)return"lunch";
   if(h>=17&&h<22)return"dinner";
   return"snack";
+}
+// ── Medication / supplement reminder windows ──────────────────────────────────
+// Same three-way split as mealTypeByTime's morning/day boundaries: 04:00–11:00 morning,
+// 11:00–17:00 day, 17:00–04:00 evening. The evening window spans midnight, so a medication
+// due at 22:00 and one due at 02:00 are the SAME occurrence — it must keep resolving to the
+// date the window opened (17:00) until 04:00 the next calendar day, not reset at midnight.
+const MED_WINDOWS = [
+  {id:"morning", label:"Morning", range:"04:00–11:00", emoji:"🌅"},
+  {id:"day",     label:"Day",     range:"11:00–17:00", emoji:"☀️"},
+  {id:"evening", label:"Evening", range:"17:00–04:00", emoji:"🌙"},
+];
+const medWindowById = id => MED_WINDOWS.find(w=>w.id===id);
+// Returns {window, date} for the reminder slot a given moment falls in. `date` is the
+// TODAY()-style day string the occurrence is filed under — for the evening window before
+// 04:00 that's YESTERDAY, since that slot opened the previous evening and hasn't closed yet.
+function medWindowFor(d=new Date()){
+  const h=d.getHours();
+  if(h>=4&&h<11) return {window:"morning", date:TODAY()};
+  if(h>=11&&h<17) return {window:"day", date:TODAY()};
+  if(h>=17) return {window:"evening", date:TODAY()};
+  const y=new Date(TODAY()+"T12:00:00"); y.setDate(y.getDate()-1);
+  return {window:"evening", date:y.toISOString().split("T")[0]};
+}
+// Medications due right now: active, scheduled for this window, scheduled for today's weekday
+// (or daily), and not already marked taken/skipped for this specific occurrence.
+function dueMedReminders(medications, medLog, now=new Date()){
+  const {window, date} = medWindowFor(now);
+  const weekday = new Date(date+"T12:00:00").getDay();
+  return (medications||[])
+    .filter(m=>m.active!==false)
+    .filter(m=>(m.windows||[]).includes(window))
+    .filter(m=>m.daily || (m.days||[]).includes(weekday))
+    .filter(m=>!(medLog||[]).some(l=>l.medId===m.id && l.date===date && l.window===window))
+    .map(m=>({...m, dueWindow:window, dueDate:date}));
 }
 // Override meal type from the content of what's being logged.
 // e.g. a drink → "drink", a protein bar/snack → "snack". Returns null if no strong signal.
@@ -215,6 +255,48 @@ const PRESETS = [
   { name:"ME2U Peanut Butter Protein Bar (60g)", kcal:365, p:30,    c:36,   f:14   },
   { name:"FitSpo Dubai Chocolate Style Bar (50g)", kcal:396, p:17.7, c:34.3, f:17.7 },
   { name:"Lidl Pea Crackers Cheese & Onion (70g pack)", kcal:411, p:24, c:47.9, f:11.7 },
+];
+// A handful of starter recipes so the Recipes tab isn't a blank "0 recipes" empty state on
+// first launch — mirrors PRESETS doing the same job for product labels. Generic and brand-free
+// (unlike PRESETS) since recipe ingredients are free text, not linked to a specific label.
+const DEFAULT_RECIPES = [
+  { name:"Protein Overnight Oats", category:"breakfast",
+    ingredients:["50g rolled oats","1 scoop protein powder","150ml milk","1 tbsp chia seeds","1 tsp honey","Handful of berries"],
+    instructions:[
+      {text:"Stir the oats, protein powder and chia seeds together in a jar."},
+      {text:"Pour in the milk and stir until no dry powder remains."},
+      {text:"Cover and refrigerate overnight (or at least 4 hours).",timerMin:null},
+      {text:"Top with honey and berries before eating."},
+    ]},
+  { name:"One-Pan Chicken & Rice", category:"main",
+    ingredients:["2 chicken breasts, diced","150g rice","1 onion, chopped","2 cloves garlic, minced","400ml chicken stock","1 bell pepper, sliced","1 tbsp olive oil","Salt & pepper"],
+    instructions:[
+      {text:"Heat the oil in a large pan and brown the chicken on all sides.",timerMin:5},
+      {text:"Add the onion and garlic, cook until softened.",timerMin:3},
+      {text:"Stir in the rice and pepper, then pour in the stock."},
+      {text:"Cover and simmer until the rice is tender and the liquid is absorbed.",timerMin:18},
+      {text:"Season to taste and serve."},
+    ]},
+  { name:"Greek Yogurt Berry Bowl", category:"snack",
+    ingredients:["200g Greek yogurt","Handful of mixed berries","1 tbsp honey","2 tbsp granola","1 tsp peanut butter"],
+    instructions:[
+      {text:"Spoon the yogurt into a bowl."},
+      {text:"Top with berries, granola and a drizzle of honey and peanut butter."},
+    ]},
+  { name:"Veggie Stir-Fry with Tofu", category:"main",
+    ingredients:["200g firm tofu, cubed","1 broccoli head, cut into florets","1 carrot, sliced","1 red pepper, sliced","2 tbsp soy sauce","1 tbsp sesame oil","1 clove garlic, minced","1 tsp grated ginger"],
+    instructions:[
+      {text:"Pan-fry the tofu in sesame oil until golden on all sides.",timerMin:6},
+      {text:"Add the garlic and ginger, stir for a minute.",timerMin:1},
+      {text:"Add the vegetables and stir-fry until just tender.",timerMin:5},
+      {text:"Pour in the soy sauce, toss to coat, and serve."},
+    ]},
+  { name:"Post-Workout Protein Shake", category:"drink",
+    ingredients:["1 scoop protein powder","250ml milk or water","1 banana","1 tbsp peanut butter","A few ice cubes"],
+    instructions:[
+      {text:"Add all ingredients to a blender."},
+      {text:"Blend until smooth and serve immediately."},
+    ]},
 ];
 // ── Color tokens ──────────────────────────────────────────────────────────────
 // Two tokens changed here for accessibility, and they are load-bearing because between them
@@ -344,66 +426,180 @@ const DEFAULT_EXERCISES = [
   {name:"Incline Dumbbell Press",category:"Push",muscleGroup:"Chest"},
   {name:"Incline Barbell Press",category:"Push",muscleGroup:"Chest"},
   {name:"Decline Bench Press",category:"Push",muscleGroup:"Chest"},
+  {name:"Decline Dumbbell Press",category:"Push",muscleGroup:"Chest"},
   {name:"Chest Press Machine",category:"Push",muscleGroup:"Chest"},
+  {name:"Incline Chest Press Machine",category:"Push",muscleGroup:"Chest"},
+  {name:"Smith Machine Bench Press",category:"Push",muscleGroup:"Chest"},
+  {name:"Smith Machine Incline Press",category:"Push",muscleGroup:"Chest"},
   {name:"Pec Deck / Chest Fly Machine",category:"Push",muscleGroup:"Chest"},
   {name:"Cable Chest Fly",category:"Push",muscleGroup:"Chest"},
+  {name:"Cable Crossover (High-to-Low)",category:"Push",muscleGroup:"Chest"},
+  {name:"Cable Crossover (Low-to-High)",category:"Push",muscleGroup:"Chest"},
+  {name:"Single-Arm Cable Fly",category:"Push",muscleGroup:"Chest"},
+  {name:"Incline Dumbbell Fly",category:"Push",muscleGroup:"Chest"},
+  {name:"Floor Press",category:"Push",muscleGroup:"Chest"},
+  {name:"Landmine Chest Press",category:"Push",muscleGroup:"Chest"},
+  {name:"Svend Press",category:"Push",muscleGroup:"Chest"},
   {name:"Push-Ups",category:"Push",muscleGroup:"Chest"},
-  // Push — Shoulders
+  {name:"Weighted Push-Ups",category:"Push",muscleGroup:"Chest"},
+  {name:"Deficit Push-Ups",category:"Push",muscleGroup:"Chest"},
+  {name:"Resistance Band Chest Press",category:"Push",muscleGroup:"Chest"},
+  // Push — Shoulders (Front Delts)
   {name:"Overhead Barbell Press",category:"Push",muscleGroup:"Front Delts"},
   {name:"Overhead Dumbbell Shoulder Press",category:"Push",muscleGroup:"Front Delts"},
+  {name:"Seated Dumbbell Press",category:"Push",muscleGroup:"Front Delts"},
   {name:"Arnold Press",category:"Push",muscleGroup:"Front Delts"},
+  {name:"Machine Shoulder Press",category:"Push",muscleGroup:"Front Delts"},
+  {name:"Smith Machine Shoulder Press",category:"Push",muscleGroup:"Front Delts"},
+  {name:"Push Press",category:"Push",muscleGroup:"Front Delts"},
+  {name:"Landmine Press",category:"Push",muscleGroup:"Front Delts"},
+  {name:"Cable Front Raise",category:"Push",muscleGroup:"Front Delts"},
+  {name:"Plate Front Raise",category:"Push",muscleGroup:"Front Delts"},
+  {name:"Front Raise",category:"Push",muscleGroup:"Front Delts"},
+  // Push — Shoulders (Side Delts)
   {name:"Dumbbell Side Raises",category:"Push",muscleGroup:"Side Delts"},
   {name:"Cable Lateral Raise",category:"Push",muscleGroup:"Side Delts"},
-  {name:"Front Raise",category:"Push",muscleGroup:"Front Delts"},
+  {name:"Leaning Cable Lateral Raise",category:"Push",muscleGroup:"Side Delts"},
+  {name:"Machine Lateral Raise",category:"Push",muscleGroup:"Side Delts"},
+  {name:"Cable Y-Raise",category:"Push",muscleGroup:"Side Delts"},
+  {name:"Upright Row (Cable)",category:"Push",muscleGroup:"Side Delts"},
+  {name:"Upright Row (Barbell)",category:"Push",muscleGroup:"Side Delts"},
+  {name:"Egyptian Lateral Raise",category:"Push",muscleGroup:"Side Delts"},
   // Push — Triceps
   {name:"Triceps Pushdown (Cable)",category:"Push",muscleGroup:"Triceps"},
+  {name:"Single-Arm Cable Pushdown",category:"Push",muscleGroup:"Triceps"},
   {name:"Overhead Triceps Extension (Cable)",category:"Push",muscleGroup:"Triceps"},
+  {name:"Overhead Triceps Extension (Dumbbell)",category:"Push",muscleGroup:"Triceps"},
+  {name:"Cable Rope Overhead Extension",category:"Push",muscleGroup:"Triceps"},
   {name:"Skull Crushers",category:"Push",muscleGroup:"Triceps"},
+  {name:"JM Press",category:"Push",muscleGroup:"Triceps"},
   {name:"Close-Grip Bench Press",category:"Push",muscleGroup:"Triceps"},
   {name:"Dips",category:"Push",muscleGroup:"Triceps"},
+  {name:"Weighted Dips",category:"Push",muscleGroup:"Triceps"},
+  {name:"Bench Dips",category:"Push",muscleGroup:"Triceps"},
+  {name:"Triceps Dip Machine",category:"Push",muscleGroup:"Triceps"},
+  {name:"Diamond Push-Ups",category:"Push",muscleGroup:"Triceps"},
+  {name:"Dumbbell Kickbacks",category:"Push",muscleGroup:"Triceps"},
   // Pull — Back/Lats
   {name:"Lat Pulldown",category:"Pull",muscleGroup:"Lats"},
+  {name:"Wide-Grip Lat Pulldown",category:"Pull",muscleGroup:"Lats"},
+  {name:"Neutral-Grip Lat Pulldown",category:"Pull",muscleGroup:"Lats"},
+  {name:"Single-Arm Lat Pulldown",category:"Pull",muscleGroup:"Lats"},
+  {name:"Straight-Arm Pulldown",category:"Pull",muscleGroup:"Lats"},
   {name:"Pull-Ups",category:"Pull",muscleGroup:"Lats"},
+  {name:"Wide-Grip Pull-Ups",category:"Pull",muscleGroup:"Lats"},
   {name:"Chin-Ups",category:"Pull",muscleGroup:"Lats"},
+  {name:"Assisted Pull-Up Machine",category:"Pull",muscleGroup:"Lats"},
+  {name:"Cable Pullover",category:"Pull",muscleGroup:"Lats"},
+  {name:"Dumbbell Pullover",category:"Pull",muscleGroup:"Lats"},
+  // Pull — Upper Back
   {name:"Seated Row (Cable)",category:"Pull",muscleGroup:"Upper Back"},
+  {name:"Wide-Grip Cable Row",category:"Pull",muscleGroup:"Upper Back"},
   {name:"One-Arm Dumbbell Row",category:"Pull",muscleGroup:"Upper Back"},
+  {name:"Chest-Supported Row",category:"Pull",muscleGroup:"Upper Back"},
+  {name:"Machine Row",category:"Pull",muscleGroup:"Upper Back"},
   {name:"Barbell Row",category:"Pull",muscleGroup:"Upper Back"},
+  {name:"Pendlay Row",category:"Pull",muscleGroup:"Upper Back"},
   {name:"T-Bar Row",category:"Pull",muscleGroup:"Upper Back"},
+  {name:"Meadows Row",category:"Pull",muscleGroup:"Upper Back"},
+  {name:"Inverted Row",category:"Pull",muscleGroup:"Upper Back"},
+  {name:"Dumbbell Row (Both Arms, Bench)",category:"Pull",muscleGroup:"Upper Back"},
+  // Pull — Traps
   {name:"Shrugs",category:"Pull",muscleGroup:"Traps"},
+  {name:"Barbell Shrugs",category:"Pull",muscleGroup:"Traps"},
+  {name:"Cable Shrugs",category:"Pull",muscleGroup:"Traps"},
+  {name:"Farmer's Carry",category:"Pull",muscleGroup:"Traps"},
   // Pull — Rear delts
   {name:"Face Pulls (Cable)",category:"Pull",muscleGroup:"Rear Delts"},
   {name:"Rear Delt Fly (Cable)",category:"Pull",muscleGroup:"Rear Delts"},
+  {name:"Bent-Over Dumbbell Rear Delt Fly",category:"Pull",muscleGroup:"Rear Delts"},
+  {name:"Chest-Supported Rear Delt Fly",category:"Pull",muscleGroup:"Rear Delts"},
   {name:"Reverse Pec Deck",category:"Pull",muscleGroup:"Rear Delts"},
-  // Pull — Biceps/Forearms
+  {name:"Band Pull-Apart",category:"Pull",muscleGroup:"Rear Delts"},
+  {name:"Incline Rear Delt Row",category:"Pull",muscleGroup:"Rear Delts"},
+  // Pull — Biceps
   {name:"Dumbbell Biceps Curls",category:"Pull",muscleGroup:"Biceps"},
   {name:"Barbell Curl",category:"Pull",muscleGroup:"Biceps"},
+  {name:"EZ-Bar Curl",category:"Pull",muscleGroup:"Biceps"},
   {name:"Hammer Curls",category:"Pull",muscleGroup:"Biceps"},
+  {name:"Cable Rope Hammer Curl",category:"Pull",muscleGroup:"Biceps"},
   {name:"Preacher Curl",category:"Pull",muscleGroup:"Biceps"},
+  {name:"Incline Dumbbell Curl",category:"Pull",muscleGroup:"Biceps"},
+  {name:"Concentration Curl",category:"Pull",muscleGroup:"Biceps"},
+  {name:"Spider Curl",category:"Pull",muscleGroup:"Biceps"},
   {name:"Cable Curl",category:"Pull",muscleGroup:"Biceps"},
+  {name:"Drag Curl",category:"Pull",muscleGroup:"Biceps"},
+  {name:"21s Bicep Curl",category:"Pull",muscleGroup:"Biceps"},
+  // Pull — Forearms
   {name:"Wrist Curls (palms up)",category:"Pull",muscleGroup:"Forearms"},
   {name:"Reverse Wrist Curls (palms down)",category:"Pull",muscleGroup:"Forearms"},
-  // Legs
+  {name:"Behind-the-Back Wrist Curl",category:"Pull",muscleGroup:"Forearms"},
+  {name:"Zottman Curl",category:"Pull",muscleGroup:"Forearms"},
+  {name:"Plate Pinch Hold",category:"Pull",muscleGroup:"Forearms"},
+  {name:"Dead Hang",category:"Pull",muscleGroup:"Forearms"},
+  // Legs — Quads
   {name:"Barbell Squat",category:"Legs",muscleGroup:"Quads"},
+  {name:"Front Squat",category:"Legs",muscleGroup:"Quads"},
+  {name:"Hack Squat",category:"Legs",muscleGroup:"Quads"},
+  {name:"Smith Machine Squat",category:"Legs",muscleGroup:"Quads"},
+  {name:"Goblet Squat",category:"Legs",muscleGroup:"Quads"},
   {name:"Leg Press",category:"Legs",muscleGroup:"Quads"},
+  {name:"Single-Leg Press",category:"Legs",muscleGroup:"Quads"},
+  {name:"Belt Squat",category:"Legs",muscleGroup:"Quads"},
   {name:"Reverse Lunges (DBs)",category:"Legs",muscleGroup:"Quads"},
   {name:"Walking Lunges",category:"Legs",muscleGroup:"Quads"},
   {name:"Bulgarian Split Squat",category:"Legs",muscleGroup:"Quads"},
-  {name:"Romanian Deadlift (DBs)",category:"Legs",muscleGroup:"Hamstrings"},
-  {name:"Conventional Deadlift",category:"Legs",muscleGroup:"Hamstrings"},
+  {name:"Step-Ups",category:"Legs",muscleGroup:"Quads"},
+  {name:"Sissy Squat",category:"Legs",muscleGroup:"Quads"},
   {name:"Leg Extension Machine",category:"Legs",muscleGroup:"Quads"},
+  // Legs — Hamstrings
+  {name:"Romanian Deadlift (DBs)",category:"Legs",muscleGroup:"Hamstrings"},
+  {name:"Romanian Deadlift (Barbell)",category:"Legs",muscleGroup:"Hamstrings"},
+  {name:"Conventional Deadlift",category:"Legs",muscleGroup:"Hamstrings"},
+  {name:"Stiff-Leg Deadlift",category:"Legs",muscleGroup:"Hamstrings"},
+  {name:"Single-Leg RDL",category:"Legs",muscleGroup:"Hamstrings"},
+  {name:"Good Mornings",category:"Legs",muscleGroup:"Hamstrings"},
+  {name:"Nordic Curl",category:"Legs",muscleGroup:"Hamstrings"},
+  {name:"Glute-Ham Raise",category:"Legs",muscleGroup:"Hamstrings"},
+  {name:"Lying Leg Curl Machine",category:"Legs",muscleGroup:"Hamstrings"},
+  {name:"Seated Leg Curl Machine",category:"Legs",muscleGroup:"Hamstrings"},
   {name:"Leg Curl Machine",category:"Legs",muscleGroup:"Hamstrings"},
+  // Legs — Glutes
   {name:"Hip Thrust",category:"Legs",muscleGroup:"Glutes"},
+  {name:"Barbell Hip Thrust",category:"Legs",muscleGroup:"Glutes"},
+  {name:"Single-Leg Hip Thrust",category:"Legs",muscleGroup:"Glutes"},
   {name:"Glute Bridge",category:"Legs",muscleGroup:"Glutes"},
+  {name:"Cable Glute Kickback",category:"Legs",muscleGroup:"Glutes"},
+  {name:"Hip Abduction Machine",category:"Legs",muscleGroup:"Glutes"},
+  {name:"Frog Pump",category:"Legs",muscleGroup:"Glutes"},
+  {name:"Sumo Deadlift",category:"Legs",muscleGroup:"Glutes"},
+  // Legs — Calves
   {name:"Calf Raise",category:"Legs",muscleGroup:"Calves"},
+  {name:"Seated Calf Raise",category:"Legs",muscleGroup:"Calves"},
+  {name:"Standing Calf Raise Machine",category:"Legs",muscleGroup:"Calves"},
+  {name:"Leg Press Calf Raise",category:"Legs",muscleGroup:"Calves"},
+  {name:"Donkey Calf Raise",category:"Legs",muscleGroup:"Calves"},
   // Abs
   {name:"Abs Hanging Leg Raises",category:"Abs",muscleGroup:"Abs"},
   {name:"ABS Weighted Sit Ups",category:"Abs",muscleGroup:"Abs"},
-  {name:"ABS Heel Touches",category:"Abs",muscleGroup:"Obliques"},
   {name:"Plank",category:"Abs",muscleGroup:"Abs"},
-  {name:"Cable Woodchopper",category:"Abs",muscleGroup:"Obliques"},
-  {name:"Russian Twists",category:"Abs",muscleGroup:"Obliques"},
+  {name:"Weighted Plank",category:"Abs",muscleGroup:"Abs"},
   {name:"Ab Wheel Rollout",category:"Abs",muscleGroup:"Abs"},
   {name:"Cable Crunch",category:"Abs",muscleGroup:"Abs"},
+  {name:"Decline Sit-Up",category:"Abs",muscleGroup:"Abs"},
+  {name:"V-Ups",category:"Abs",muscleGroup:"Abs"},
+  {name:"Toes to Bar",category:"Abs",muscleGroup:"Abs"},
+  {name:"Mountain Climbers",category:"Abs",muscleGroup:"Abs"},
+  {name:"Dragon Flag",category:"Abs",muscleGroup:"Abs"},
+  // Obliques
+  {name:"ABS Heel Touches",category:"Abs",muscleGroup:"Obliques"},
+  {name:"Cable Woodchopper",category:"Abs",muscleGroup:"Obliques"},
+  {name:"Russian Twists",category:"Abs",muscleGroup:"Obliques"},
+  {name:"Side Plank",category:"Abs",muscleGroup:"Obliques"},
+  {name:"Side Bends (Dumbbell)",category:"Abs",muscleGroup:"Obliques"},
+  {name:"Landmine Rotation",category:"Abs",muscleGroup:"Obliques"},
+  {name:"Pallof Press",category:"Abs",muscleGroup:"Obliques"},
+  {name:"Bicycle Crunches",category:"Abs",muscleGroup:"Obliques"},
 ];
 // ── Energy model ──────────────────────────────────────────────────────────────
 // Every number produced here is NET of resting metabolism, and every number scales with
@@ -510,11 +706,16 @@ function suggestProgression(exerciseName, gymSessions, method) {
   }
   if (recent.length < 2) return null;
   const [last, prev] = recent;
+  // Weight is stored as a string (it comes straight from a text input), so it must be parsed
+  // before arithmetic — "80"+2.5 string-concatenates to "802.5", which has no .toFixed and
+  // crashed the whole session panel.
+  const lastW = parseFloat(last.weight);
+  const prevW = parseFloat(prev.weight);
   const lastAllStrong = last.sets.every(s => (s.reps||0) >= 10);
-  const sameWeight = last.weight === prev.weight;
+  const sameWeight = !isNaN(lastW) && lastW === prevW;
   if (lastAllStrong && sameWeight) {
-    const step = last.weight >= 30 ? 2.5 : last.weight >= 10 ? 1.25 : 0.5;
-    return `Last 2 sessions all cleared 10+ reps at ${last.weight}kg — try ${(last.weight+step).toFixed(2).replace(/\.?0+$/,"")}kg next time.`;
+    const step = lastW >= 30 ? 2.5 : lastW >= 10 ? 1.25 : 0.5;
+    return `Last 2 sessions all cleared 10+ reps at ${lastW}kg — try ${(lastW+step).toFixed(2).replace(/\.?0+$/,"")}kg next time.`;
   }
   return null;
 }
@@ -1264,17 +1465,54 @@ function Ring({value,max,color,label}){
     <span style={{fontSize:10,color:over?ringCol:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",fontWeight:over?700:400}}>{label}</span>
   </div>);
 }
+// A countdown ring that visually drains as time runs out — used for the cooldown stretch
+// timer, which previously showed only a bare number. Same SVG mechanic as Ring above, but the
+// stroke represents time REMAINING (shrinks toward 0) rather than a value climbing toward a
+// target, and it flips to a "done" fill once time is up instead of an over-target warning.
+function TimerRing({remaining,total,label,size=120}){
+  const s=size,r=(s/2)-9,circ=2*Math.PI*r;
+  const done=remaining<=0;
+  const pct=total>0?Math.max(0,Math.min(remaining/total,1)):0;
+  const ringCol=done?C.lime:C.blue;
+  return(<div role="img" aria-label={done?`${label}: time's up`:`${label}: ${remaining} seconds remaining of ${total}`} style={{position:"relative",width:s,height:s,margin:"0 auto"}}>
+    <svg width={s} height={s} style={{transform:"rotate(-90deg)"}} aria-hidden="true">
+      <circle cx={s/2} cy={s/2} r={r} fill="none" stroke={C.dim} strokeWidth={7}/>
+      <circle cx={s/2} cy={s/2} r={r} fill="none" stroke={ringCol} strokeWidth={7}
+        strokeDasharray={`${pct*circ} ${circ}`} strokeLinecap="round"
+        style={{transition:"stroke-dasharray 1s linear, stroke .3s ease"}}/>
+    </svg>
+    <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
+      <span style={{fontSize:size>=100?34:24,fontWeight:900,fontFamily:"monospace",color:done?C.lime:C.text,lineHeight:1}}>{`${Math.floor(remaining/60)}:${String(remaining%60).padStart(2,"0")}`}</span>
+    </div>
+  </div>);
+}
 function Chip({val,label,color}){return <span style={{fontFamily:"monospace",fontSize:11}}><span style={{color}}>{Math.round(val)}</span><span style={{color:C.muted}}>{label}</span></span>;}
 // Shown under a picked product to explain where the pre-filled gram amount came from.
 // Products flagged "always eaten whole" say so explicitly — otherwise the pre-filled number
 // looks like an arbitrary default rather than the deliberate one the user configured.
-function PortionHint({prod}){
+// Shows the known serving/pack size for a product, and — when `onUse` is passed — one-tap
+// buttons to set the grams field to either. Previously the "use" button lived inline at each
+// call site with an inverted `!(servingG||packageG)` condition, so it only ever appeared when
+// there was NO serving to use; the working button was hidden and there was no way to log a
+// whole pack in one tap at all. Centralising it here fixes that once instead of at every site.
+function PortionHint({prod,onUse}){
   if(!prod) return null;
-  if(prod.alwaysFullPack && prod.packSizeG)
-    return <div style={{fontSize:11,color:C.lime,marginBottom:6,fontStyle:"italic"}}>📦 Always eaten whole — full {prod.packSizeG}g pack</div>;
   const serving = prod.servingG || prod.packageG;
-  if(!serving) return null;
-  return <div style={{fontSize:11,color:C.lime,marginBottom:6,fontStyle:"italic"}}>🍽 Usual serving: {serving}g{prod.packSizeG?` · pack ${prod.packSizeG}g`:""}</div>;
+  const pack = prod.packSizeG;
+  if(prod.alwaysFullPack && pack){
+    return(<div style={{marginBottom:6}}>
+      <div style={{fontSize:11,color:C.lime,fontStyle:"italic"}}>📦 Always eaten whole — full {pack}g pack</div>
+      {onUse&&<button type="button" onClick={()=>onUse(String(pack))} style={{marginTop:3,background:"none",border:`1px solid ${C.lime}60`,color:C.lime,fontSize:9,cursor:"pointer",padding:"2px 7px",borderRadius:4}}>use {pack}g</button>}
+    </div>);
+  }
+  if(!serving && !pack) return null;
+  return(<div style={{marginBottom:6}}>
+    <div style={{fontSize:11,color:C.lime,fontStyle:"italic"}}>🍽 Usual serving: {serving?`${serving}g`:"—"}{pack?` · pack ${pack}g`:""}</div>
+    {onUse&&(serving||pack)&&<div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:3}}>
+      {serving?<button type="button" onClick={()=>onUse(String(serving))} style={{background:"none",border:`1px solid ${C.border}`,color:C.lime,fontSize:9,cursor:"pointer",padding:"2px 7px",borderRadius:4}}>use serving {serving}g</button>:null}
+      {pack?<button type="button" onClick={()=>onUse(String(pack))} style={{background:"none",border:`1px solid ${C.orange}60`,color:C.orange,fontSize:9,cursor:"pointer",padding:"2px 7px",borderRadius:4}}>📦 use whole pack {pack}g</button>:null}
+    </div>}
+  </div>);
 }
 function InfoTip({text}){
   const [open,setOpen]=useState(false);
@@ -1497,6 +1735,7 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
   const [expandedIdx, setExpandedIdx] = useState(null);
   const [swapIdx, setSwapIdx] = useState(null);
   const [swapSearch, setSwapSearch] = useState("");
+  const [swapCat, setSwapCat] = useState(null); // category filter id for the swap-ingredient search
   const [swapDescMode, setSwapDescMode] = useState(false); // true = show "describe it" input
   const [swapDescText, setSwapDescText] = useState(""); // user-provided description for AI estimate
   const [estimatingIdx, setEstimatingIdx] = useState(null);
@@ -1504,6 +1743,7 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
   // Add-ingredient state: pick a label OR enter manually
   const [addMode, setAddMode] = useState(null); // null | "label" | "manual"
   const [addSearch, setAddSearch] = useState("");
+  const [addCat, setAddCat] = useState(null); // category filter id for the add-from-label search
   const [addPickedProd, setAddPickedProd] = useState(null);
   const [addPickedG, setAddPickedG] = useState("");
   const [addManual, setAddManual] = useState({name:"",weightG:"",kcal:"",protein:"",carbs:"",fat:""});
@@ -1654,9 +1894,10 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
     }));
   };
 
-  const filteredProds = swapSearch.length > 0
-    ? (products || []).filter(p => p.name.toLowerCase().includes(swapSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(swapSearch.toLowerCase())).slice(0, 12)
-    : (products || []).slice(0, 12);
+  const filteredProds = (swapSearch.length > 0
+    ? (products || []).filter(p => p.name.toLowerCase().includes(swapSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(swapSearch.toLowerCase()))
+    : (products || [])
+  ).filter(p => !swapCat || (p.categories||[]).includes(swapCat)).slice(0, 12);
 
   const totals = ingredients.reduce((acc, ing) => {
     const m = macrosFor(ing);
@@ -1808,11 +2049,15 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
                     <input value={swapSearch} onChange={e => setSwapSearch(e.target.value)} placeholder="Search your product labels…"
                       style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:13,outline:"none",marginBottom:7}}
                       autoFocus/>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:7}}>
+                      <button type="button" onClick={()=>setSwapCat(null)} style={{padding:"3px 8px",borderRadius:12,border:`1px solid ${!swapCat?C.lime:C.border}`,background:!swapCat?`${C.lime}18`:C.bg,color:!swapCat?C.lime:C.muted,cursor:"pointer",fontSize:9.5}}>All</button>
+                      {PRODUCT_CATEGORIES.filter(cat=>products.some(p=>(p.categories||[]).includes(cat.id))).map(cat=>{const on=swapCat===cat.id;return(<button key={cat.id} type="button" onClick={()=>setSwapCat(on?null:cat.id)} style={{padding:"3px 8px",borderRadius:12,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:9.5}}>{cat.emoji}</button>);})}
+                    </div>
                     <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:200,overflowY:"auto",marginBottom:8}}>
                       {filteredProds.map(prod => (
                         <button key={prod.name} type="button" onClick={() => swapWith(i, prod)}
                           style={{padding:"9px 12px",borderRadius:8,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",userSelect:"none",textAlign:"left"}}>
-                          <span style={{fontSize:13,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{prod.name}</span>
+                          <span style={{fontSize:13,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>
                           <span style={{fontFamily:"monospace",fontSize:11,color:C.muted,flexShrink:0,marginLeft:10}}>{prod.kcal}k {prod.p}P</span>
                         </button>
                       ))}
@@ -1847,18 +2092,23 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
           </div>
           {!addPickedProd?(<>
             <input value={addSearch} onChange={e=>setAddSearch(e.target.value)} placeholder="Search labels…" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:13,outline:"none",marginBottom:7}} autoFocus/>
+            <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:7}}>
+              <button type="button" onClick={()=>setAddCat(null)} style={{padding:"3px 8px",borderRadius:12,border:`1px solid ${!addCat?C.lime:C.border}`,background:!addCat?`${C.lime}18`:C.bg,color:!addCat?C.lime:C.muted,cursor:"pointer",fontSize:9.5}}>All</button>
+              {PRODUCT_CATEGORIES.filter(cat=>products.some(p=>(p.categories||[]).includes(cat.id))).map(cat=>{const on=addCat===cat.id;return(<button key={cat.id} type="button" onClick={()=>setAddCat(on?null:cat.id)} style={{padding:"3px 8px",borderRadius:12,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:9.5}}>{cat.emoji}</button>);})}
+            </div>
             <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:200,overflowY:"auto"}}>
-              {(products||[]).filter(p=>!addSearch||p.name.toLowerCase().includes(addSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(addSearch.toLowerCase())).slice(0,12).map(prod=>(
+              {(products||[]).filter(p=>(!addSearch||p.name.toLowerCase().includes(addSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(addSearch.toLowerCase()))&&(!addCat||(p.categories||[]).includes(addCat))).slice(0,12).map(prod=>(
                 <button key={prod.name} type="button" onClick={()=>{setAddPickedProd(prod);setAddPickedG(defaultGramsFor(prod));}} style={{padding:"7px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
-                  <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{prod.name}</span>
+                  <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>
                   <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
                 </button>
               ))}
-              {(products||[]).filter(p=>!addSearch||p.name.toLowerCase().includes(addSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(addSearch.toLowerCase())).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match.</div>}
+              {(products||[]).filter(p=>(!addSearch||p.name.toLowerCase().includes(addSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(addSearch.toLowerCase()))&&(!addCat||(p.categories||[]).includes(addCat))).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match.</div>}
             </div>
           </>):(<div>
             <div style={{fontSize:12,color:C.lime,marginBottom:5,fontWeight:600}}>{addPickedProd.name}</div>
             <div style={{fontSize:10,color:C.muted,marginBottom:6,fontFamily:"monospace"}}>{addPickedProd.kcal} kcal · {addPickedProd.p}g P · {addPickedProd.c}g C · {addPickedProd.f}g F per 100g</div>
+            {<PortionHint prod={addPickedProd} onUse={setAddPickedG}/>}
             <div style={{display:"flex",gap:7,alignItems:"center"}}>
               <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" value={addPickedG} onChange={e=>setAddPickedG(e.target.value.replace(",","."))} placeholder="100" style={{width:80,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:6,padding:"6px 9px",color:C.lime,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none"}} autoFocus/>
               <span style={{fontSize:11,color:C.muted}}>g</span>
@@ -2175,8 +2425,7 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
         </>):(<div>
           <div style={{fontSize:12,color:C.lime,marginBottom:4,fontWeight:600}}>{pickedProd.name}</div>
           <div style={{fontSize:10,color:C.muted,marginBottom:6,fontFamily:"monospace"}}>{pickedProd.kcal} kcal · {pickedProd.p}g P · {pickedProd.c}g C · {pickedProd.f}g F per 100g</div>
-          {<PortionHint prod={pickedProd}/>}
-          {!(pickedProd.servingG||pickedProd.packageG)&&<div style={{fontSize:10,color:C.muted,marginBottom:6}}>Serving: {pickedProd.servingG||pickedProd.packageG}g <button type="button" onClick={()=>setPickedG(String(pickedProd.servingG||pickedProd.packageG))} style={{background:"none",border:`1px solid ${C.border}`,color:C.lime,fontSize:9,cursor:"pointer",padding:"1px 6px",borderRadius:4,marginLeft:4}}>use</button></div>}
+          {<PortionHint prod={pickedProd} onUse={setPickedG}/>}
           <div style={{display:"flex",gap:7,alignItems:"center",marginBottom:8}}>
             <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" value={pickedG} onChange={e=>setPickedG(e.target.value.replace(",","."))} placeholder="100" autoFocus style={{width:70,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:6,padding:"6px 9px",color:C.lime,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
             <span style={{fontSize:11,color:C.muted}}>g</span>
@@ -2240,6 +2489,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
   const [manualLabels,setManualLabels]=useState([]); // [{id, name, weightG, kcal, protein, carbs, fat}]
   const [mPickOpen,setMPickOpen]=useState(false);
   const [mPickSearch,setMPickSearch]=useState("");
+  const [mPickCat,setMPickCat]=useState(null); // category filter id
   const [mPickedProd,setMPickedProd]=useState(null);
   const [mPickedG,setMPickedG]=useState("");
   // Dedicated labels-only mode state (issue 2)
@@ -2363,8 +2613,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
       </>):(<div style={{background:C.faint,borderRadius:10,padding:"12px 14px"}}>
         <div style={{fontSize:13,fontWeight:700,color:C.lime,marginBottom:3}}>{lblPicked.name}</div>
         <div style={{fontSize:10,color:C.muted,marginBottom:6,fontFamily:"monospace"}}>{lblPicked.kcal} kcal · {lblPicked.p}g P · {lblPicked.c}g C · {lblPicked.f}g F per 100g</div>
-        {<PortionHint prod={lblPicked}/>}
-        {!(lblPicked.servingG||lblPicked.packageG)&&<div style={{fontSize:10,color:C.muted,marginBottom:6}}>Serving: {lblPicked.servingG||lblPicked.packageG}g <button type="button" onClick={()=>setLblG(String(lblPicked.servingG||lblPicked.packageG))} style={{background:"none",border:`1px solid ${C.border}`,color:C.lime,fontSize:9,cursor:"pointer",padding:"1px 6px",borderRadius:4,marginLeft:4}}>use full</button></div>}
+        {<PortionHint prod={lblPicked} onUse={setLblG}/>}
         <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:8}}>
           <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" value={lblG} onChange={e=>setLblG(e.target.value.replace(",","."))} placeholder="grams" autoFocus style={{width:80,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:7,padding:"7px 9px",color:C.lime,fontSize:15,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
           <span style={{fontSize:11,color:C.muted}}>g</span>
@@ -2425,20 +2674,23 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
         </div>
         {!mPickedProd?(<>
           <input value={mPickSearch} onChange={e=>setMPickSearch(e.target.value)} placeholder="Search your product labels…" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:13,outline:"none",marginBottom:7}} autoFocus/>
+          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:7}}>
+            <button type="button" onClick={()=>setMPickCat(null)} style={{padding:"3px 8px",borderRadius:12,border:`1px solid ${!mPickCat?C.lime:C.border}`,background:!mPickCat?`${C.lime}18`:C.bg,color:!mPickCat?C.lime:C.muted,cursor:"pointer",fontSize:9.5}}>All</button>
+            {PRODUCT_CATEGORIES.filter(cat=>products.some(p=>(p.categories||[]).includes(cat.id))).map(cat=>{const on=mPickCat===cat.id;return(<button key={cat.id} type="button" onClick={()=>setMPickCat(on?null:cat.id)} style={{padding:"3px 8px",borderRadius:12,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:9.5}}>{cat.emoji}</button>);})}
+          </div>
           <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:240,overflowY:"auto"}}>
-            {(products||[]).filter(p=>!mPickSearch||p.name.toLowerCase().includes(mPickSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(mPickSearch.toLowerCase())).slice(0,15).map(prod=>(
+            {(products||[]).filter(p=>(!mPickSearch||p.name.toLowerCase().includes(mPickSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(mPickSearch.toLowerCase()))&&(!mPickCat||(p.categories||[]).includes(mPickCat))).slice(0,15).map(prod=>(
               <button key={prod.name} type="button" onClick={()=>{setMPickedProd(prod);setMPickedG(defaultGramsFor(prod));}} style={{padding:"8px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
-                <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{prod.name}</span>
+                <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>
                 <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
               </button>
             ))}
-            {(products||[]).filter(p=>!mPickSearch||p.name.toLowerCase().includes(mPickSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(mPickSearch.toLowerCase())).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match.</div>}
+            {(products||[]).filter(p=>(!mPickSearch||p.name.toLowerCase().includes(mPickSearch.toLowerCase())||(p.subtitle||"").toLowerCase().includes(mPickSearch.toLowerCase()))&&(!mPickCat||(p.categories||[]).includes(mPickCat))).length===0&&<div style={{fontSize:11,color:C.muted,padding:"4px 0"}}>No labels match.</div>}
           </div>
         </>):(<div>
           <div style={{fontSize:12,color:C.lime,marginBottom:7,fontWeight:600}}>{mPickedProd.name}</div>
           <div style={{fontSize:10,color:C.muted,marginBottom:6,fontFamily:"monospace"}}>{mPickedProd.kcal} kcal · {mPickedProd.p}g P · {mPickedProd.c}g C · {mPickedProd.f}g F per 100g</div>
-          {mPickedProd.servingG||mPickedProd.servingG||mPickedProd.packageG&&<div style={{fontSize:10,color:C.lime,marginBottom:6,fontStyle:"italic"}}>🍽 Usual serving size — defaults to {mPickedProd.servingG||mPickedProd.packageG}g</div>}
-          {mPickedProd.servingG||mPickedProd.packageG&&!false&&<div style={{fontSize:10,color:C.muted,marginBottom:6}}>Serving: {mPickedProd.servingG||mPickedProd.packageG}g <button type="button" onClick={()=>setMPickedG(String(mPickedProd.servingG||mPickedProd.packageG))} style={{background:"none",border:`1px solid ${C.border}`,color:C.lime,fontSize:9,cursor:"pointer",padding:"1px 6px",borderRadius:4,marginLeft:4}}>use</button></div>}
+          {<PortionHint prod={mPickedProd} onUse={setMPickedG}/>}
           <div style={{display:"flex",gap:7,alignItems:"center"}}>
             <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" value={mPickedG} onChange={e=>setMPickedG(e.target.value.replace(",","."))} placeholder="100" style={{width:80,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:6,padding:"6px 9px",color:C.lime,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none"}} autoFocus/>
             <span style={{fontSize:11,color:C.muted}}>g</span>
@@ -2625,8 +2877,7 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
       </>):(<div>
         <div style={{fontSize:12,color:C.lime,marginBottom:4,fontWeight:600}}>{pickedProd.name}</div>
         <div style={{fontSize:10,color:C.muted,marginBottom:6,fontFamily:"monospace"}}>{pickedProd.kcal} kcal · {pickedProd.p}g P · {pickedProd.c}g C · {pickedProd.f}g F per 100g</div>
-        {<PortionHint prod={pickedProd}/>}
-        {!(pickedProd.servingG||pickedProd.packageG)&&<div style={{fontSize:10,color:C.muted,marginBottom:6}}>Serving: {pickedProd.servingG||pickedProd.packageG}g <button type="button" onClick={()=>setPickedG(String(pickedProd.servingG||pickedProd.packageG))} style={{background:"none",border:`1px solid ${C.border}`,color:C.lime,fontSize:9,cursor:"pointer",padding:"1px 6px",borderRadius:4,marginLeft:4}}>use</button></div>}
+        {<PortionHint prod={pickedProd} onUse={setPickedG}/>}
         <div style={{display:"flex",gap:7,alignItems:"center"}}>
           <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" value={pickedG} onChange={e=>setPickedG(e.target.value.replace(",","."))} placeholder="100" style={{width:80,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:6,padding:"6px 9px",color:C.lime,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none"}} autoFocus/>
           <span style={{fontSize:11,color:C.muted}}>g (raw/dry)</span>
@@ -2674,8 +2925,13 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
   </Sheet>);
 }
 // ── Today Tab ─────────────────────────────────────────────────────────────────
-function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProducts,profile,latestWeight,weights,setWeights,onGoToSettings}){
+function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProducts,profile,latestWeight,weights,setWeights,onGoToSettings,medications,medLog,onMarkMed}){
   const [modal,setModal]=useState(null);const [wInput,setWInput]=useState("");
+  // Re-render on the minute so a reminder appears/disappears exactly when its window opens or
+  // closes, without needing any user action to refresh the tab.
+  const [medTick,setMedTick]=useState(0);
+  useEffect(()=>{const id=setInterval(()=>setMedTick(t=>t+1),60000);return()=>clearInterval(id);},[]);
+  const dueMeds=dueMedReminders(medications,medLog);
   const [expandedMealId,setExpandedMealId]=useState(null);
   const [editingMealId,setEditingMealId]=useState(null);
   const extraBurn=(dayData.activities||[]).reduce((s,a)=>s+a.kcal,0)+(dayData.burnedExtra||0);
@@ -2724,6 +2980,30 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
           {profile.goal&&<div style={{fontSize:11,background:`${gc}20`,color:gc,padding:"4px 10px",borderRadius:20,fontWeight:700}}>{profile.goal==="cut"?"Cut":profile.goal==="bulk"?"Bulk":"Maintain"}</div>}
         </div>
       </div>
+
+      {/* Medication/supplement reminders — due for the current time window, and not yet
+          marked taken or skipped. Disappears the moment either button is tapped, and stays
+          gone until the next window/day brings the same medication due again. */}
+      {dueMeds.length>0&&<div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:10}}>
+        {dueMeds.map(med=>{
+          const win=medWindowById(med.dueWindow);
+          const low=med.packageSize&&med.remaining!=null&&med.remaining<=(med.dosePerTake||1);
+          return(<div key={med.id} style={{background:`${C.orange}10`,border:`1px solid ${C.orange}55`,borderRadius:12,padding:"11px 14px"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:10,color:C.orange,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:2}}>{win?.emoji} {win?.label} reminder</div>
+                <div style={{fontSize:14,fontWeight:700,color:C.text}}>💊 {med.name}</div>
+                <div style={{fontSize:11,color:C.muted,marginTop:2}}>{med.dosePerTake||1} dose{(med.dosePerTake||1)!==1?"s":""}{med.notes?` · ${med.notes}`:""}</div>
+                {med.packageSize?<div style={{fontSize:11,marginTop:2,color:low?C.red:C.muted}}>{low?"⚠ ":""}{med.remaining??med.packageSize} left in package</div>:null}
+              </div>
+            </div>
+            <div style={{display:"flex",gap:8,marginTop:9}}>
+              <button onClick={()=>onMarkMed(med,"skipped")} style={{flex:1,padding:"9px 0",borderRadius:8,background:"none",border:`1px solid ${C.border}`,color:C.muted,fontWeight:600,cursor:"pointer",fontSize:12}}>Skip</button>
+              <button onClick={()=>onMarkMed(med,"taken")} style={{flex:2,padding:"9px 0",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:13}}>✓ Taken</button>
+            </div>
+          </div>);
+        })}
+      </div>}
 
       {/* Weight card */}
       <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"10px 14px",marginBottom:10}}>
@@ -3056,6 +3336,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
   const [addExMode, setAddExMode] = useState(false);
   const [newExName, setNewExName] = useState("");
   const [swapOpenFor, setSwapOpenFor] = useState(null); // exercise id showing swap alternatives
+  const [moveOpenFor, setMoveOpenFor] = useState(null); // exercise id showing the "move to combo" picker
   const [undoStack, setUndoStack] = useState([]); // snapshots of session before each discrete action
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [showJumpCombo, setShowJumpCombo] = useState(false);
@@ -3203,13 +3484,18 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
   //  current  — the one being logged right now
   //  done     — hit the set target
   //  partial  — some sets logged, target not reached
-  //  skipped  — the cursor has moved past it and nothing was logged
+  //  skipped  — the cursor has moved past it within the current combo's own round and nothing was logged
   //  upcoming — still ahead
+  //
+  // Note: only exercises passed *within the active combo* count as skipped. Combos are not
+  // mandatory in order — "jump here" and "Next Combo" move the cursor without implying the
+  // combos jumped over were abandoned, so their un-logged exercises stay "upcoming", not
+  // struck through.
   const exStatus = (ci, ei, ex) => {
     if(ci===session.currentComboIdx && ei===session.currentExInRound && !session.resting) return "current";
     if(isExComplete(ex)) return "done";
     if((ex.sets||[]).length>0) return "partial";
-    if(ci<session.currentComboIdx || (ci===session.currentComboIdx && ei<session.currentExInRound)) return "skipped";
+    if(ci===session.currentComboIdx && ei<session.currentExInRound) return "skipped";
     return "upcoming";
   };
 
@@ -3291,7 +3577,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       <div style={{background:C.bg,borderRadius:10,padding:"12px 14px",marginBottom:12,textAlign:"center"}}>
         <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:8}}>Stretch Timer</div>
         {stretchTarget?(<>
-          <div style={{fontSize:34,fontWeight:900,fontFamily:"monospace",color:stretchRemaining<=0?C.lime:C.blue,marginBottom:4}}>{fmtTime(stretchRemaining)}</div>
+          <div style={{marginBottom:10}}><TimerRing remaining={stretchRemaining} total={stretchTarget.duration} label="Stretch timer" size={110}/></div>
           <div style={{fontSize:11,color:stretchRemaining<=0?C.lime:C.muted,marginBottom:10}}>{stretchRemaining<=0?"⏰ Time's up!":"holding…"}</div>
         </>):null}
         <div style={{display:"flex",gap:8,justifyContent:"center"}}>
@@ -3397,6 +3683,16 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
     )}
     {session.combos.map((c,ci)=>{
       const isCurCombo = ci===session.currentComboIdx;
+      // A combo whose every exercise has hit its target collapses entirely (not just its rows)
+      // once folded — previously the header, "jump here" and a "N completed hidden" line stayed
+      // on screen for a combo with nothing left to show inside it.
+      //
+      // Exception: never collapse the CURRENTLY ACTIVE combo. Jumping back into an already-done
+      // combo points the cursor at one of its rows (exStatus always marks the cursor's own row
+      // "current", done or not) — collapsing the block here would hide that row with no way to
+      // reach it, even though the per-row logic below specifically keeps it visible.
+      const comboAllDone = c.exercises.length>0 && c.exercises.every(isExComplete);
+      if(!showCompleted && comboAllDone && !isCurCombo) return null;
       return(<div key={c.id} style={{marginBottom:10,border:`1px solid ${isCurCombo?C.orange+"55":C.border}`,borderRadius:11,padding:"8px 9px",background:isCurCombo?`${C.orange}08`:"transparent"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7,paddingLeft:2}}>
           <span style={{fontSize:11,fontFamily:"monospace",color:isCurCombo?C.orange:C.muted,fontWeight:isCurCombo?700:400}}>
@@ -3404,7 +3700,12 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
           </span>
           {!isCurCombo&&<button onClick={()=>jumpToCombo(ci)} style={{fontSize:11,color:C.blue,background:"none",border:`1px solid ${C.blue}40`,borderRadius:6,padding:"3px 9px"}}>jump here</button>}
         </div>
-        {c.exercises.length===0&&<div style={{fontSize:11,color:C.muted,fontStyle:"italic",padding:"6px 4px"}}>Empty — drag an exercise here.</div>}
+        {/* data-exkey makes an empty combo a valid drag-drop target too — elementFromPoint has
+            nothing to land on in an empty combo otherwise, so a combo emptied by dragging out
+            its last exercise could never receive one back via drag. The tap-based "move to
+            combo" button above each row is the more reliable route (esp. on iOS Safari), but
+            this keeps drag consistent for combos that still have room. */}
+        {c.exercises.length===0&&<div data-exkey={`${ci}:0`} style={{fontSize:11,color:C.muted,fontStyle:"italic",padding:"6px 4px",border:drag&&drag.toCombo===ci?`1px dashed ${C.blue}`:"1px dashed transparent",borderRadius:8}}>Empty — drag an exercise here, or use "move to combo" ⇥ above.</div>}
         {(()=>{const hidden=c.exercises.filter(isExComplete).length;
           return (!showCompleted&&hidden>0)?<div style={{fontSize:11,color:C.muted,padding:"3px 4px 7px",fontStyle:"italic"}}>✓ {hidden} completed hidden</div>:null;})()}
         {c.exercises.map((ex,ei)=>{
@@ -3460,7 +3761,21 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
                 keyboard and by screen-reader users, so it can't be the only way to reorder. */}
             {!isDone&&<button onClick={()=>moveExercise(ci,ei,-1)} disabled={ei===0} aria-label={`Move ${ex.name} up`} style={{fontSize:11,color:ei===0?C.faint:C.muted,background:"none",border:"none"}}>▲ up</button>}
             {!isDone&&<button onClick={()=>moveExercise(ci,ei,1)} disabled={ei===c.exercises.length-1} aria-label={`Move ${ex.name} down`} style={{fontSize:11,color:ei===c.exercises.length-1?C.faint:C.muted,background:"none",border:"none"}}>▼ down</button>}
+            {/* Tap-based alternative to the drag handle — dragging into another combo needs a
+                landing row to drop on, so a combo that's been emptied out has no way to receive
+                anything back via drag. Pointer drag is also unreliable on iOS Safari. This works
+                regardless of target combo state. */}
+            {session.combos.length>1&&<button onClick={()=>setMoveOpenFor(moveOpenFor===ex.id?null:ex.id)} style={{fontSize:11,color:C.orange,background:"none",border:"none",textDecoration:"underline"}}>⇥ move to combo</button>}
           </div>
+          {moveOpenFor===ex.id&&(<div style={{marginBottom:8,background:C.card,border:`1px solid ${C.orange}40`,borderRadius:7,padding:"7px 9px"}}>
+            <div style={{fontSize:9.5,color:C.muted,marginBottom:5}}>Move "{ex.name}" to:</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{session.combos.map((tc,tci)=>tci===ci?null:(
+              <button key={tc.id} onClick={()=>{moveExerciseTo(ci,ei,tci,tc.exercises.length);setMoveOpenFor(null);}}
+                style={{padding:"5px 10px",borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,color:C.text,fontSize:11}}>
+                Combo {tci+1}{tc.exercises.length===0?" (empty)":""}
+              </button>
+            ))}</div>
+          </div>)}
           {swapOpenFor===ex.id&&lib&&(()=>{
             const alts = findAlternatives(lib.muscleGroup, gymExerciseLibrary, ex.name);
             return(<div style={{marginBottom:8,background:C.card,border:`1px solid ${C.blue}40`,borderRadius:7,padding:"7px 9px"}}>
@@ -5149,7 +5464,40 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases, gymSes
 }
 
 // ── History Tab (shows weight per day) ───────────────────────────────────────
-function HistoryTab({weights,products,profile}){
+// Groups the flat medication log by date (most recent first) and shows a compact taken/skipped
+// list per day — collapsed by default since most users won't check this daily.
+function MedHistorySection({medLog}){
+  const [open,setOpen]=useState(false);
+  const [showAll,setShowAll]=useState(false);
+  if(!medLog||medLog.length===0)return null;
+  const byDate={};
+  for(const l of medLog){(byDate[l.date]=byDate[l.date]||[]).push(l);}
+  const dates=Object.keys(byDate).sort((a,b)=>b.localeCompare(a));
+  const shown=showAll?dates:dates.slice(0,14);
+  return(<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"12px 14px",marginBottom:12}}>
+    <button onClick={()=>setOpen(p=>!p)} style={{width:"100%",background:"none",border:"none",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+      <span style={{fontSize:14,fontWeight:600,color:C.text}}>💊 Medications & Supplements</span>
+      <span style={{fontSize:12,color:C.muted}}>{open?"▲":"▼"}</span>
+    </button>
+    {open&&<div style={{marginTop:10,display:"flex",flexDirection:"column",gap:8}}>
+      {shown.map(date=>(<div key={date}>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",marginBottom:4}}>{new Date(date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</div>
+        <div style={{display:"flex",flexDirection:"column",gap:4}}>
+          {byDate[date].map(l=>{
+            const win=medWindowById(l.window);
+            const taken=l.status==="taken";
+            return(<div key={l.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:C.bg,borderRadius:7,padding:"6px 10px"}}>
+              <span style={{fontSize:12,color:C.text}}>{win?.emoji} {l.name||"(deleted medication)"}</span>
+              <span style={{fontSize:11,fontFamily:"monospace",color:taken?C.lime:C.muted}}>{taken?`✓ taken ${l.doseTaken||""}`.trim():"skipped"} · {l.time}</span>
+            </div>);
+          })}
+        </div>
+      </div>))}
+      {!showAll&&dates.length>14&&<button onClick={()=>setShowAll(true)} style={{fontSize:11,color:C.muted,background:"none",border:`1px dashed ${C.border}`,borderRadius:6,padding:"5px 0",cursor:"pointer"}}>▾ Show all {dates.length} days</button>}
+    </div>}
+  </div>);
+}
+function HistoryTab({weights,products,profile,medications,medLog}){
   const [dates,setDates]=useState([]);const [logs,setLogs]=useState({});const [expanded,setExpanded]=useState(null);const [loading,setLoading]=useState(true);
   const [editMeal,setEditMeal]=useState(null);const [editAct,setEditAct]=useState(null);const [addMealDate,setAddMealDate]=useState(null);const [addActDate,setAddActDate]=useState(null);
   const [newDayPicker,setNewDayPicker]=useState(false);const [newDayDate,setNewDayDate]=useState("");
@@ -5182,6 +5530,7 @@ function HistoryTab({weights,products,profile}){
       <button onClick={()=>createDay(newDayDate)} disabled={!newDayDate} style={{padding:"9px 14px",borderRadius:8,background:newDayDate?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,cursor:newDayDate?"pointer":"default",fontSize:13}}>Add</button>
       <button onClick={()=>setNewDayPicker(false)} style={{padding:"9px 10px",borderRadius:8,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:13}}>✕</button>
     </div>}
+    <MedHistorySection medLog={medLog}/>
     {loading&&<div style={{textAlign:"center",padding:"40px 0",color:C.muted}}>Loading…</div>}
     {!loading&&!dates.length&&<div style={{textAlign:"center",padding:"40px 0",color:C.muted}}>No history yet.</div>}
     <div style={{display:"flex",flexDirection:"column",gap:7}}>
@@ -5404,14 +5753,99 @@ function TestAPIButton({apiKey}) {
   </div>);
 }
 
-function SettingsTab({profile,setProfile,weights,setWeights,weightPhases,setWeightPhases,latestWeight}){
+const WEEKDAY_TOGGLES = [["Mon",1],["Tue",2],["Wed",3],["Thu",4],["Fri",5],["Sat",6],["Sun",0]];
+const emptyMedForm = {name:"",daily:true,days:[],windows:["morning"],dosePerTake:"1",packageSize:"",notes:""};
+// Medications & Supplements — setup for the Today-tab reminder cards. Frequency (daily or
+// specific weekdays), which of the three time windows it's taken in, dose per occurrence, and
+// pack size (so remaining stock can be tracked and decremented as doses are marked taken).
+function MedsSettingsCard({medications,setMedications}){
+  const [adding,setAdding]=useState(false);
+  const [editId,setEditId]=useState(null);
+  const [form,setForm]=useState(emptyMedForm);
+  const startAdd=()=>{setForm(emptyMedForm);setEditId(null);setAdding(true);};
+  const startEdit=med=>{setForm({name:med.name,daily:med.daily,days:med.days||[],windows:med.windows?.length?med.windows:["morning"],dosePerTake:String(med.dosePerTake??"1"),packageSize:String(med.packageSize||""),notes:med.notes||""});setEditId(med.id);setAdding(true);};
+  const toggleWindow=w=>setForm(p=>({...p,windows:p.windows.includes(w)?p.windows.filter(x=>x!==w):[...p.windows,w]}));
+  const toggleDay=d=>setForm(p=>({...p,days:p.days.includes(d)?p.days.filter(x=>x!==d):[...p.days,d]}));
+  const save=()=>{
+    if(!form.name.trim()||form.windows.length===0)return;
+    const dose=parseFloat(form.dosePerTake)||0;
+    const pack=parseFloat(form.packageSize)||0;
+    if(editId){
+      setMedications(p=>p.map(m=>m.id===editId?{...m,name:form.name.trim(),daily:form.daily,days:form.days,windows:form.windows,dosePerTake:dose,packageSize:pack||null,notes:form.notes}:m));
+    }else{
+      setMedications(p=>[...p,{id:Date.now()+Math.random(),name:form.name.trim(),daily:form.daily,days:form.days,windows:form.windows,dosePerTake:dose,packageSize:pack||null,remaining:pack||null,active:true,notes:form.notes,createdDate:TODAY()}]);
+    }
+    setAdding(false);setEditId(null);
+  };
+  const refill=id=>setMedications(p=>p.map(m=>m.id===id?{...m,remaining:m.packageSize||m.remaining}:m));
+  const toggleActive=id=>setMedications(p=>p.map(m=>m.id===id?{...m,active:m.active===false}:m));
+  const remove=id=>{if(confirm("Delete this medication/supplement? Its history stays in History.")) setMedications(p=>p.filter(m=>m.id!==id));};
+  const scheduleText=med=>{
+    const days=med.daily?"Daily":(med.days||[]).length===0?"No days set":WEEKDAY_TOGGLES.filter(([,d])=>(med.days||[]).includes(d)).map(([l])=>l).join(" ");
+    const wins=(med.windows||[]).map(w=>medWindowById(w)?.emoji).join(" ");
+    return `${days} · ${wins}`;
+  };
+  return(<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:12}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:(medications?.length||adding)?10:4}}>
+      <span style={{fontSize:14,fontWeight:600,color:C.text}}>💊 Medications & Supplements</span>
+      {!adding&&<button onClick={startAdd} style={{fontSize:12,color:C.lime,background:"none",border:`1px solid ${C.lime}`,borderRadius:6,padding:"4px 10px",cursor:"pointer"}}>+ Add</button>}
+    </div>
+    {!adding&&!(medications?.length)&&<div style={{fontSize:11,color:C.muted}}>Set up a medication or supplement to get reminders on the Today tab, and track how much you have left.</div>}
+    {!adding&&(medications||[]).map(med=>{
+      const low=med.packageSize&&med.remaining!=null&&med.remaining<=(med.dosePerTake||1)*2;
+      return(<div key={med.id} style={{background:C.bg,border:`1px solid ${med.active===false?C.dim:C.border}`,borderRadius:10,padding:"10px 12px",marginBottom:8,opacity:med.active===false?0.55:1}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:13,fontWeight:600,color:C.text}}>{med.name}{med.active===false?" (paused)":""}</div>
+            <div style={{fontSize:11,color:C.muted,marginTop:2,fontFamily:"monospace"}}>{scheduleText(med)} · {med.dosePerTake||1}/take</div>
+            {med.packageSize?<div style={{fontSize:11,marginTop:3,color:low?C.orange:C.muted}}>{low?"⚠ ":""}{med.remaining??med.packageSize} of {med.packageSize} left{low?" — refill soon":""}</div>:null}
+          </div>
+          <div style={{display:"flex",gap:5,flexShrink:0}}>
+            <button onClick={()=>startEdit(med)} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:11,cursor:"pointer",padding:"3px 7px",borderRadius:5}}>✎</button>
+            <button onClick={()=>remove(med.id)} style={{background:"none",border:"none",color:C.faint,fontSize:15,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}}>
+          {med.packageSize?<button onClick={()=>refill(med.id)} style={{fontSize:10.5,color:C.blue,background:"none",border:`1px solid ${C.blue}40`,borderRadius:6,padding:"3px 8px",cursor:"pointer"}}>↻ mark refilled ({med.packageSize})</button>:null}
+          <button onClick={()=>toggleActive(med.id)} style={{fontSize:10.5,color:C.muted,background:"none",border:`1px solid ${C.border}`,borderRadius:6,padding:"3px 8px",cursor:"pointer"}}>{med.active===false?"▶ resume":"⏸ pause"}</button>
+        </div>
+      </div>);
+    })}
+    {adding&&(<div style={{background:C.bg,border:`1px solid ${C.lime}40`,borderRadius:10,padding:"11px 12px"}}>
+      <Field label="Name" value={form.name} onChange={v=>setForm(p=>({...p,name:v}))} placeholder="e.g. Vitamin D, Blood pressure pill"/>
+      <div style={{marginTop:9}}>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:5}}>Frequency</div>
+        <div style={{display:"flex",gap:6,marginBottom:form.daily?0:7}}>
+          <button type="button" onClick={()=>setForm(p=>({...p,daily:true}))} style={{flex:1,padding:"7px 0",borderRadius:8,border:`1px solid ${form.daily?C.lime:C.border}`,background:form.daily?`${C.lime}18`:C.card,color:form.daily?C.lime:C.muted,cursor:"pointer",fontSize:12,fontWeight:form.daily?700:400}}>Every day</button>
+          <button type="button" onClick={()=>setForm(p=>({...p,daily:false}))} style={{flex:1,padding:"7px 0",borderRadius:8,border:`1px solid ${!form.daily?C.lime:C.border}`,background:!form.daily?`${C.lime}18`:C.card,color:!form.daily?C.lime:C.muted,cursor:"pointer",fontSize:12,fontWeight:!form.daily?700:400}}>Specific days</button>
+        </div>
+        {!form.daily&&<div style={{display:"flex",gap:4,marginBottom:2}}>{WEEKDAY_TOGGLES.map(([lbl,d])=>{const on=form.days.includes(d);return(<button key={d} type="button" onClick={()=>toggleDay(d)} style={{flex:1,padding:"6px 0",borderRadius:6,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.card,color:on?C.lime:C.muted,cursor:"pointer",fontSize:10}}>{lbl}</button>);})}</div>}
+      </div>
+      <div style={{marginTop:9}}>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:5}}>When (can pick more than one)</div>
+        <div style={{display:"flex",gap:6}}>{MED_WINDOWS.map(w=>{const on=form.windows.includes(w.id);return(<button key={w.id} type="button" onClick={()=>toggleWindow(w.id)} style={{flex:1,padding:"8px 4px",borderRadius:8,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.card,color:on?C.lime:C.muted,cursor:"pointer",fontSize:11,textAlign:"center"}}><div>{w.emoji} {w.label}</div><div style={{fontSize:9,opacity:0.8,marginTop:2}}>{w.range}</div></button>);})}</div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9,marginTop:9}}>
+        <Field label="Dose per take" value={form.dosePerTake} onChange={v=>setForm(p=>({...p,dosePerTake:v}))} type="number" placeholder="1"/>
+        <Field label="Tablets/doses per package" value={form.packageSize} onChange={v=>setForm(p=>({...p,packageSize:v}))} type="number" placeholder="optional"/>
+      </div>
+      <div style={{marginTop:9}}><Field label="Notes (optional)" value={form.notes} onChange={v=>setForm(p=>({...p,notes:v}))} placeholder="e.g. take with food"/></div>
+      <div style={{display:"flex",gap:8,marginTop:11}}>
+        <button onClick={()=>{setAdding(false);setEditId(null);}} style={{flex:1,padding:"9px 0",borderRadius:8,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer",fontSize:12}}>Cancel</button>
+        <button onClick={save} disabled={!form.name.trim()||form.windows.length===0} style={{flex:2,padding:"9px 0",borderRadius:8,background:(form.name.trim()&&form.windows.length>0)?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:13}}>{editId?"Save Changes":"Add Medication"}</button>
+      </div>
+    </div>)}
+  </div>);
+}
+
+function SettingsTab({profile,setProfile,weights,setWeights,weightPhases,setWeightPhases,latestWeight,medications,setMedications}){
   const [editProf,setEditProf]=useState(false);const [pf,setPf]=useState({...profile});
   const [exportMsg,setExportMsg]=useState("");const [editWIdx,setEditWIdx]=useState(null);const [editWVal,setEditWVal]=useState("");const [showAllW,setShowAllW]=useState(false);
   const [pendingGoal,setPendingGoal]=useState(null); // goal being transitioned to
   const AGE=calcAge(profile.birthday);
   const saveProfile=()=>{setProfile({...pf,heightCm:parseFloat(pf.heightCm)||null,apiKey:pf.apiKey||""});setEditProf(false);};
   const exportData=async()=>{
-    const keys=["fit_dates","fit_weights","fit_products","fit_mealpreps","fit_profile","fit_photos","fit_weight_phases","fit_seeded_presets","fit_gym_schedule","fit_gym_templates","fit_gym_sessions","fit_gym_settings","fit_gym_exercise_library","fit_recipes"];
+    const keys=["fit_dates","fit_weights","fit_products","fit_mealpreps","fit_profile","fit_photos","fit_weight_phases","fit_seeded_presets","fit_gym_schedule","fit_gym_templates","fit_gym_sessions","fit_gym_settings","fit_gym_exercise_library","fit_recipes","fit_medications","fit_med_log"];
     const out={};for(const k of keys){out[k]=await store.get(k,null);}
     const dates=out.fit_dates||[];for(const d of dates){out["fit_day_"+d]=await store.get("fit_day_"+d,null);}
     const blob=new Blob([JSON.stringify(out,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="fitness-data-"+TODAY()+".json";a.click();URL.revokeObjectURL(url);setExportMsg("Exported!");setTimeout(()=>setExportMsg(""),2000);
@@ -5500,6 +5934,9 @@ function SettingsTab({profile,setProfile,weights,setWeights,weightPhases,setWeig
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9}}><Field label="Target weight kg" value={String(profile.targetWeightKg||"")} onChange={v=>setProfile(p=>({...p,targetWeightKg:parseFloat(v.replace(",","."))||null}))} placeholder="65"/><Field label="Goal note" value={profile.goalNote||""} onChange={v=>setProfile(p=>({...p,goalNote:v}))} placeholder="e.g. Visible abs for summer"/></div>
       </>)}
     </div>
+
+    {/* Medications / Supplements */}
+    <MedsSettingsCard medications={medications} setMedications={setMedications}/>
 
     {/* Standalone API key + test */}
     <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:12}}>
@@ -5754,6 +6191,11 @@ function App(){
   const [gymActiveSession,setGymActiveSession_]=useState(null);
   const [gymExerciseLibrary,setGymExerciseLibrary_]=useState([]);
   const [recipes,setRecipes_]=useState([]);
+  // Medication/supplement reminders — definitions (frequency, dose, pack size) and a flat
+  // taken/skipped event log, mirroring the gymSessions pattern rather than nesting into the
+  // per-day log object, so history reads don't depend on that object's own rollover timing.
+  const [medications,setMedications_]=useState([]);
+  const [medLog,setMedLog_]=useState([]);
   // `today` is reactive state, not a const. If we use a const, leaving the app open across
   // midnight means React renders with a NEW today value but dayData still holds yesterday's
   // meals — and the setDayData closure writes that stale payload to today's storage key,
@@ -5818,6 +6260,25 @@ function App(){
         console.log("[update] Added " + trulyNew.length + " never-seeded preset products");
       }
     }
+    // Storage itself (not just the setProducts setter used for later edits) must hold the
+    // sorted order — every "pick a label" list reads straight from what was loaded here, and
+    // the seed/migration branches above wrote straight to storage in PRESETS' insertion order.
+    prods = sortProducts(prods);
+    await store.set("fit_products", prods);
+    // Recipes: seed the same way as product presets — only on a genuinely first launch (the
+    // key has literally never been written), never re-adding starters a user deliberately
+    // cleared out. `rRecipesRaw` (not the `[]`-defaulted read further down) is what tells the
+    // two cases apart.
+    const rRecipesRaw = await store.get("fit_recipes", null);
+    if (!rRecipesRaw) {
+      const seededRecipes = DEFAULT_RECIPES.map(r => ({
+        id: Date.now()+Math.random(), name:r.name, category:r.category, photo:null, photoPos:{x:50,y:50}, photoZoom:1,
+        ingredients: r.ingredients.map(text => ({id:Date.now()+Math.random(), text})),
+        instructions: r.instructions.map(s => ({id:Date.now()+Math.random(), text:s.text, timerMin:s.timerMin||null})),
+        generatedByAI:false,
+      }));
+      await store.set("fit_recipes", seededRecipes);
+    }
     // Use the date at the moment of bootstrap (in case midnight already passed during load).
     const bootDate = TODAY();
     // Fetch gym schedule BEFORE constructing today's default day object, so a brand-new day
@@ -5853,8 +6314,11 @@ function App(){
       }
     }
     const rRecipes=await store.get("fit_recipes",[]);
-    setProducts_(prods);setDayData_(day);setWeights_(wts);setMealPreps_(preps);setProfile_(prof);setProgressPhotos_(photos);setWeightPhases_(Array.isArray(phases)?phases:[]);
+    const meds=await store.get("fit_medications",[]);
+    const mLog=await store.get("fit_med_log",[]);
+    setProducts_(sortProducts(prods));setDayData_(day);setWeights_(wts);setMealPreps_(preps);setProfile_(prof);setProgressPhotos_(photos);setWeightPhases_(Array.isArray(phases)?phases:[]);
     setGymSchedule_(Array.isArray(gSchedule)?gSchedule:[]);setGymTemplates_(gTemplates||{});setGymSessions_(Array.isArray(gSessions)?gSessions:[]);setGymSettings_(gSettings||{trainingMethod:"maintain",customNote:""});setGymActiveSession_(normalizeGymSession(gActive));setGymExerciseLibrary_(gLibrary);setRecipes_(Array.isArray(rRecipes)?rRecipes:[]);
+    setMedications_(Array.isArray(meds)?meds:[]);setMedLog_(Array.isArray(mLog)?mLog:[]);
     setToday(bootDate); // Make sure state matches what we just loaded
     lastLoadedDate.current = bootDate;
     setReady(true);
@@ -5878,7 +6342,7 @@ function App(){
 
   const setDayData=useCallback(upd=>{setDayData_(prev=>{const next=typeof upd==="function"?upd(prev):upd;store.set(`fit_day_${today}`,next);addToIndex(today);return next;});},[today]);
   const setWeights=useCallback(upd=>{setWeights_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_weights",n);return n;});},[]);
-  const setProducts=useCallback(upd=>{setProducts_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_products",n);return n;});},[]);
+  const setProducts=useCallback(upd=>{setProducts_(p=>{const n=sortProducts(typeof upd==="function"?upd(p):upd);store.set("fit_products",n);return n;});},[]);
   const setMealPreps=useCallback(upd=>{setMealPreps_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_mealpreps",n);return n;});},[]);
   const setProfile=useCallback(upd=>{setProfile_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_profile",n);return n;});},[]);
   const setProgressPhotos=useCallback(upd=>{setProgressPhotos_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_photos",n);return n;});},[]);
@@ -5892,6 +6356,20 @@ function App(){
   const setGymActiveSession=useCallback(upd=>{setGymActiveSession_(p=>{const raw=typeof upd==="function"?upd(p):upd;const n=raw?normalizeGymSession(raw):null;store.set("fit_gym_active_session",n);return n;});},[]);
   const setGymExerciseLibrary=useCallback(upd=>{setGymExerciseLibrary_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_exercise_library",n);return n;});},[]);
   const setRecipes=useCallback(upd=>{setRecipes_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_recipes",n);return n;});},[]);
+  const setMedications=useCallback(upd=>{setMedications_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_medications",n);return n;});},[]);
+  const setMedLog=useCallback(upd=>{setMedLog_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_med_log",n);return n;});},[]);
+  // Mark a due medication occurrence taken or skipped: appends the log entry and, on "taken"
+  // with a tracked pack size, decrements remaining stock by the dose just taken.
+  const markMedOccurrence = useCallback((med, status) => {
+    // Snapshot the name/dose at the time of logging (same reasoning as gym sessions snapshotting
+    // exercise data) so history still reads correctly if the medication is later renamed or deleted.
+    const entry = {id:Date.now()+Math.random(), medId:med.id, name:med.name, date:med.dueDate, window:med.dueWindow, status,
+      time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"}), doseTaken:med.dosePerTake||0};
+    setMedLog(p=>[entry, ...p]);
+    if (status==="taken" && med.packageSize) {
+      setMedications(p=>p.map(x=>x.id===med.id?{...x,remaining:Math.max(0,(x.remaining??x.packageSize)-(med.dosePerTake||0))}:x));
+    }
+  }, [setMedLog, setMedications]);
   const latestWeight=weights[0]?.weight;
   // Auto-revert temporary goal when its revert date arrives
   useEffect(()=>{
@@ -5929,11 +6407,11 @@ function App(){
       <button onClick={()=>setRolloverBanner(null)} style={{background:"none",border:"none",color:C.lime,fontSize:18,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button>
     </div>}
     <div style={{flex:1,overflow:"hidden"}}>
-      {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")}/>}
+      {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence}/>}
       {viewTab==="activity"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary}/>}
       {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes}/>}
-      {viewTab==="history"&&<HistoryTab weights={weights} products={products} profile={profile}/>}
-      {viewTab==="settings"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight}/>}
+      {viewTab==="history"&&<HistoryTab weights={weights} products={products} profile={profile} medications={medications} medLog={medLog}/>}
+      {viewTab==="settings"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight} medications={medications} setMedications={setMedications}/>}
     </div>
     {/* The tab bar is hidden while a gym session is live so "gym mode" is genuinely modal:
         no stray tap can reveal weight or food data to someone standing behind you, and no

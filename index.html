@@ -6078,11 +6078,20 @@ function Nav({tab,setTab}){
   const tabs=[["today","Today"],["activity","Activity"],["food","Food"],["history","History"],["settings","Settings"]];
   // Height is 58 + the iOS home-indicator inset. Previously a flat 52px with no inset, which
   // put the bottom of every tab button underneath the home indicator on notched iPhones.
-  return(<nav aria-label="Main" style={{background:C.surf,borderTop:`1px solid ${C.border}`,display:"flex",flexShrink:0,paddingBottom:SAFE_BOTTOM}}>
+  //
+  // The inset used to be padding-bottom on the <nav> itself, sitting entirely BELOW the 58px
+  // buttons — safe from the home indicator, but it also left the icons pinned to the top of
+  // the bar with a visibly empty strip underneath, reading as "the tabs float above the bottom
+  // edge" instead of sitting in it. Moving the inset onto each button and keeping
+  // justifyContent:"center" centers the icon+label within the taller (58px + inset) box
+  // instead, so they sit further down — roughly half the inset now serves as clearance above
+  // the home indicator and half as breathing room below the border, rather than all of it
+  // being dead space under a top-pinned icon.
+  return(<nav aria-label="Main" style={{background:C.surf,borderTop:`1px solid ${C.border}`,display:"flex",flexShrink:0}}>
     {tabs.map(([id,label])=>{
       const active=tab===id;
       return(<button key={id} onClick={()=>setTab(id)} aria-label={label} aria-current={active?"page":undefined}
-        style={{flex:1,minHeight:58,background:"none",border:"none",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:3,padding:"7px 0 6px",position:"relative",color:active?C.lime:C.muted}}>
+        style={{flex:1,minHeight:`calc(58px + ${SAFE_BOTTOM})`,background:"none",border:"none",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:3,padding:"7px 0",position:"relative",color:active?C.lime:C.muted}}>
         {/* Active indicator: a second, non-colour cue so the selected tab isn't communicated
             by hue alone (fails for the ~8% of men with red-green colour deficiency). */}
         <span aria-hidden="true" style={{position:"absolute",top:0,left:"50%",transform:"translateX(-50%)",width:active?26:0,height:2.5,borderRadius:"0 0 3px 3px",background:C.lime,transition:"width .2s ease"}}/>
@@ -6432,6 +6441,18 @@ root.render(<ErrorBoundary><App/></ErrorBoundary>);
   boot.style.opacity = "0";
   setTimeout(() => boot.remove(), 300);
 })();
+
+// Service worker: makes the app installable/offline-capable, and — the actual point of the
+// custom fetch strategy in sw.js — means opening the app (from Safari or the home-screen icon)
+// always fetches the current index.html from the network first, so a new version pushed to
+// GitHub Pages shows up the next time it's opened rather than staying stuck on whatever was
+// cached at install time. Guarded so it's a no-op anywhere the browser doesn't support it
+// (older browsers, some in-app webviews) or when running inside Claude.ai's own iframe.
+if ("serviceWorker" in navigator && window.self === window.top) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  });
+}
 </script>
 </body>
 </html>

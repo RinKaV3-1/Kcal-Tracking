@@ -139,28 +139,56 @@ const MED_WINDOWS = [
   {id:"evening", label:"Evening", range:"17:00–04:00", emoji:"🌙"},
 ];
 const medWindowById = id => MED_WINDOWS.find(w=>w.id===id);
-// Returns {window, date} for the reminder slot a given moment falls in. `date` is the
-// TODAY()-style day string the occurrence is filed under — for the evening window before
-// 04:00 that's YESTERDAY, since that slot opened the previous evening and hasn't closed yet.
-function medWindowFor(d=new Date()){
-  const h=d.getHours();
-  if(h>=4&&h<11) return {window:"morning", date:TODAY()};
-  if(h>=11&&h<17) return {window:"day", date:TODAY()};
-  if(h>=17) return {window:"evening", date:TODAY()};
-  const y=new Date(TODAY()+"T12:00:00"); y.setDate(y.getDate()-1);
-  return {window:"evening", date:y.toISOString().split("T")[0]};
+// Local (not UTC) calendar-date string, matching whichever local day a given moment falls on.
+// TODAY() is deliberately NOT used for medication windows: it derives the date from
+// toISOString(), which is UTC — while window boundaries (04:00/11:00/17:00) are local wall-clock
+// hours. Mixing the two disagreed near local midnight in timezones ahead of UTC (e.g. a medication
+// window computed as "still open, h<4 local" would then get stamped with a date computed from a
+// UTC clock that had already rolled to a different day), which is what produced history entries
+// filed under the wrong date.
+const localDateStr = (d=new Date()) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+// For one reminder window, the local date its most recent occurrence opened on — or null if
+// that window hasn't opened yet today. The evening window spans midnight (opens 17:00, still
+// the same occurrence until 04:00 the next day), so before 04:00 local it resolves to
+// yesterday's date rather than today's.
+function medWindowOpenDate(windowId, now=new Date()){
+  const h = now.getHours();
+  if (windowId==="morning") return h>=4 ? localDateStr(now) : null;
+  if (windowId==="day") return h>=11 ? localDateStr(now) : null;
+  // evening
+  if (h>=17) return localDateStr(now);
+  if (h<4) { const y=new Date(now); y.setDate(y.getDate()-1); return localDateStr(y); }
+  return null; // 04:00–17:00 — no evening occurrence has opened yet today
 }
-// Medications due right now: active, scheduled for this window, scheduled for today's weekday
-// (or daily), and not already marked taken/skipped for this specific occurrence.
+// The single most-recently-opened window right now (windows only open in sequence, so this is
+// just the last one in MED_WINDOWS order that has an open date). Used purely to flag reminders
+// left over from an earlier window today as "overdue" in the UI — it plays no part in whether
+// a reminder is shown at all.
+function currentMedWindow(now=new Date()){
+  let cur=null;
+  for (const win of MED_WINDOWS) if (medWindowOpenDate(win.id, now)) cur=win.id;
+  return cur;
+}
+// Medications due: for every window that has already opened today (not just whichever window
+// is active RIGHT now), any medication scheduled for it that hasn't been logged yet. A reminder
+// therefore stays visible across later windows instead of vanishing the moment the window it
+// was due in closes — the user can still mark it taken or skipped late.
 function dueMedReminders(medications, medLog, now=new Date()){
-  const {window, date} = medWindowFor(now);
-  const weekday = new Date(date+"T12:00:00").getDay();
-  return (medications||[])
-    .filter(m=>m.active!==false)
-    .filter(m=>(m.windows||[]).includes(window))
-    .filter(m=>m.daily || (m.days||[]).includes(weekday))
-    .filter(m=>!(medLog||[]).some(l=>l.medId===m.id && l.date===date && l.window===window))
-    .map(m=>({...m, dueWindow:window, dueDate:date}));
+  const active = currentMedWindow(now);
+  const out = [];
+  for (const win of MED_WINDOWS) {
+    const date = medWindowOpenDate(win.id, now);
+    if (!date) continue;
+    const weekday = new Date(date+"T12:00:00").getDay();
+    for (const m of (medications||[])) {
+      if (m.active===false) continue;
+      if (!(m.windows||[]).includes(win.id)) continue;
+      if (!(m.daily || (m.days||[]).includes(weekday))) continue;
+      if ((medLog||[]).some(l=>l.medId===m.id && l.date===date && l.window===win.id)) continue;
+      out.push({...m, dueWindow:win.id, dueDate:date, overdue: win.id!==active});
+    }
+  }
+  return out;
 }
 // Override meal type from the content of what's being logged.
 // e.g. a drink → "drink", a protein bar/snack → "snack". Returns null if no strong signal.
@@ -382,6 +410,7 @@ button[disabled]:active,button:disabled:active{transform:none;opacity:.45}
 @keyframes sheetIn{from{transform:translateY(100%)}to{transform:translateY(0)}}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 @keyframes toastIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+@keyframes analyzeSlide{0%{transform:translateX(-100%)}100%{transform:translateX(350%)}}
 `;
 
 // Safe-area helpers. Without these the bottom tab bar sits underneath the iPhone home
@@ -412,6 +441,72 @@ const TRAINING_METHODS = [
   {id:"maintain",label:"Maintain",emoji:"⚖️",desc:"Keep the same weights — just tracks what you did, no suggestions"},
   {id:"custom",label:"Custom",emoji:"✏️",desc:"Your own approach — add a note for context"},
 ];
+// Combo vs solo preference — feeds both the "how should I lay out a day I build myself"
+// framing and the auto-builder's grouping of exercises into combos below.
+const COMBO_PREFERENCES = [
+  {id:"combos", label:"Combos / supersets", emoji:"🔗", desc:"Exercises paired together, done back-to-back with one rest after the pair"},
+  {id:"solo",   label:"Solo exercises",     emoji:"1️⃣", desc:"One exercise at a time, with a full rest after each"},
+  {id:"mix",    label:"A mix of both",      emoji:"🔀", desc:"Main lift on its own, accessory work paired up"},
+];
+// ── Auto-build a gym plan ───────────────────────────────────────────────────
+// Given how many days/week and the combo/solo/mix preference, generates a template per
+// selected weekday: which day-type (push/pull/legs/upper/lower/full) it is, one exercise per
+// target muscle group for that day-type (picked from the user's own exercise library so any
+// custom exercises are eligible too), grouped into combos per the stated preference.
+const AUTO_PLAN_DAYTYPES = {
+  full:  {label:"Full Body", groups:["Chest","Lats","Quads","Hamstrings","Upper Back"]},
+  upper: {label:"Upper",     groups:["Chest","Upper Back","Side Delts","Biceps","Triceps"]},
+  lower: {label:"Lower",     groups:["Quads","Hamstrings","Glutes","Calves"]},
+  push:  {label:"Push",      groups:["Chest","Side Delts","Triceps"]},
+  pull:  {label:"Pull",      groups:["Lats","Upper Back","Biceps"]},
+  legs:  {label:"Legs",      groups:["Quads","Hamstrings","Glutes","Calves"]},
+};
+// Which sequence of day-types to use for a given number of training days/week — standard
+// splits: 1 day full body, 2 upper/lower, 3 push/pull/legs, 4 upper/lower repeated, 5 the
+// classic PPL+upper/lower, 6+ repeats push/pull/legs to fill the remaining days.
+function autoPlanDayTypes(n){
+  if (n<=0) return [];
+  if (n===1) return ["full"];
+  if (n===2) return ["upper","lower"];
+  if (n===3) return ["push","pull","legs"];
+  if (n===4) return ["upper","lower","upper","lower"];
+  if (n===5) return ["push","pull","legs","upper","lower"];
+  const out=[]; for(let i=0;i<n;i++) out.push(["push","pull","legs"][i%3]);
+  return out;
+}
+// One exercise per muscle group, preferring the user's own library (so custom exercises are
+// eligible) and falling back to the built-in defaults if the library is empty/unavailable.
+function pickExerciseForGroup(muscleGroup, library){
+  const pool = (library&&library.length ? library : DEFAULT_EXERCISES).filter(e=>e.muscleGroup===muscleGroup);
+  return pool[0] || null;
+}
+const autoPlanTemplateEx = ex => ({id:Date.now()+Math.random(), name:ex.name, type:"weighted"});
+function groupExercisesIntoCombos(exercises, preference){
+  const combos=[];
+  if (preference==="solo") {
+    exercises.forEach(ex => combos.push({id:Date.now()+Math.random(), exercises:[autoPlanTemplateEx(ex)]}));
+  } else if (preference==="combos") {
+    for (let i=0;i<exercises.length;i+=2) combos.push({id:Date.now()+Math.random(), exercises:exercises.slice(i,i+2).map(autoPlanTemplateEx)});
+  } else { // "mix": the first (usually the biggest compound movement) stands alone, the rest pair up
+    if (exercises.length>0) combos.push({id:Date.now()+Math.random(), exercises:[autoPlanTemplateEx(exercises[0])]});
+    for (let i=1;i<exercises.length;i+=2) combos.push({id:Date.now()+Math.random(), exercises:exercises.slice(i,i+2).map(autoPlanTemplateEx)});
+  }
+  return combos;
+}
+// Returns {templates: {weekday: template}, dayTypeLabels: {weekday: "Push"}} for the selected
+// weekdays (already sorted Monday-first by the caller), assigning day-types in that order.
+function autoBuildGymPlan(selectedWeekdays, preference, gymExerciseLibrary){
+  const dayTypes = autoPlanDayTypes(selectedWeekdays.length);
+  const templates = {}, dayTypeLabels = {};
+  selectedWeekdays.forEach((wd, i) => {
+    const dt = dayTypes[i] || "full";
+    const spec = AUTO_PLAN_DAYTYPES[dt];
+    const exercises = spec.groups.map(g => pickExerciseForGroup(g, gymExerciseLibrary)).filter(Boolean);
+    templates[wd] = {warmup:null, cooldown:null, combos:groupExercisesIntoCombos(exercises, preference)};
+    dayTypeLabels[wd] = spec.label;
+  });
+  return {templates, dayTypeLabels};
+}
 // Exercise library: broad training-split category + specific muscle group, used for
 // organizing exercises and for the "swap for an alternative" feature (same muscle group).
 const EXERCISE_CATEGORIES = ["Push","Pull","Legs","Abs","Cardio","Other"];
@@ -601,6 +696,64 @@ const DEFAULT_EXERCISES = [
   {name:"Pallof Press",category:"Abs",muscleGroup:"Obliques"},
   {name:"Bicycle Crunches",category:"Abs",muscleGroup:"Obliques"},
 ];
+// ── Muscle-group body diagram ───────────────────────────────────────────────
+// A schematic (not anatomical) humanoid outline with named zones, used to give each exercise a
+// tiny "what does this train" picture — not a photo of the movement, just a body shape with the
+// target region highlighted. One shared outline; front and back views differ only in which
+// zone shapes are drawn on top of it, since a simplified silhouette looks the same either way.
+const MUSCLE_BODY_OUTLINE = `
+  <circle cx="50" cy="12" r="9"/>
+  <rect x="46" y="19" width="8" height="7" rx="2"/>
+  <path d="M32,25 Q50,20 68,25 L69,78 Q50,86 31,78 Z"/>
+  <circle cx="26" cy="29" r="7.5"/>
+  <circle cx="74" cy="29" r="7.5"/>
+  <rect x="17" y="35" width="11" height="26" rx="5.5"/>
+  <rect x="72" y="35" width="11" height="26" rx="5.5"/>
+  <rect x="16" y="62" width="10" height="24" rx="5"/>
+  <rect x="74" y="62" width="10" height="24" rx="5"/>
+  <rect x="33" y="80" width="15" height="36" rx="6"/>
+  <rect x="52" y="80" width="15" height="36" rx="6"/>
+  <rect x="34" y="118" width="12" height="30" rx="5"/>
+  <rect x="54" y="118" width="12" height="30" rx="5"/>
+`;
+const MUSCLE_ZONES = {
+  chest: `<path d="M33,27 Q50,23 67,27 L66,50 Q50,55 34,50 Z"/>`,
+  abs: `<rect x="42" y="51" width="16" height="26" rx="3"/>`,
+  obliques: `<rect x="34" y="51" width="7" height="26" rx="2"/><rect x="59" y="51" width="7" height="26" rx="2"/>`,
+  frontDelts: `<circle cx="26" cy="29" r="7.5"/><circle cx="74" cy="29" r="7.5"/>`,
+  sideDelts: `<ellipse cx="21" cy="31" rx="4.5" ry="7" transform="rotate(-25 21 31)"/><ellipse cx="79" cy="31" rx="4.5" ry="7" transform="rotate(25 79 31)"/>`,
+  biceps: `<rect x="17" y="35" width="11" height="26" rx="5.5"/><rect x="72" y="35" width="11" height="26" rx="5.5"/>`,
+  forearms: `<rect x="16" y="62" width="10" height="24" rx="5"/><rect x="74" y="62" width="10" height="24" rx="5"/>`,
+  quads: `<rect x="33" y="80" width="15" height="36" rx="6"/><rect x="52" y="80" width="15" height="36" rx="6"/>`,
+  traps: `<path d="M41,19 L59,19 L53,32 L47,32 Z"/>`,
+  upperBack: `<path d="M39,32 Q50,28 61,32 L59,52 Q50,57 41,52 Z"/>`,
+  lats: `<path d="M32,34 Q29,50 35,64 L44,58 L41,34 Z"/><path d="M68,34 Q71,50 65,64 L56,58 L59,34 Z"/>`,
+  rearDelts: `<circle cx="26" cy="29" r="7.5"/><circle cx="74" cy="29" r="7.5"/>`,
+  triceps: `<rect x="17" y="35" width="11" height="26" rx="5.5"/><rect x="72" y="35" width="11" height="26" rx="5.5"/>`,
+  glutes: `<path d="M35,78 Q50,73 65,78 L63,93 Q50,98 37,93 Z"/>`,
+  hamstrings: `<rect x="33" y="80" width="15" height="36" rx="6"/><rect x="52" y="80" width="15" height="36" rx="6"/>`,
+  calves: `<rect x="34" y="118" width="12" height="30" rx="5"/><rect x="54" y="118" width="12" height="30" rx="5"/>`,
+};
+// muscleGroup (as used on DEFAULT_EXERCISES / the exercise library) -> which zone to highlight.
+const MUSCLE_GROUP_ZONE = {
+  "Chest":"chest", "Front Delts":"frontDelts", "Side Delts":"sideDelts",
+  "Biceps":"biceps", "Forearms":"forearms", "Quads":"quads",
+  "Abs":"abs", "Obliques":"obliques",
+  "Triceps":"triceps", "Lats":"lats", "Upper Back":"upperBack",
+  "Traps":"traps", "Rear Delts":"rearDelts", "Hamstrings":"hamstrings",
+  "Glutes":"glutes", "Calves":"calves",
+};
+// A small body-outline icon with one zone highlighted — "what kind of exercise is this and
+// which muscle does it train", not a picture of the movement itself. Falls back to a plain
+// dumbbell glyph for muscle groups outside the known map (e.g. custom "Full Body" entries).
+function MuscleIcon({muscleGroup, size=28}){
+  const zone = MUSCLE_GROUP_ZONE[muscleGroup];
+  if (!zone) return <span aria-hidden="true" style={{fontSize:size*0.55,lineHeight:1,display:"inline-block",width:size,textAlign:"center"}}>🏋️</span>;
+  return (<svg width={size} height={size*1.55} viewBox="0 0 100 155" role="img" aria-label={`Targets: ${muscleGroup}`} style={{flexShrink:0}}>
+    <g fill={C.dim} stroke="none" dangerouslySetInnerHTML={{__html: MUSCLE_BODY_OUTLINE}}/>
+    <g fill={C.lime} stroke="none" opacity={0.95} dangerouslySetInnerHTML={{__html: MUSCLE_ZONES[zone]}}/>
+  </svg>);
+}
 // ── Energy model ──────────────────────────────────────────────────────────────
 // Every number produced here is NET of resting metabolism, and every number scales with
 // bodyweight. Both of those were previously wrong in ways that inflated the eating target:
@@ -689,8 +842,18 @@ function getLastPerformance(exerciseName, gymSessions) {
   return null;
 }
 // Simple heuristic progression suggestion (no AI call — instant, local).
-// Progressive overload: if the last 2 sessions both show the top set at >= a solid rep count
-// (>=10) across all sets at the same weight, suggest a small increase. Otherwise hold steady.
+// Two branches:
+//  - Weighted exercises: last 2 sessions both cleared a solid rep count (>=10) at the SAME
+//    weight → the weight itself isn't the limiter any more, suggest increasing it. No specific
+//    number is named — "increase the weight" survives a re-read better than a number the app
+//    guessed at, and different equipment (plates vs a pin-select machine) has different
+//    realistic increments anyway.
+//  - Bodyweight / no-load exercises (weight never entered, e.g. heel touches, planks): weight
+//    is meaningless here, so the old logic fired the "10+ reps, same weight" message on every
+//    single session (any rep count clears 10, and "" === "" is trivially "the same weight"),
+//    producing a nonsense "try 0.5kg" suggestion. Compare total reps between the last two
+//    sessions instead: a genuine rep increase (>=3%) means it's still progressing on its own
+//    and gets no message; a plateau (roughly flat rep count) is the actual signal to add load.
 function suggestProgression(exerciseName, gymSessions, method) {
   if (method !== "progressive_overload") return null;
   const nl = normExName(exerciseName);
@@ -711,13 +874,27 @@ function suggestProgression(exerciseName, gymSessions, method) {
   // crashed the whole session panel.
   const lastW = parseFloat(last.weight);
   const prevW = parseFloat(prev.weight);
-  const lastAllStrong = last.sets.every(s => (s.reps||0) >= 10);
-  const sameWeight = !isNaN(lastW) && lastW === prevW;
-  if (lastAllStrong && sameWeight) {
-    const step = lastW >= 30 ? 2.5 : lastW >= 10 ? 1.25 : 0.5;
-    return `Last 2 sessions all cleared 10+ reps at ${lastW}kg — try ${(lastW+step).toFixed(2).replace(/\.?0+$/,"")}kg next time.`;
+  const isWeighted = lastW > 0 && prevW > 0;
+
+  if (isWeighted) {
+    const lastAllStrong = last.sets.every(s => (s.reps||0) >= 10);
+    const sameWeight = lastW === prevW;
+    if (lastAllStrong && sameWeight) {
+      return `Last 2 sessions all cleared 10+ reps at ${lastW}kg — consider increasing the weight or difficulty next time.`;
+    }
+    return null;
   }
-  return null;
+
+  // Bodyweight branch — total reps across all sets, not the single-set >=10 threshold that
+  // means something different once there's no external load to speak of.
+  const totalReps = sets => sets.reduce((a,s) => a + (s.reps||0), 0);
+  const lastReps = totalReps(last.sets), prevReps = totalReps(prev.sets);
+  if (lastReps < 8 || prevReps < 8) return null; // too early to read a trend
+  const pctChange = prevReps > 0 ? (lastReps - prevReps) / prevReps : 0;
+  const plateaued = pctChange < 0.03; // <3% up (or a drop) reads as "stalled", not progress
+  if (!plateaued) return null; // still climbing session over session — nothing to flag
+  const avgReps = Math.round((lastReps + prevReps) / 2);
+  return `You've held around ${avgReps} reps for the last 2 sessions — consider increasing the difficulty (added weight, slower tempo, less rest, etc.).`;
 }
 // Alternatives for the "swap this exercise" feature — same muscle group, excluding itself,
 // sorted with custom (user-added) exercises first since those are most likely relevant.
@@ -1021,19 +1198,92 @@ function gCol(goal){return goal==="cut"?C.orange:goal==="bulk"?C.blue:C.lime;}
 // ── Dual storage: window.storage (Claude.ai) OR localStorage (standalone) ────
 // Data is stored per-device. Use Export/Import in Settings to move data
 // between devices or back up.
+// ── IndexedDB-backed storage ────────────────────────────────────────────────
+// localStorage has a hard ~5MB quota shared across every key, and this app base64-encodes
+// progress photos and recipe photos straight into individual keys — a handful of photos is
+// enough to hit that wall, and localStorage.setItem throws synchronously when it does, with
+// nothing catching it anywhere a photo gets saved. IndexedDB's quota is negotiated per-origin
+// against available disk space (typically hundreds of MB up to several GB, browser-dependent),
+// which removes the practical ceiling. store.get/set were already async everywhere they're
+// called, so swapping the backing implementation here needed no changes anywhere else.
+const IDB_NAME = "fit_store", IDB_STORE = "kv", IDB_VERSION = 1;
+let _idbPromise = null;
+function openIDB(){
+  if (_idbPromise) return _idbPromise;
+  _idbPromise = new Promise((resolve, reject) => {
+    if (typeof indexedDB === "undefined") { reject(new Error("indexedDB unavailable")); return; }
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = () => { if (!req.result.objectStoreNames.contains(IDB_STORE)) req.result.createObjectStore(IDB_STORE); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return _idbPromise;
+}
+function idbGet(key){
+  return openIDB().then(db => new Promise((resolve, reject) => {
+    const req = db.transaction(IDB_STORE, "readonly").objectStore(IDB_STORE).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }));
+}
+function idbSet(key, value){
+  return openIDB().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  }));
+}
+// One-time copy of whatever's already in localStorage into IndexedDB, gated on a marker key so
+// it only ever runs once. The old localStorage entries are left in place afterwards (untouched,
+// unused) rather than deleted — a free safety net, and 5MB of now-orphaned strings costs nothing
+// once IndexedDB is the thing actually being read from.
+let _migration = null;
+function migrateLocalStorageToIDB(){
+  if (_migration) return _migration;
+  _migration = (async () => {
+    try {
+      if (await idbGet("__migrated_v1")) return;
+      for (let i = 0; i < localStorage.length; i++) {
+        const lsKey = localStorage.key(i);
+        if (!lsKey || !lsKey.startsWith("fit_")) continue;
+        // store.set always writes localStorage under "fit_"+k, so stripping exactly those 4
+        // characters recovers the original k this app already uses everywhere (e.g.
+        // "fit_products"), which is what the IDB key is set to below.
+        const key = lsKey.slice(4);
+        try {
+          const raw = localStorage.getItem(lsKey);
+          if (raw != null) await idbSet(key, JSON.parse(raw));
+        } catch {}
+      }
+      await idbSet("__migrated_v1", true);
+    } catch {} // IndexedDB unavailable — get/set fall back to localStorage per-call regardless
+  })();
+  return _migration;
+}
+
 const store = {
   async get(k, d=null) {
     if (typeof window.storage !== "undefined") {
       try { const r = await window.storage.get(k); return r ? JSON.parse(r.value) : d; } catch {}
     }
+    try {
+      await migrateLocalStorageToIDB();
+      const v = await idbGet(k);
+      if (v !== undefined) return v;
+    } catch {} // IndexedDB unavailable in this browser — fall through to localStorage below
     try { const v = localStorage.getItem("fit_"+k); return v ? JSON.parse(v) : d; } catch { return d; }
   },
   async set(k, v) {
-    const s = JSON.stringify(v);
     if (typeof window.storage !== "undefined") {
-      try { await window.storage.set(k, s); } catch {}
+      try { await window.storage.set(k, JSON.stringify(v)); } catch {}
     }
-    try { localStorage.setItem("fit_"+k, s); } catch {}
+    try {
+      await migrateLocalStorageToIDB();
+      await idbSet(k, v);
+      return;
+    } catch {} // IndexedDB unavailable — last-resort fallback, still capped at ~5MB but better than losing the write
+    try { localStorage.setItem("fit_"+k, JSON.stringify(v)); } catch {}
   },
 };
 async function addToIndex(date){const d=await store.get("fit_dates",[]);if(!d.includes(date)){d.unshift(date);await store.set("fit_dates",d.slice(0,730));}}
@@ -1097,9 +1347,13 @@ const inClaudeAI = () => { try { return typeof window.storage !== "undefined"; }
 // in callAI() had to change.
 const VISION_MODEL = "claude-sonnet-5";
 const TEXT_MODEL   = "claude-haiku-4-5"; // text-only calls
-async function callAI(content, apiKey, model, maxTokens) {
-  // Claude.ai artifact proxy: no extra headers, just Content-Type + .json() response
-  // Standalone with API key: add auth headers
+// One attempt at the raw API call — throws on any of: network failure, an API error object,
+// a response with no content array, or a text block that came back empty. That last case is
+// the "Empty response" users saw on heavy multi-photo calls (4 scale photos + a long prompt is
+// a lot for the model to reason through) — previously it surfaced straight to the user, who had
+// to manually retry until it worked. fetchClaudeOnce() only does the network round-trip; retry
+// policy lives in fetchClaudeText() below so both callAI() and callAIText() share it.
+async function fetchClaudeOnce(content, apiKey, model, maxTokens) {
   const headers = { "Content-Type": "application/json" };
   if (apiKey && !inClaudeAI()) {
     headers["x-api-key"] = apiKey;
@@ -1107,7 +1361,6 @@ async function callAI(content, apiKey, model, maxTokens) {
     headers["anthropic-dangerous-direct-browser-access"] = "true";
   }
   const body = JSON.stringify({ model: model||VISION_MODEL, max_tokens: maxTokens||1500, messages: [{ role: "user", content }] });
-  // Use the exact pattern from Claude.ai artifact docs: fetch then .json()
   let data;
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers, body });
@@ -1118,28 +1371,35 @@ async function callAI(content, apiKey, model, maxTokens) {
   if (data.error) throw new Error("API: " + (data.error.message || JSON.stringify(data.error)));
   if (!data.content) throw new Error("No content in response: " + JSON.stringify(data).slice(0,100));
   const text = data.content.find(b => b.type === "text")?.text || "";
+  if (!text.trim()) throw new Error("Empty response");
+  return text;
+}
+// Retries transient failures (network hiccup, empty text block) up to 2 extra times with a
+// short backoff before giving up — the same class of failure a manual "try again" tap fixed,
+// just automatic now. A genuine API error (bad key, rate limit, etc.) still surfaces immediately
+// since retrying it would just fail the same way three times instead of once.
+async function fetchClaudeText(content, apiKey, model, maxTokens) {
+  const delays = [0, 700, 1500];
+  let lastErr;
+  for (const delay of delays) {
+    if (delay) await new Promise(r => setTimeout(r, delay));
+    try {
+      return await fetchClaudeOnce(content, apiKey, model, maxTokens);
+    } catch (e) {
+      lastErr = e;
+      if (/^API:/.test(e.message)) throw e; // not transient — don't burn retries on it
+    }
+  }
+  throw lastErr;
+}
+async function callAI(content, apiKey, model, maxTokens) {
+  const text = await fetchClaudeText(content, apiKey, model, maxTokens);
   return extractJSON(text);
 }
 
 // Same as callAI but returns the raw text response (for free-form questions, advice, etc.)
 async function callAIText(content, apiKey, model, maxTokens) {
-  const headers = { "Content-Type": "application/json" };
-  if (apiKey && !inClaudeAI()) {
-    headers["x-api-key"] = apiKey;
-    headers["anthropic-version"] = "2023-06-01";
-    headers["anthropic-dangerous-direct-browser-access"] = "true";
-  }
-  const body = JSON.stringify({ model: model||VISION_MODEL, max_tokens: maxTokens||1500, messages: [{ role: "user", content }] });
-  let data;
-  try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers, body });
-    data = await response.json();
-  } catch(e) {
-    throw new Error("Connection error: " + e.message);
-  }
-  if (data.error) throw new Error("API: " + (data.error.message || JSON.stringify(data.error)));
-  if (!data.content) throw new Error("No content in response: " + JSON.stringify(data).slice(0,100));
-  return data.content.find(b => b.type === "text")?.text || "";
+  return fetchClaudeText(content, apiKey, model, maxTokens);
 }
 
 // Food analysis
@@ -1483,6 +1743,28 @@ function TimerRing({remaining,total,label,size=120}){
     </svg>
     <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
       <span style={{fontSize:size>=100?34:24,fontWeight:900,fontFamily:"monospace",color:done?C.lime:C.text,lineHeight:1}}>{`${Math.floor(remaining/60)}:${String(remaining%60).padStart(2,"0")}`}</span>
+    </div>
+  </div>);
+}
+// Visible progress for an AI photo-analysis call. There's no real completion percentage to
+// report (the API doesn't stream progress), so this is an honest indeterminate bar plus an
+// elapsed-time counter — which is what the "how long is this going to take" complaint actually
+// needed: not a fake percentage, just proof it's still working and a sense of the wait so far.
+function AnalyzeProgress({active, label="Analyzing"}){
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!active) { setElapsed(0); return; }
+    const start = Date.now();
+    const id = setInterval(() => setElapsed(Math.floor((Date.now()-start)/1000)), 1000);
+    return () => clearInterval(id);
+  }, [active]);
+  if (!active) return null;
+  return (<div style={{marginTop:8}} role="status" aria-live="polite">
+    <div style={{height:4,borderRadius:2,background:C.dim,overflow:"hidden"}}>
+      <div style={{height:"100%",width:"38%",background:C.blue,borderRadius:2,animation:"analyzeSlide 1.3s ease-in-out infinite"}}/>
+    </div>
+    <div style={{fontSize:10,color:C.muted,marginTop:5,textAlign:"center",fontFamily:"monospace"}}>
+      {label}… {elapsed}s{elapsed>=12?" — multiple photos with scales can take 15–25s":""}
     </div>
   </div>);
 }
@@ -1909,6 +2191,11 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
     if (ing._canteen) return { color: C.yellow, bg: C.yellow+"15", label: "🍴 canteen estimate", border: C.yellow+"40" };
     if (ing._pinned && ing._estimated) return { color: C.blue, bg: C.blue+"15", label: "🤖 AI-estimated", border: C.blue+"50" };
     if (ing._pinned) return { color: C.lime, bg: C.lime+"18", label: "✓ label pinned: "+ing.name, border: C.lime };
+    // kcal came through but protein/carbs/fat are all exactly zero — real food essentially never
+    // has that profile, so this reads as an incomplete AI response for this one ingredient
+    // (the model filled in some fields and not others) rather than genuinely zero macros. This
+    // silently under-logged protein/carbs/fat before, with nothing on screen to say so.
+    if (m.kcal100 > 0 && m.p100 === 0 && m.c100 === 0 && m.f100 === 0) return { color: C.red, bg: C.red+"12", label: "⚠ kcal only — protein/carbs/fat look missing, please check", border: C.red+"50" };
     if (m.matched) return { color: C.lime, bg: C.lime+"12", label: "✓ matched label: "+m.matched, border: C.lime+"50" };
     return { color: C.yellow, bg: C.yellow+"10", label: "⚠ no label match — macros unknown", border: C.yellow+"40" };
   };
@@ -1941,7 +2228,10 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
           const isSwapping = swapIdx === i;
           const isEstimating = estimatingIdx === i;
           const st = statusFor(ing, m);
-          const noMacros = m.kcal100 === 0 && m.p100 === 0 && m.c100 === 0 && m.f100 === 0;
+          // Protein/carbs/fat all zero covers both "nothing at all" AND "kcal came through but
+          // the rest didn't" — both are incomplete data that should offer the same fix-it
+          // actions (AI estimate / pick label) rather than silently logging a partial total.
+          const noMacros = m.p100 === 0 && m.c100 === 0 && m.f100 === 0;
           return (
             <div key={i} style={{background:C.bg,borderRadius:10,border:`1px solid ${st.border}`,overflow:"hidden"}}>
               {/* Main row */}
@@ -2447,6 +2737,7 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
           <textarea value={photoDesc} onChange={e=>setPhotoDesc(e.target.value)} rows={1} placeholder="Optional description (e.g. 'green beans 100g + soy sauce')" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:12,outline:"none",resize:"none",marginTop:7,fontFamily:"inherit"}}/>
           {photoErr&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:6,padding:"6px 9px",fontSize:11,color:"#ff8080",marginTop:7,wordBreak:"break-word"}}>{photoErr}</div>}
           {photoImgs.length>0&&<button onClick={async()=>{setPhotoLoading(true);setPhotoErr(null);try{const r=await aFood(photoImgs,products,"home",photoDesc,apiKey);if(r?.ingredients?.length){setPhotoIngs(r.ingredients);}else{setPhotoErr("No ingredients detected — try a clearer photo or use Manual.");}}catch(e){setPhotoErr(String(e.message||e));}setPhotoLoading(false);}} disabled={photoLoading} style={{width:"100%",padding:"9px 0",borderRadius:8,background:photoLoading?C.faint:C.blue,color:"#000",fontWeight:700,border:"none",cursor:photoLoading?"default":"pointer",fontSize:12,marginTop:8}}>{photoLoading?"Analyzing…":"🔍 Analyze"}</button>}
+          <AnalyzeProgress active={photoLoading}/>
         </>):(<>
           <div style={{fontSize:11,color:C.muted,marginBottom:7}}>Confirm what was detected — adjust weights as needed:</div>
           <IngredientConfirmPanel ingredients={photoIngs} setIngredients={setPhotoIngs} products={products} apiKey={apiKey} confirmLabel="Add These Extras" onSkip={()=>{setExtrasMode(null);setPhotoIngs(null);setPhotoImgs([]);}} onConfirm={(ings)=>{const newExtras=ings.filter(i=>parseFloat(i.weightG)>0).map(i=>{const g=parseFloat(i.weightG)||0;const s=g/100;return{id:Date.now()+Math.random(),source:"photo",name:i.name||"extra",weightG:g,kcal:(i.kcal||i._kcal100||0)*s,protein:(i.protein||i._p100||0)*s,carbs:(i.carbs||i._c100||0)*s,fat:(i.fat||i._f100||0)*s};});setExtras(p=>[...p,...newExtras]);setExtrasMode(null);setPhotoIngs(null);setPhotoImgs([]);}}/>
@@ -2640,6 +2931,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
       <button onClick={analyze} disabled={!canAnalyze} style={{width:"100%",padding:"12px 0",borderRadius:10,background:canAnalyze?C.lime:C.faint,color:"#000",fontWeight:700,border:"none",cursor:canAnalyze?"pointer":"default",fontSize:15,marginTop:10}}>
         {loading?"Analyzing…":mt==="canteen"?"Estimate Meal":`Analyze ${imgs.length} photo${imgs.length!==1?"s":""}`}
       </button>
+      <AnalyzeProgress active={loading}/>
       {mt==="canteen"&&!desc.trim()&&<div style={{fontSize:11,color:C.muted,marginTop:5,textAlign:"center"}}>Add a description first</div>}
     </>)}
     {mode==="manual"&&!result&&(<>
@@ -2840,6 +3132,7 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
 
     {/* Analyze — works with or without photos */}
     {!result&&!showPanel&&!buildMode&&<button onClick={analyze} disabled={loading||(!imgs.length&&!desc.trim())} style={{width:"100%",padding:"14px 0",borderRadius:10,background:loading?C.faint:(imgs.length||desc.trim())?C.lime:C.faint,color:"#000",fontWeight:800,border:"none",cursor:(loading||(!imgs.length&&!desc.trim()))?"default":"pointer",fontSize:15,marginTop:10,boxShadow:(!loading&&(imgs.length||desc.trim()))?`0 0 12px ${C.lime}40`:"none"}}>{loading?"Analyzing…":imgs.length?`🔍 Analyze ${imgs.length} photo${imgs.length!==1?"s":""}${desc.trim()?" + description":""}`:desc.trim()?"🔍 Estimate from description":"Add photos or a description first"}</button>}
+    <AnalyzeProgress active={loading}/>
     {!result&&!showPanel&&!buildMode&&<button onClick={()=>{setBuildMode("labels");setLabelIngs([]);setPickedProd(null);setPickSearch("");}} style={{width:"100%",padding:"10px 0",borderRadius:10,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12,marginTop:8}}>🏷️ Build from product labels manually</button>}
     {err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ff8080",margin:"10px 0",wordBreak:"break-word"}}>{err}</div>}
 
@@ -2981,17 +3274,18 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
         </div>
       </div>
 
-      {/* Medication/supplement reminders — due for the current time window, and not yet
-          marked taken or skipped. Disappears the moment either button is tapped, and stays
-          gone until the next window/day brings the same medication due again. */}
+      {/* Medication/supplement reminders — one card per window that has opened today and
+          hasn't been marked yet. A reminder from an earlier window that closed without being
+          marked stays here (flagged "overdue") rather than silently disappearing — it only
+          goes away once Taken or Skip is tapped. */}
       {dueMeds.length>0&&<div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:10}}>
         {dueMeds.map(med=>{
           const win=medWindowById(med.dueWindow);
           const low=med.packageSize&&med.remaining!=null&&med.remaining<=(med.dosePerTake||1);
-          return(<div key={med.id} style={{background:`${C.orange}10`,border:`1px solid ${C.orange}55`,borderRadius:12,padding:"11px 14px"}}>
+          return(<div key={med.id} style={{background:med.overdue?`${C.red}0d`:`${C.orange}10`,border:`1px solid ${med.overdue?C.red:C.orange}55`,borderRadius:12,padding:"11px 14px"}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
               <div style={{flex:1,minWidth:0}}>
-                <div style={{fontSize:10,color:C.orange,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:2}}>{win?.emoji} {win?.label} reminder</div>
+                <div style={{fontSize:10,color:C.orange,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:2}}>{win?.emoji} {win?.label} reminder{med.overdue?" · overdue":""}</div>
                 <div style={{fontSize:14,fontWeight:700,color:C.text}}>💊 {med.name}</div>
                 <div style={{fontSize:11,color:C.muted,marginTop:2}}>{med.dosePerTake||1} dose{(med.dosePerTake||1)!==1?"s":""}{med.notes?` · ${med.notes}`:""}</div>
                 {med.packageSize?<div style={{fontSize:11,marginTop:2,color:low?C.red:C.muted}}>{low?"⚠ ":""}{med.remaining??med.packageSize} left in package</div>:null}
@@ -3265,6 +3559,7 @@ function GymTemplateEditor({weekday, template, setTemplate, gymExerciseLibrary, 
           const lib = libFor(ex.name);
           return(<div key={ex.id} style={{background:C.bg,borderRadius:7,padding:"7px 9px",marginBottom:5}}>
             <div style={{display:"flex",alignItems:"center",gap:6}}>
+              {lib&&<MuscleIcon muscleGroup={lib.muscleGroup} size={22}/>}
               <div style={{flex:1,minWidth:0}}>
                 <span style={{fontSize:12,color:C.text,display:"block",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ex.name}</span>
                 {lib&&<span style={{fontSize:9,color:C.muted}}>{lib.category} · {lib.muscleGroup}</span>}
@@ -3299,8 +3594,8 @@ function GymTemplateEditor({weekday, template, setTemplate, gymExerciseLibrary, 
           <div style={{background:C.bg,border:`1px dashed ${C.border}`,borderRadius:8,padding:"8px 10px",marginTop:6}}>
             <input value={pickerSearch} onChange={e=>setPickerSearch(e.target.value)} placeholder="Search or type new exercise…" autoFocus style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 9px",color:C.text,fontSize:12,outline:"none",marginBottom:7}}/>
             <div style={{display:"flex",flexDirection:"column",gap:4,maxHeight:160,overflowY:"auto",marginBottom:7}}>
-              {filteredLib.map(libEx=>(<button key={libEx.id} onClick={()=>addExerciseFromLib(combo.id,libEx)} style={{padding:"6px 9px",borderRadius:6,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between"}}>
-                <span style={{fontSize:11.5,color:C.text}}>{libEx.name}</span><span style={{fontSize:9.5,color:C.muted}}>{libEx.muscleGroup}</span>
+              {filteredLib.map(libEx=>(<button key={libEx.id} onClick={()=>addExerciseFromLib(combo.id,libEx)} style={{padding:"6px 9px",borderRadius:6,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:7,justifyContent:"space-between"}}>
+                <span style={{display:"flex",alignItems:"center",gap:7,minWidth:0}}><MuscleIcon muscleGroup={libEx.muscleGroup} size={18}/><span style={{fontSize:11.5,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{libEx.name}</span></span><span style={{fontSize:9.5,color:C.muted,flexShrink:0}}>{libEx.muscleGroup}</span>
               </button>))}
               {filteredLib.length===0&&<div style={{fontSize:10.5,color:C.muted,padding:"3px 0"}}>No matches — add it as new below.</div>}
             </div>
@@ -3415,8 +3710,17 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       return {...s, currentComboIdx:s.currentComboIdx+1, currentExInRound:0, resting:false};
     });
   };
+  // Jumping to a combo swaps it into the currently-active slot (rather than just moving the
+  // cursor to wherever it sat in the list) so the combo you jumped to visually moves to the
+  // front — matching the same "cursor stays positional" rule moveExerciseTo already follows.
   const jumpToCombo = idx => {
-    updateAction(s=>({...s, currentComboIdx:idx, currentExInRound:0, resting:false}));
+    updateAction(s=>{
+      if(idx===s.currentComboIdx) return s;
+      const combos=[...s.combos];
+      const cur=s.currentComboIdx;
+      [combos[cur], combos[idx]] = [combos[idx], combos[cur]];
+      return {...s, combos, currentComboIdx:cur, currentExInRound:0, resting:false};
+    });
     setShowJumpCombo(false);
   };
   const moveExercise = (comboIdx, idx, dir) => {
@@ -3737,6 +4041,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
             <span role="button" tabIndex={-1} aria-label={`Reorder ${ex.name}`}
               onPointerDown={e=>beginDrag(e,ci,ei)} onPointerMove={moveDrag} onPointerUp={endDrag} onPointerCancel={endDrag}
               style={{touchAction:"none",cursor:"grab",color:C.muted,fontSize:15,lineHeight:1,padding:"3px 4px",marginTop:1,flexShrink:0,userSelect:"none"}}>⠿</span>
+            {lib&&<MuscleIcon muscleGroup={lib.muscleGroup} size={26}/>}
             <div style={{flex:1,minWidth:0}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",gap:8,marginBottom:2}}>
                 <span style={{fontSize:13,fontWeight:isCurrent?700:500,color:isCurrent?C.lime:isDone?C.muted:C.text,textDecoration:isSkipped?"line-through":"none"}}>{ex.name}</span>
@@ -3912,11 +4217,31 @@ function CancelConfirmBox({onSaveFinish, onDiscard, onKeepGoing}){
 // ── Gym Setup Sheet ─────────────────────────────────────────────────────────
 // Pick default gym weekdays, set the overall training method, and jump into each
 // scheduled day's template editor.
-function GymSetupSheet({gymSchedule,setGymSchedule,gymSettings,setGymSettings,gymTemplates,onEditTemplate,onClose}){
+function GymSetupSheet({gymSchedule,setGymSchedule,gymSettings,setGymSettings,gymTemplates,setGymTemplates,gymExerciseLibrary,onEditTemplate,onClose}){
   const toggle=wd=>setGymSchedule(prev=>(prev||[]).includes(wd)?(prev||[]).filter(x=>x!==wd):[...(prev||[]),wd]);
   const method=gymSettings?.trainingMethod||"maintain";
   const setMethod=m=>setGymSettings(p=>({...(p||{}),trainingMethod:m}));
   const setNote=n=>setGymSettings(p=>({...(p||{}),customNote:n}));
+  const preference=gymSettings?.comboPreference||"mix";
+  const setPreference=pr=>setGymSettings(p=>({...(p||{}),comboPreference:pr}));
+
+  // Auto-builder: pick which weekdays to generate for (defaults to the days already marked as
+  // gym days that don't have a plan yet) and it fills them in using the preference above.
+  const [autoOpen,setAutoOpen]=useState(false);
+  const [autoDays,setAutoDays]=useState(()=>(gymSchedule||[]).filter(wd=>!gymTemplates?.[wd]?.combos?.length));
+  const [autoPreview,setAutoPreview]=useState(null); // {templates, dayTypeLabels} once generated, shown before applying
+  const toggleAutoDay=wd=>setAutoDays(prev=>prev.includes(wd)?prev.filter(x=>x!==wd):[...prev,wd].sort((a,b)=>WEEKDAY_ORDER.indexOf(a)-WEEKDAY_ORDER.indexOf(b)));
+  const generate=()=>{
+    if(!autoDays.length)return;
+    setAutoPreview(autoBuildGymPlan(autoDays,preference,gymExerciseLibrary));
+  };
+  const applyAutoPlan=()=>{
+    if(!autoPreview)return;
+    setGymSchedule(prev=>[...new Set([...(prev||[]),...autoDays])]);
+    setGymTemplates(prev=>({...(prev||{}),...autoPreview.templates}));
+    setAutoPreview(null);setAutoOpen(false);
+  };
+
   return(<Sheet onClose={onClose} title="Gym Settings">
     <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Default gym days</div>
     <div style={{display:"flex",gap:5,marginBottom:16}}>{WEEKDAY_ORDER.map(id=>{const wd=WEEKDAYS[id];const on=(gymSchedule||[]).includes(wd.id);return(<button key={wd.id} onClick={()=>toggle(wd.id)} style={{flex:1,padding:"9px 0",borderRadius:9,border:`1px solid ${on?C.orange:C.border}`,background:on?`${C.orange}18`:C.bg,color:on?C.orange:C.muted,fontWeight:on?700:400,cursor:"pointer",fontSize:11}}>{wd.label}</button>);})}</div>
@@ -3930,10 +4255,49 @@ function GymSetupSheet({gymSchedule,setGymSchedule,gymSettings,setGymSettings,gy
     ))}</div>
     {method==="custom"&&<div style={{marginBottom:16}}><Field label="Your approach" value={gymSettings?.customNote||""} onChange={setNote} placeholder="e.g. pyramid sets, deload every 4th week"/></div>}
 
+    {/* How the user likes exercises laid out — read by both manual template editing (as a
+        preference to keep in mind) and the auto-builder below (which actually applies it). */}
+    <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Combos or solo exercises?</div>
+    <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:16}}>{COMBO_PREFERENCES.map(pr=>(
+      <button key={pr.id} onClick={()=>setPreference(pr.id)} style={{padding:"11px 13px",borderRadius:10,border:`1px solid ${preference===pr.id?C.blue:C.border}`,background:preference===pr.id?`${C.blue}12`:C.bg,cursor:"pointer",textAlign:"left"}}>
+        <div style={{fontSize:13,fontWeight:preference===pr.id?700:500,color:preference===pr.id?C.blue:C.text}}>{pr.emoji} {pr.label}</div>
+        <div style={{fontSize:10,color:C.muted,marginTop:2,lineHeight:1.4}}>{pr.desc}</div>
+      </button>
+    ))}</div>
+
     <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Usual sets per combo</div>
     <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:16}}>
       <input type="text" inputMode="numeric" value={gymSettings?.targetSetsPerCombo||""} onChange={e=>setGymSettings(p=>({...(p||{}),targetSetsPerCombo:parseInt(e.target.value.replace(/\D/g,""))||null}))} placeholder="e.g. 3" style={{width:70,background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 10px",color:C.text,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
       <span style={{fontSize:11,color:C.muted,flex:1,lineHeight:1.4}}>Optional — shows a heads-up once you've hit this many rounds on a combo, so you know it's about time to move on.</span>
+    </div>
+
+    {/* Auto-builder: generates day plans instead of building them by hand, using the
+        combo/solo/mix preference above and a standard split (full body / upper-lower /
+        push-pull-legs) sized to however many days are picked. */}
+    <div style={{background:C.card,border:`1px solid ${autoOpen?C.lime:C.border}`,borderRadius:12,padding:"12px 14px",marginBottom:16}}>
+      <button onClick={()=>{setAutoOpen(p=>!p);setAutoPreview(null);}} style={{width:"100%",background:"none",border:"none",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",padding:0}}>
+        <span style={{fontSize:13,fontWeight:600,color:autoOpen?C.lime:C.text}}>🪄 Build my plan for me</span>
+        <span style={{fontSize:11,color:C.muted}}>{autoOpen?"▲":"▼"}</span>
+      </button>
+      {autoOpen&&(<div style={{marginTop:10}}>
+        <div style={{fontSize:11,color:C.muted,marginBottom:8,lineHeight:1.4}}>Pick how many days you train — I'll lay out a standard split ({preference==="solo"?"solo exercises":preference==="combos"?"paired combos":"mixed"}) covering the major muscle groups. This replaces the plan for any day picked below.</div>
+        <div style={{display:"flex",gap:5,marginBottom:10}}>{WEEKDAY_ORDER.map(id=>{const wd=WEEKDAYS[id];const on=autoDays.includes(wd.id);return(<button key={wd.id} onClick={()=>{toggleAutoDay(wd.id);setAutoPreview(null);}} style={{flex:1,padding:"9px 0",borderRadius:9,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,fontWeight:on?700:400,cursor:"pointer",fontSize:11}}>{wd.label}</button>);})}</div>
+        {!autoPreview&&<button onClick={generate} disabled={!autoDays.length} style={{width:"100%",padding:"10px 0",borderRadius:9,background:autoDays.length?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,cursor:autoDays.length?"pointer":"default",fontSize:13}}>{autoDays.length?`Generate for ${autoDays.length} day${autoDays.length!==1?"s":""}`:"Pick at least one day"}</button>}
+        {autoPreview&&(<div>
+          <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:10}}>{autoDays.map(wd=>{
+            const t=autoPreview.templates[wd];
+            const names=(t?.combos||[]).flatMap(c=>c.exercises.map(e=>e.name));
+            return(<div key={wd} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:9,padding:"9px 11px"}}>
+              <div style={{fontSize:12,fontWeight:600,color:C.text}}>{WEEKDAYS[wd].full} — {autoPreview.dayTypeLabels[wd]}</div>
+              <div style={{fontSize:10,color:C.muted,marginTop:3,lineHeight:1.5}}>{names.join(" · ")}</div>
+            </div>);
+          })}</div>
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={()=>setAutoPreview(null)} style={{flex:1,padding:"9px 0",borderRadius:9,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12}}>← Back</button>
+            <button onClick={applyAutoPlan} style={{flex:2,padding:"9px 0",borderRadius:9,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:13}}>✓ Use this plan</button>
+          </div>
+        </div>)}
+      </div>)}
     </div>
 
     {(gymSchedule||[]).length>0&&<>
@@ -4036,8 +4400,8 @@ function GymManualLogSheet({gymExerciseLibrary, setGymExerciseLibrary, onSave, o
           <div style={{background:C.bg,border:`1px dashed ${C.border}`,borderRadius:8,padding:"8px 10px"}}>
             <input value={pickerSearch} onChange={e=>setPickerSearch(e.target.value)} placeholder="Search or type new exercise…" autoFocus style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 9px",color:C.text,fontSize:12,outline:"none",marginBottom:7}}/>
             <div style={{display:"flex",flexDirection:"column",gap:4,maxHeight:160,overflowY:"auto",marginBottom:7}}>
-              {filteredLib.map(libEx=>(<button key={libEx.id} onClick={()=>addExerciseFromLib(combo.id,libEx)} style={{padding:"6px 9px",borderRadius:6,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between"}}>
-                <span style={{fontSize:11.5,color:C.text}}>{libEx.name}</span><span style={{fontSize:9.5,color:C.muted}}>{libEx.muscleGroup}</span>
+              {filteredLib.map(libEx=>(<button key={libEx.id} onClick={()=>addExerciseFromLib(combo.id,libEx)} style={{padding:"6px 9px",borderRadius:6,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:7,justifyContent:"space-between"}}>
+                <span style={{display:"flex",alignItems:"center",gap:7,minWidth:0}}><MuscleIcon muscleGroup={libEx.muscleGroup} size={18}/><span style={{fontSize:11.5,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{libEx.name}</span></span><span style={{fontSize:9.5,color:C.muted,flexShrink:0}}>{libEx.muscleGroup}</span>
               </button>))}
               {filteredLib.length===0&&<div style={{fontSize:10.5,color:C.muted,padding:"3px 0"}}>No matches — add it as new below.</div>}
             </div>
@@ -4413,7 +4777,7 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
       {gymSetupOpen&&<GymSetupSheet
         gymSchedule={gymSchedule||[]} setGymSchedule={setGymSchedule}
         gymSettings={gymSettings} setGymSettings={setGymSettings}
-        gymTemplates={gymTemplates||{}}
+        gymTemplates={gymTemplates||{}} setGymTemplates={setGymTemplates}
         gymExerciseLibrary={gymExerciseLibrary||[]} setGymExerciseLibrary={setGymExerciseLibrary}
         onEditTemplate={wd=>{setGymSetupOpen(false);setEditingWeekday(wd);}}
         onClose={()=>setGymSetupOpen(false)}
@@ -5956,7 +6320,7 @@ function SettingsTab({profile,setProfile,weights,setWeights,weightPhases,setWeig
         <input ref={ref} type="file" accept=".json" style={{display:"none"}} onChange={importData}/>
       </div>
       {exportMsg&&<div style={{fontSize:12,color:C.lime,marginTop:8,textAlign:"center"}}>{exportMsg}</div>}
-      <div style={{fontSize:11,color:C.muted,marginTop:12,lineHeight:1.6}}>Storage: inside Claude.ai this uses Anthropic cloud storage (per account). Outside Claude.ai it uses your browser localStorage (per device). Data does not sync automatically between devices.</div>
+      <div style={{fontSize:11,color:C.muted,marginTop:12,lineHeight:1.6}}>Storage: inside Claude.ai this uses Anthropic cloud storage (per account). Outside Claude.ai it uses your browser's IndexedDB (per device) — hundreds of MB available, well above what photos and years of logs need. Data does not sync automatically between devices.</div>
     </div>
   </div>);
 }

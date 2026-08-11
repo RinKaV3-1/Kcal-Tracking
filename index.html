@@ -1313,7 +1313,15 @@ async function prepImgs(imgs) {
   return out;
 }
 const iBlks = imgs => imgs.map(i=>({type:"image",source:{type:"base64",media_type:i.mt,data:i.data}}));
-const pCtx  = ps  => ps.slice(0,30).map(p=>`${p.name}:${p.kcal}kcal P${p.p}g C${p.c}g F${p.f}g`).join("; ");
+// Pack/serving size is included so the AI can default a package-only photo (no scale) of a
+// KNOWN product to its real recorded pack size instead of guessing a generic ~100g serving —
+// previously this context carried macros only, so there was no way for it to know a matched
+// product even HAD a recorded pack size.
+const pCtx  = ps  => ps.slice(0,30).map(p=>{
+  const pack = p.packSizeG ? ` pack:${p.packSizeG}g` : "";
+  const serving = (p.servingG||p.packageG) ? ` serving:${p.servingG||p.packageG}g` : "";
+  return `${p.name}:${p.kcal}kcal P${p.p}g C${p.c}g F${p.f}g${pack}${serving}`;
+}).join("; ");
 
 function extractJSON(text) {
   if (!text) throw new Error("Empty response");
@@ -1353,6 +1361,10 @@ const TEXT_MODEL   = "claude-haiku-4-5"; // text-only calls
 // a lot for the model to reason through) — previously it surfaced straight to the user, who had
 // to manually retry until it worked. fetchClaudeOnce() only does the network round-trip; retry
 // policy lives in fetchClaudeText() below so both callAI() and callAIText() share it.
+// One attempt at the raw API call. Returns {text, truncated} rather than throwing on a
+// too-short token budget — `truncated` (from the API's own stop_reason) lets the retry loop
+// below ask for a bigger budget next time instead of blindly retrying into the same wall, or
+// worse, handing an obviously-incomplete response to extractJSON.
 async function fetchClaudeOnce(content, apiKey, model, maxTokens) {
   const headers = { "Content-Type": "application/json" };
   if (apiKey && !inClaudeAI()) {
@@ -1372,19 +1384,29 @@ async function fetchClaudeOnce(content, apiKey, model, maxTokens) {
   if (!data.content) throw new Error("No content in response: " + JSON.stringify(data).slice(0,100));
   const text = data.content.find(b => b.type === "text")?.text || "";
   if (!text.trim()) throw new Error("Empty response");
-  return text;
+  return { text, truncated: data.stop_reason === "max_tokens" };
 }
-// Retries transient failures (network hiccup, empty text block) up to 2 extra times with a
-// short backoff before giving up — the same class of failure a manual "try again" tap fixed,
-// just automatic now. A genuine API error (bad key, rate limit, etc.) still surfaces immediately
-// since retrying it would just fail the same way three times instead of once.
-async function fetchClaudeText(content, apiKey, model, maxTokens) {
+// Shared retry loop for both JSON calls (callAI) and free-text calls (callAIText). Retries up
+// to 2 extra times with a short backoff on: a network hiccup, an empty text block, a response
+// cut short by the token budget (stop_reason max_tokens — bumps the budget before retrying
+// rather than repeating the exact same truncation), or — when `parse` is supplied — the parse
+// itself failing. That last case matters: a response that came back non-empty and un-truncated
+// but still didn't parse as valid JSON (garbled formatting, stray preamble) previously wasn't
+// retried at all once the fetch itself "succeeded", which is exactly the failure users hit as
+// "Could not parse AI response" with no automatic recovery. A genuine API error (bad key, rate
+// limit) still surfaces immediately — retrying it would just fail the same way three times over.
+async function fetchClaudeWithRetry(content, apiKey, model, maxTokens, parse) {
   const delays = [0, 700, 1500];
-  let lastErr;
+  let lastErr, budget = maxTokens;
   for (const delay of delays) {
     if (delay) await new Promise(r => setTimeout(r, delay));
     try {
-      return await fetchClaudeOnce(content, apiKey, model, maxTokens);
+      const { text, truncated } = await fetchClaudeOnce(content, apiKey, model, budget);
+      if (truncated) {
+        budget = Math.min((budget||1500) * 2, 8192);
+        throw new Error("Truncated response (ran out of tokens) — retrying with a larger budget");
+      }
+      return parse ? parse(text) : text;
     } catch (e) {
       lastErr = e;
       if (/^API:/.test(e.message)) throw e; // not transient — don't burn retries on it
@@ -1393,13 +1415,12 @@ async function fetchClaudeText(content, apiKey, model, maxTokens) {
   throw lastErr;
 }
 async function callAI(content, apiKey, model, maxTokens) {
-  const text = await fetchClaudeText(content, apiKey, model, maxTokens);
-  return extractJSON(text);
+  return fetchClaudeWithRetry(content, apiKey, model, maxTokens, extractJSON);
 }
 
 // Same as callAI but returns the raw text response (for free-form questions, advice, etc.)
 async function callAIText(content, apiKey, model, maxTokens) {
-  return fetchClaudeText(content, apiKey, model, maxTokens);
+  return fetchClaudeWithRetry(content, apiKey, model, maxTokens);
 }
 
 // Food analysis
@@ -1477,8 +1498,8 @@ async function aFood(imgs, ps, mt, desc, apiKey) {
       + "OTHER WEIGHT RULES:\n"
       + "  • Each scale photo = one ingredient. Scale is zeroed between each.\n"
       + "  • If genuinely unreadable, set weightUncertain:true and estimate from visible portion size.\n"
-      + "  • Package label weight ('180g pack', '1L') is package size NOT consumed amount.\n"
-      + "  • Single-serve item with NO scale photo → use package size only if plausibly eaten whole.\n\n"
+      + "  • Package label weight ('180g pack', '1L') is package size NOT consumed amount — UNLESS the photo shows the whole/unopened package with no scale reading anywhere, in which case that IS the consumed amount (the user photographing an intact package with no scale is showing you the whole thing was used, not a fragment). Prefer the 'pack:' size from the known products list when this ingredient matches one, over guessing.\n"
+      + "  • Single-serve item with NO scale photo → use its package size (from the known products list, or the printed label) if plausibly eaten whole.\n\n"
       + "OTHER RULES:\n"
       + "1. DESCRIPTION PRIORITY: if the description names a specific product or flavour, match it EXACTLY from known products list.\n"
       + "2. Identify EVERY ingredient across ALL " + compressed.length + " photos. You may have up to 15 ingredients — count carefully and skip none. Small additions like syrups, oils, sweeteners, nuts, seeds, sauces still count.\n"
@@ -1489,7 +1510,11 @@ async function aFood(imgs, ps, mt, desc, apiKey) {
       + "Reply ONLY with this JSON:\n"
       + '{"type":"meal","name":"","kcal":0,"protein":0,"carbs":0,"fat":0,"totalGrams":0,"notes":"","newProduct":{"name":"","kcal":0,"p":0,"c":0,"f":0},"ingredients":[{"name":"","weightG":0,"_scaleRead":"","weightUncertain":false,"kcal":0,"protein":0,"carbs":0,"fat":0}]}';
   }
-  return callAI([{ type:"text", text:prompt }, ...iBlks(compressed)], apiKey, VISION_MODEL, 2500);
+  // 4096, not 2500 — a full 15-ingredient breakdown (each with name/weightG/_scaleRead/
+  // weightUncertain/kcal/protein/carbs/fat) genuinely needs the room, and running out mid-JSON
+  // is exactly the "Could not parse AI response" failure users hit. fetchClaudeWithRetry still
+  // bumps this further and retries if it's not enough.
+  return callAI([{ type:"text", text:prompt }, ...iBlks(compressed)], apiKey, VISION_MODEL, 4096);
 }
 
 async function aAct(imgs, apiKey) {
@@ -1527,7 +1552,7 @@ async function aPrep(imgs, ps, desc, apiKey) {
       + "  • PACKAGE WEIGHT PRINTED ON THE LABEL (e.g. '180g pack', '450g net weight', '5 porcijos') = the package SIZE, NOT what was used. Never copy that number into weightG.\n"
       + "  • Use printed package weight as consumed amount only when the item is explicitly a single-serve item eaten whole with no scale (e.g. one protein bar).\n\n"
       + "OTHER RULES:\n"
-      + "1. List EVERY ingredient shown across ALL " + c.length + " photos — this means BOTH scale-photographed ingredients AND package-only photos with no scale reading. Never silently omit an ingredient just because its photo has no scale in it. For a package-only item: (a) if the description mentions a weight/amount for it (e.g. \"200g pasta\"), use that as weightG; (b) otherwise set weightG to a single reasonable serving-size estimate for that product type (not 0) AND set 'weightUncertain': true so the user sees it needs verifying — this way the item still appears in the list with editable macros instead of vanishing. You may have up to 15 ingredients — count them carefully. Small additions like syrups, oils, sweeteners, nuts, seeds, sauces still count.\n"
+      + "1. List EVERY ingredient shown across ALL " + c.length + " photos — this means BOTH scale-photographed ingredients AND package-only photos with no scale reading. Never silently omit an ingredient just because its photo has no scale in it. For a package-only item (no scale anywhere in its photo), in this priority order: (a) if the description mentions a weight/amount for it (e.g. \"200g pasta\"), use that as weightG; (b) otherwise, if the photo identifies it as a KNOWN product from the list above that has a 'pack:' size, and the photo shows the whole/unopened package (not a partial or already-open-and-partly-used one), use that full pack size as weightG — a photo of an intact package with no scale reading is the user showing you they used the whole thing, not a fragment of it; (c) otherwise set weightG to a single reasonable serving-size estimate for that product type (not 0) AND set 'weightUncertain': true so the user sees it needs verifying — this way the item still appears in the list with editable macros instead of vanishing. You may have up to 15 ingredients — count them carefully. Small additions like syrups, oils, sweeteners, nuts, seeds, sauces still count.\n"
       + "2. The kcal/protein/carbs/fat fields you return MUST be PER-100g reference values for that ingredient (NOT per-serving, NOT scaled to the weight). If you matched a known product, copy its per-100g values exactly.\n"
       + "3. totalKcal/totalProtein/totalCarbs/totalFat at the top level ARE the meal totals (already scaled): sum of (per-100g × weightG / 100) across all ingredients.\n"
       + "4. estimatedWeightG = sum of all ingredient weightG.\n"
@@ -1546,7 +1571,7 @@ async function aPrep(imgs, ps, desc, apiKey) {
       + "Reply ONLY with JSON, no explanation:\n"
       + '{"totalKcal":0,"totalProtein":0,"totalCarbs":0,"totalFat":0,"estimatedWeightG":0,"notes":"","ingredients":[{"name":"","weightG":0,"_scaleRead":"","weightUncertain":false,"kcal":0,"protein":0,"carbs":0,"fat":0}]}' },
     ...iBlks(c),
-  ], apiKey, VISION_MODEL, 2500);
+  ], apiKey, VISION_MODEL, 4096);
 }
 
 // Cheap text-only call: generate a short generic category subtitle for a product name,
@@ -3689,6 +3714,12 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
   // Advance to the next exercise in the round (used by both "Log Set" and "Skip exercise").
   // loggedReps is null when skipping — the exercise's sets array is left untouched.
   const advanceExercise = (comboIdx, exId, loggedReps) => {
+    // The swap-alternatives panel is only meant to be open while you're deciding what to do
+    // with THIS exercise. Logging (or skipping) it without picking an alternative left the
+    // panel state pointing at an exercise that no longer qualifies to swap (canSwap requires
+    // zero sets logged) — but the panel's own render check never looked at canSwap, only at
+    // swapOpenFor matching the id, so it stayed on screen below a row that had moved on.
+    if (swapOpenFor===exId) setSwapOpenFor(null);
     updateAction(s=>{
       const c={...s.combos[comboIdx]};
       // The weight in use at the moment the set is logged is stored ON the set, not just on
@@ -5073,7 +5104,7 @@ function RecipeEditSheet({recipe, products, profile, onSave, onClose}){
 }
 
 // ── Recipe Detail Sheet (view / shop / cook) ───────────────────────────────
-function RecipeDetailSheet({recipe, onEdit, onDelete, onClose}){
+function RecipeDetailSheet({recipe, onEdit, onDelete, onLog, onClose}){
   const [shoppingMode, setShoppingMode] = useState(false);
   const [checked, setChecked] = useState({}); // {ingredientId: bool} — ephemeral, resets each visit
   const [completedSteps, setCompletedSteps] = useState({}); // {stepId: bool} — ephemeral
@@ -5118,7 +5149,10 @@ function RecipeDetailSheet({recipe, onEdit, onDelete, onClose}){
       </div>
     </div>
 
-    <button onClick={()=>setShoppingMode(p=>!p)} style={{width:"100%",padding:"11px 0",borderRadius:10,background:shoppingMode?C.lime:`${C.lime}15`,border:`1px solid ${C.lime}`,color:shoppingMode?"#000":C.lime,fontWeight:700,cursor:"pointer",fontSize:13,marginBottom:14}}>{shoppingMode?`✓ Done Shopping (${checkedCount}/${(recipe.ingredients||[]).length})`:"🛒 Shopping Mode"}</button>
+    <div style={{display:"flex",gap:8,marginBottom:14}}>
+      <button onClick={()=>setShoppingMode(p=>!p)} style={{flex:1,padding:"11px 0",borderRadius:10,background:shoppingMode?C.lime:`${C.lime}15`,border:`1px solid ${C.lime}`,color:shoppingMode?"#000":C.lime,fontWeight:700,cursor:"pointer",fontSize:13}}>{shoppingMode?`✓ Done Shopping (${checkedCount}/${(recipe.ingredients||[]).length})`:"🛒 Shopping Mode"}</button>
+      {onLog&&<button onClick={onLog} style={{flex:1,padding:"11px 0",borderRadius:10,background:`${C.blue}15`,border:`1px solid ${C.blue}`,color:C.blue,fontWeight:700,cursor:"pointer",fontSize:13}}>🍽 Log this</button>}
+    </div>
 
     {shoppingMode ? (
       <div>
@@ -5165,6 +5199,49 @@ function RecipeDetailSheet({recipe, onEdit, onDelete, onClose}){
         {firstIncompleteIdx===-1 && (recipe.instructions||[]).length>0 && <div style={{textAlign:"center",padding:"10px 0",color:C.lime,fontSize:13,fontWeight:600}}>🎉 All steps done!</div>}
       </div>
     </>)}
+  </Sheet>);
+}
+
+// ── Recipe Log Sheet — cook it, then log it ────────────────────────────────
+// Turns a recipe's free-text ingredient list into an eaten meal. Reuses IngredientConfirmPanel
+// wholesale rather than building parallel matching UI: it already does exactly what's needed
+// here — fuzzy-suggest a saved product label per ingredient name, let the user pick a different
+// one or describe it for an AI estimate instead, and keep every ingredient's grams editable.
+// That last part matters specifically for cooking: what actually went in rarely matches the
+// recipe exactly, so every amount needs to stay correctable right up to the log step.
+function RecipeLogSheet({recipe, products, apiKey, onLog, onClose}){
+  // Pull a starting gram figure out of ingredient text where the recipe already states one
+  // ("50g rolled oats" -> weightG 50, name "rolled oats"). Everything else ("1 scoop protein
+  // powder", "a banana", "1 tbsp honey") has no honest gram conversion to guess at, so it's
+  // left blank for the user to fill in — which is the point of this step anyway.
+  const parseIngredient = text => {
+    const m = (text||"").match(/^(\d+(?:[.,]\d+)?)\s*g\b\s*(.*)$/i);
+    if (m && m[2].trim()) return { name: m[2].trim(), weightG: m[1].replace(",", ".") };
+    return { name: (text||"").trim(), weightG: "" };
+  };
+  const [ingredients, setIngredients] = useState(() => (recipe.ingredients||[]).map(ing => parseIngredient(ing.text)));
+  const [mealType, setMealType] = useState(mealTypeByTime());
+
+  const confirm = (ings, totals) => {
+    const withWeight = ings.filter(i => parseFloat(i.weightG) > 0);
+    const summary = withWeight.map(i => i.name + " " + i.weightG + "g").join(", ");
+    onLog({
+      id: Date.now(), mealType, name: recipe.name,
+      kcal: Math.round(totals.kcal), protein: Math.round(totals.protein*10)/10,
+      carbs: Math.round(totals.carbs*10)/10, fat: Math.round(totals.fat*10)/10,
+      ingredients: withWeight.map(i => ({name:i.name, weightG:String(i.weightG), kcal:i._kcal100??i.kcal??0, protein:i._p100??i.protein??0, carbs:i._c100??i.carbs??0, fat:i._f100??i.fat??0})),
+      notes: summary, time: new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"}),
+    });
+  };
+
+  return(<Sheet onClose={onClose} title={`Log "${recipe.name}"`}>
+    <div style={{fontSize:11,color:C.muted,marginBottom:12,lineHeight:1.4}}>Match each ingredient to one of your product labels — or pick a different one, or describe it for an estimate — and correct the grams to whatever you actually used.</div>
+    <div style={{display:"flex",gap:4,marginBottom:14}}>{MEAL_TYPES.map(mt=>(
+      <button key={mt.id} onClick={()=>setMealType(mt.id)} style={{flex:1,padding:"5px 2px",borderRadius:7,border:`1px solid ${mealType===mt.id?C.lime:C.border}`,background:mealType===mt.id?`${C.lime}18`:C.bg,color:mealType===mt.id?C.lime:C.muted,cursor:"pointer",fontSize:8.5,textAlign:"center",lineHeight:1.4}}>
+        <div style={{fontSize:11}}>{mt.emoji}</div><div>{mt.label}</div>
+      </button>
+    ))}</div>
+    <IngredientConfirmPanel ingredients={ingredients} setIngredients={setIngredients} products={products} apiKey={apiKey} confirmLabel="Log to Today →" onSkip={onClose} onConfirm={confirm}/>
   </Sheet>);
 }
 
@@ -5250,13 +5327,14 @@ function RecipeSuggestSheet({products, profile, onSave, onClose}){
   </Sheet>);
 }
 
-function RecipesSection({recipes, setRecipes, products, profile}){
+function RecipesSection({recipes, setRecipes, products, profile, onLogMeal}){
   const [expanded, setExpanded] = useState(false);
   const [catFilter, setCatFilter] = useState(null);
   const [viewing, setViewing] = useState(null); // recipe being viewed
   const [editing, setEditing] = useState(null); // recipe being edited, or {} for new
   const [suggesting, setSuggesting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
+  const [logging, setLogging] = useState(null); // recipe being logged as an eaten meal
 
   const filtered = (recipes||[]).filter(r=>!catFilter||r.category===catFilter);
   const saveRecipe = rec => {
@@ -5302,9 +5380,10 @@ function RecipesSection({recipes, setRecipes, products, profile}){
         })}
       </div>
     </>)}
-    {viewing && <RecipeDetailSheet recipe={viewing} onEdit={()=>{setEditing(viewing);setViewing(null);}} onDelete={()=>setConfirmDelete(viewing.id)} onClose={()=>setViewing(null)}/>}
+    {viewing && <RecipeDetailSheet recipe={viewing} onEdit={()=>{setEditing(viewing);setViewing(null);}} onDelete={()=>setConfirmDelete(viewing.id)} onLog={onLogMeal?()=>{setLogging(viewing);setViewing(null);}:null} onClose={()=>setViewing(null)}/>}
     {editing!==null && <RecipeEditSheet recipe={editing.id?editing:null} products={products} profile={profile} onSave={saveRecipe} onClose={()=>setEditing(null)}/>}
     {suggesting && <RecipeSuggestSheet products={products} profile={profile} onSave={saveRecipe} onClose={()=>setSuggesting(false)}/>}
+    {logging && <RecipeLogSheet recipe={logging} products={products} apiKey={profile?.apiKey} onLog={meal=>{onLogMeal(meal);setLogging(null);}} onClose={()=>setLogging(null)}/>}
     {confirmDelete && (<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",zIndex:70,display:"flex",alignItems:"center",justifyContent:"center",padding:20}} onClick={e=>e.target===e.currentTarget&&setConfirmDelete(null)}>
       <div style={{background:C.card,border:"1px solid #5a1a1a",borderRadius:14,padding:20,maxWidth:320}}>
         <div style={{fontSize:14,color:"#ff8080",marginBottom:14}}>Delete this recipe? This can't be undone.</div>
@@ -5354,7 +5433,7 @@ const defaultGramsFor = prod => {
   return serving ? String(serving) : "100";
 };
 
-function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,weightPhases,recipes,setRecipes}){
+function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,weightPhases,recipes,setRecipes,onLogMeal}){
   const [modal,setModal]=useState(false);const [editPrep,setEditPrep]=useState(null);const [showProd,setShowProd]=useState(false);
   const [search,setSearch]=useState("");const [showAdd,setShowAdd]=useState(false);const [editPIdx,setEditPIdx]=useState(null);
   const formRef=useRef(null); // ref on the add/edit form div — scrolled to on edit
@@ -5507,7 +5586,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
       {/* Food Coach */}
       <CoachPanel profile={profile} weights={weights||[]} products={products} mealPreps={mealPreps} weightPhases={weightPhases||[]} recipes={recipes} mode="food"/>
       <div style={{marginBottom:16}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Meal Preps</div>{mealPreps.length===0&&<div style={{textAlign:"center",padding:"16px 0",color:C.muted,fontSize:13}}>No meal preps yet. Tap + to create.</div>}{active.length>0&&<div style={{marginBottom:8}}><div style={{display:"flex",flexDirection:"column",gap:8}}>{active.map(p=><PrepCard key={p.id} prep={p}/>)}</div></div>}{done.length>0&&<div><button onClick={()=>setShowDone(p=>!p)} style={{width:"100%",padding:"8px 12px",borderRadius:10,background:C.card,border:`1px solid ${showDone?C.border:C.dim}`,color:C.muted,fontWeight:600,cursor:"pointer",fontSize:11,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:showDone?8:0,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}><span>Finished ({done.length})</span><span>{showDone?"▲":"▼"}</span></button>{showDone&&<div style={{display:"flex",flexDirection:"column",gap:8}}>{done.map(p=><PrepCard key={p.id} prep={p}/>)}</div>}</div>}</div>
-      <RecipesSection recipes={recipes} setRecipes={setRecipes} products={products} profile={profile}/>
+      <RecipesSection recipes={recipes} setRecipes={setRecipes} products={products} profile={profile} onLogMeal={onLogMeal}/>
       <button onClick={()=>setShowProd(p=>!p)} style={{width:"100%",padding:"12px 16px",borderRadius:12,background:C.card,border:`1px solid ${showProd?C.lime:C.border}`,color:showProd?C.lime:C.text,fontWeight:600,cursor:"pointer",fontSize:13,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:showProd?10:0}}><span>Product Labels ({products.length})</span><span style={{fontSize:11}}>{showProd?"▲":"▼"}</span></button>
       {showProd&&<div><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}><span style={{fontSize:11,color:C.muted}}>per 100g</span><button onClick={()=>{setShowAdd(p=>!p);setEditPIdx(null);setPForm(EMPTY_PFORM);setScanImgs([]);}} style={{padding:"7px 14px",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>+ Add</button></div><input placeholder="Search products…" value={search} onChange={e=>setSearch(e.target.value)} style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"9px 14px",color:C.text,fontSize:13,outline:"none",marginBottom:8}}/>
       {saveToast&&(saveToast.type==="added"||saveToast.type==="updated")&&<div style={{background:`${C.lime}15`,border:`1px solid ${C.lime}66`,borderRadius:10,padding:"9px 13px",marginBottom:10,display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}><div style={{fontSize:12,color:C.lime,fontWeight:600}}>✓ {saveToast.type==="added"?"Added":"Updated"}: <span style={{fontFamily:"monospace"}}>{saveToast.name}</span></div><button onClick={()=>setSaveToast(null)} style={{background:"none",border:"none",color:C.lime,fontSize:16,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button></div>}
@@ -5828,39 +5907,6 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases, gymSes
 }
 
 // ── History Tab (shows weight per day) ───────────────────────────────────────
-// Groups the flat medication log by date (most recent first) and shows a compact taken/skipped
-// list per day — collapsed by default since most users won't check this daily.
-function MedHistorySection({medLog}){
-  const [open,setOpen]=useState(false);
-  const [showAll,setShowAll]=useState(false);
-  if(!medLog||medLog.length===0)return null;
-  const byDate={};
-  for(const l of medLog){(byDate[l.date]=byDate[l.date]||[]).push(l);}
-  const dates=Object.keys(byDate).sort((a,b)=>b.localeCompare(a));
-  const shown=showAll?dates:dates.slice(0,14);
-  return(<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"12px 14px",marginBottom:12}}>
-    <button onClick={()=>setOpen(p=>!p)} style={{width:"100%",background:"none",border:"none",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-      <span style={{fontSize:14,fontWeight:600,color:C.text}}>💊 Medications & Supplements</span>
-      <span style={{fontSize:12,color:C.muted}}>{open?"▲":"▼"}</span>
-    </button>
-    {open&&<div style={{marginTop:10,display:"flex",flexDirection:"column",gap:8}}>
-      {shown.map(date=>(<div key={date}>
-        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",marginBottom:4}}>{new Date(date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</div>
-        <div style={{display:"flex",flexDirection:"column",gap:4}}>
-          {byDate[date].map(l=>{
-            const win=medWindowById(l.window);
-            const taken=l.status==="taken";
-            return(<div key={l.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:C.bg,borderRadius:7,padding:"6px 10px"}}>
-              <span style={{fontSize:12,color:C.text}}>{win?.emoji} {l.name||"(deleted medication)"}</span>
-              <span style={{fontSize:11,fontFamily:"monospace",color:taken?C.lime:C.muted}}>{taken?`✓ taken ${l.doseTaken||""}`.trim():"skipped"} · {l.time}</span>
-            </div>);
-          })}
-        </div>
-      </div>))}
-      {!showAll&&dates.length>14&&<button onClick={()=>setShowAll(true)} style={{fontSize:11,color:C.muted,background:"none",border:`1px dashed ${C.border}`,borderRadius:6,padding:"5px 0",cursor:"pointer"}}>▾ Show all {dates.length} days</button>}
-    </div>}
-  </div>);
-}
 function HistoryTab({weights,products,profile,medications,medLog}){
   const [dates,setDates]=useState([]);const [logs,setLogs]=useState({});const [expanded,setExpanded]=useState(null);const [loading,setLoading]=useState(true);
   const [editMeal,setEditMeal]=useState(null);const [editAct,setEditAct]=useState(null);const [addMealDate,setAddMealDate]=useState(null);const [addActDate,setAddActDate]=useState(null);
@@ -5894,7 +5940,6 @@ function HistoryTab({weights,products,profile,medications,medLog}){
       <button onClick={()=>createDay(newDayDate)} disabled={!newDayDate} style={{padding:"9px 14px",borderRadius:8,background:newDayDate?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,cursor:newDayDate?"pointer":"default",fontSize:13}}>Add</button>
       <button onClick={()=>setNewDayPicker(false)} style={{padding:"9px 10px",borderRadius:8,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:13}}>✕</button>
     </div>}
-    <MedHistorySection medLog={medLog}/>
     {loading&&<div style={{textAlign:"center",padding:"40px 0",color:C.muted}}>Loading…</div>}
     {!loading&&!dates.length&&<div style={{textAlign:"center",padding:"40px 0",color:C.muted}}>No history yet.</div>}
     <div style={{display:"flex",flexDirection:"column",gap:7}}>
@@ -6002,6 +6047,22 @@ function HistoryTab({weights,products,profile,medications,medLog}){
               return(<div key={m.id}>{editMeal?.date===date&&editMeal?.id===m.id?<EditMealInline meal={m} onSave={meal=>updateMeal(date,meal)} onCancel={()=>setEditMeal(null)} products={products} apiKey={profile?.apiKey}/>:<div style={{background:C.bg,borderRadius:10,padding:"9px 12px"}}><div style={{display:"flex",alignItems:"center",gap:8}}><div style={{flex:1,minWidth:0}}><div style={{display:"flex",alignItems:"baseline",gap:6,marginBottom:3,flexWrap:"wrap"}}><span style={{fontSize:13,fontWeight:600,color:C.text,wordBreak:"break-word"}}>{mtEmoji} {m.name}</span><span style={{fontSize:10,color:C.muted,fontFamily:"monospace",flexShrink:0}}>{m.time}</span></div><div style={{display:"flex",gap:8}}><Chip val={m.kcal} label="k" color={C.lime}/><Chip val={m.protein} label="P" color={C.blue}/><Chip val={m.carbs} label="C" color={C.orange}/><Chip val={m.fat} label="F" color={C.purple}/></div></div><button onClick={()=>setEditMeal({date,id:m.id})} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12,cursor:"pointer",padding:"4px 7px",borderRadius:6,lineHeight:1}}>✎</button><button onClick={()=>deleteMeal(date,m.id)} style={{background:"none",border:"none",color:C.faint,fontSize:16,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div>{m.notes&&<div style={{fontSize:10,color:C.muted,marginTop:5,lineHeight:1.4,wordBreak:"break-word"}}>📋 {m.notes}</div>}</div>}</div>);
             })}{!log.meals?.length&&<div style={{fontSize:12,color:C.muted,padding:"4px 0"}}>No meals.</div>}</div></div>
             <div><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}><span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Activities{actKcal>0&&<span style={{color:C.orange,marginLeft:6}}>+{Math.round(actKcal)}kcal</span>}</span><button onClick={()=>setAddActDate(addActDate===date?null:date)} style={{fontSize:11,color:C.orange,background:"none",border:`1px solid ${C.orange}`,borderRadius:6,padding:"3px 10px",cursor:"pointer",fontWeight:600}}>+ Add</button></div>{addActDate===date&&<div style={{marginBottom:8}}><AddActManual onAdd={act=>addAct(date,act)} onCancel={()=>setAddActDate(null)}/></div>}<div style={{display:"flex",flexDirection:"column",gap:6}}>{(log.activities||[]).map(a=><div key={a.id}>{editAct?.date===date&&editAct?.id===a.id?<EditActInline act={a} onSave={act=>updateAct(date,act)} onCancel={()=>setEditAct(null)}/>:<div style={{background:C.bg,borderRadius:10,padding:"9px 12px",display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:18}}>{a.type==="gym"?"🏋️":a.type==="run"?"🏃":"🚶"}</span><div style={{flex:1}}><span style={{fontSize:13,color:C.text}}>{a.label}</span><div style={{display:"flex",gap:8,marginTop:2}}><span style={{fontFamily:"monospace",fontSize:11,color:C.orange}}>{Math.round(a.kcal)}kcal</span>{a.distanceKm&&<span style={{fontFamily:"monospace",fontSize:10,color:C.muted}}>{a.distanceKm}km</span>}{a.durationMin&&<span style={{fontFamily:"monospace",fontSize:10,color:C.muted}}>{a.durationMin}min</span>}</div></div><button onClick={()=>setEditAct({date,id:a.id})} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12,cursor:"pointer",padding:"4px 7px",borderRadius:6,lineHeight:1}}>✎</button><button onClick={()=>deleteAct(date,a.id)} style={{background:"none",border:"none",color:C.faint,fontSize:16,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div>}</div>)}{!(log.activities||[]).length&&<div style={{fontSize:12,color:C.muted,padding:"4px 0"}}>No activities.</div>}</div></div>
+            {/* Medications logged for this date — shown alongside meals/activities for the same
+                day instead of in a separate section, so one day's full picture is in one place. */}
+            {(()=>{const medsForDate=(medLog||[]).filter(l=>l.date===date);
+              if(!medsForDate.length)return null;
+              return(<div style={{marginTop:10}}>
+                <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:7}}>Medications & Supplements</div>
+                <div style={{display:"flex",flexDirection:"column",gap:6}}>{medsForDate.map(l=>{
+                  const win=medWindowById(l.window);
+                  const taken=l.status==="taken";
+                  return(<div key={l.id} style={{background:C.bg,borderRadius:10,padding:"9px 12px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{fontSize:13,color:C.text}}>{win?.emoji} 💊 {l.name||"(deleted medication)"}</span>
+                    <span style={{fontSize:11,fontFamily:"monospace",color:taken?C.lime:C.muted}}>{taken?`✓ taken ${l.doseTaken||""}`.trim():"skipped"} · {l.time}</span>
+                  </div>);
+                })}</div>
+              </div>);
+            })()}
           </div>}
         </div>);
       })}
@@ -6742,6 +6803,11 @@ function App(){
     if (status==="taken" && med.packageSize) {
       setMedications(p=>p.map(x=>x.id===med.id?{...x,remaining:Math.max(0,(x.remaining??x.packageSize)-(med.dosePerTake||0))}:x));
     }
+    // Medication history now renders inside each day's row in History (alongside meals and
+    // activities), which only lists dates present in fit_dates. A day where the ONLY thing
+    // logged is a medication was never added there — indexing it here keeps it from being an
+    // invisible entry with no row to show up in.
+    addToIndex(med.dueDate);
   }, [setMedLog, setMedications]);
   const latestWeight=weights[0]?.weight;
   // Auto-revert temporary goal when its revert date arrives
@@ -6782,7 +6848,7 @@ function App(){
     <div style={{flex:1,overflow:"hidden"}}>
       {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence}/>}
       {viewTab==="activity"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary}/>}
-      {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes}/>}
+      {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes} onLogMeal={meal=>setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}))}/>}
       {viewTab==="history"&&<HistoryTab weights={weights} products={products} profile={profile} medications={medications} medLog={medLog}/>}
       {viewTab==="settings"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight} medications={medications} setMedications={setMedications}/>}
     </div>

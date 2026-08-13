@@ -395,14 +395,17 @@ button[disabled]:active,button:disabled:active{transform:none;opacity:.45}
   *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
 }
 
-/* App shell. Anchored with position:fixed + inset:0 rather than a height value, because
-   height on mobile is the unreliable part: 100vh is measured against the viewport with the
-   browser chrome hidden, and mixing it with a 100dvh max leaves the shell a different height
-   than the visible area depending on which unit the browser honours. That mismatch is what
-   left the tab bar floating short of the bottom edge. A fixed box pinned to all four sides is
-   exactly the visual viewport on every engine, with no unit arithmetic to disagree about. */
+/* App shell. inset:0 alone (used previously) turned out not to be enough: iOS Safari hides
+   its own toolbar on scroll, and position:fixed elements don't reliably re-measure against the
+   now-taller visual viewport when that happens on every engine version — the shell can stay
+   sized to the pre-scroll viewport, leaving a gap where the toolbar used to be, with the tab
+   bar floating short of the true bottom edge. --app-height is kept in sync with
+   window.visualViewport (see the effect in App()) specifically to track that live, so the shell
+   is always exactly the currently-visible height rather than whatever the layout viewport
+   happened to be at last reflow. 100dvh is the fallback for browsers without visualViewport. */
 .app-shell{
-  position:fixed; inset:0; margin:0 auto; max-width:520px;
+  position:fixed; top:0; left:0; right:0; margin:0 auto; max-width:520px;
+  height:var(--app-height, 100dvh);
   display:flex; flex-direction:column; overflow:hidden;
   background:${C.bg};
 }
@@ -1022,8 +1025,21 @@ function getTDEE(profile,weight){
 // Replaces the old fixed `DAY_BURN = {gym:300, run_short:400, run_long:600}` table, which
 // charged a 55kg and a 110kg athlete identically. Those constants happened to be about right
 // at 70kg, so a 70kg user sees little change here; lighter users get less, heavier users more.
-function plannedDayBurn(dayType, weightKg) {
+// `gymSessions`, when passed, personalizes the "gym" planned figure using real history instead
+// of the generic METs formula: the LOWEST kcalBurned among the last 7 logged gym sessions,
+// discounted a further 5% as a safety margin. Lowest-of-recent rather than an average means a
+// single unusually light session doesn't get averaged away — the assumed burn stays
+// conservative until sessions consistently clear a higher bar. This is still only the PLANNED
+// figure: dayBurnTotal() below takes the larger of planned vs logged, so today's real number
+// always wins once the session is actually finished — the assumed number just stops being a
+// generic formula guess and starts being "the worst you've actually done lately, minus a
+// margin," which degrades gracefully to the old formula for anyone with no gym history yet.
+function plannedDayBurn(dayType, weightKg, gymSessions) {
   const w = weightKg || 75;
+  if (dayType === "gym") {
+    const recent = (gymSessions||[]).filter(s=>(s.kcalBurned||0)>0).slice(0,7);
+    if (recent.length > 0) return Math.round(Math.min(...recent.map(s=>s.kcalBurned)) * 0.95);
+  }
   switch (dayType) {
     case "gym":       return Math.round(netMetKcal(ENERGY.LIFT_METS, w, ENERGY.PLANNED_LIFT_MIN));
     case "run_short": return Math.round(runKcal(ENERGY.PLANNED_RUN_SHORT_KM, w));
@@ -1037,8 +1053,8 @@ function plannedDayBurn(dayType, weightKg) {
 // If the user logged actual activities, we use the larger of (logged, planned) so that
 // partial-logging doesn't silently lower the target. extraBurn here is the total kcal of
 // logged activities + any manual burnedExtra.
-function dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weightKg) {
-  const planned = plannedDayBurn(dayType, weightKg);
+function dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weightKg, gymSessions) {
+  const planned = plannedDayBurn(dayType, weightKg, gymSessions);
   const logged = extraBurn || 0;
   if (!hasLoggedActivity) return planned;
   // User logged activity — use the larger of what they actually burned vs the planned baseline.
@@ -1078,12 +1094,12 @@ const PROTEIN_G_PER_KG = {cut:2.2, maintain:1.8, bulk:1.6};
 // Returns `{kcal,protein,carbs,fat,unavailable?,issues}`. When the profile can't support a
 // calculation the numbers come back zeroed with `unavailable:true`, so callers show
 // "complete your profile" rather than a plausible-looking invention.
-function getDT(profile,dayType,weight,extraBurn=0,hasLoggedActivity=false,dailySteps=0){
+function getDT(profile,dayType,weight,extraBurn=0,hasLoggedActivity=false,dailySteps=0,gymSessions=null){
   const issues=targetIssues(profile,weight);
   const tdee=getTDEE(profile,weight);
   if(!tdee) return {kcal:0,protein:0,carbs:0,fat:0,unavailable:true,issues};
 
-  const burn = dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weight);
+  const burn = dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weight, gymSessions);
   const stepBonus = stepsKcal(dailySteps, profile.activityLevel||"sedentary", weight);
   const base = tdee + burn + stepBonus;
 
@@ -1137,10 +1153,10 @@ function getDT(profile,dayType,weight,extraBurn=0,hasLoggedActivity=false,dailyS
   }
   return {kcal, protein, carbs, fat:finalFat, issues};
 }
-function getMaint(profile,dayType,weight,extraBurn=0,hasLoggedActivity=false,dailySteps=0){
+function getMaint(profile,dayType,weight,extraBurn=0,hasLoggedActivity=false,dailySteps=0,gymSessions=null){
   const tdee=getTDEE(profile,weight);if(!tdee)return null;
   const stepBonus = stepsKcal(dailySteps, profile.activityLevel||"sedentary", weight);
-  return Math.round(tdee + dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weight) + stepBonus);
+  return Math.round(tdee + dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weight, gymSessions) + stepBonus);
 }
 // Trend over the last ~21 days (or up to 14 entries if you weigh more often).
 // Requires at least 4 entries spanning at least 3 days. Returns kg/week (negative = losing).
@@ -1305,12 +1321,11 @@ async function resizeImg(dataUrl, maxPx=1024) {
   });
 }
 async function prepImgs(imgs) {
-  const out = [];
-  for (const img of imgs.slice(0, 15)) {
-    const resized = await resizeImg(img.preview);
-    out.push({ data: resized.split(",")[1], mt: "image/jpeg", preview: resized });
-  }
-  return out;
+  // Resize every photo concurrently rather than one at a time — image decode happens off the
+  // main thread in every modern browser, so awaiting them sequentially in a loop was paying
+  // that decode latency N times over for N photos instead of once. Promise.all preserves order.
+  const resized = await Promise.all(imgs.slice(0, 15).map(img => resizeImg(img.preview)));
+  return resized.map(r => ({ data: r.split(",")[1], mt: "image/jpeg", preview: r }));
 }
 const iBlks = imgs => imgs.map(i=>({type:"image",source:{type:"base64",media_type:i.mt,data:i.data}}));
 // Pack/serving size is included so the AI can default a package-only photo (no scale) of a
@@ -1775,7 +1790,14 @@ function TimerRing({remaining,total,label,size=120}){
 // report (the API doesn't stream progress), so this is an honest indeterminate bar plus an
 // elapsed-time counter — which is what the "how long is this going to take" complaint actually
 // needed: not a fake percentage, just proof it's still working and a sense of the wait so far.
-function AnalyzeProgress({active, label="Analyzing"}){
+//
+// The text used to assert a flat "15–25s" ceiling after 12s, which was simply false for a
+// heavier request (5 photos measured at 60s+) — a wrong number is worse than no number, since
+// it reads as the app lying about its own progress. Nothing here asserts an upper bound any
+// more: photoCount sets expectations up front (more photos = more reasoning, said honestly
+// before the wait starts), and the elapsed-time message only ever describes what's already
+// true ("still working"), never promises when it'll finish.
+function AnalyzeProgress({active, label="Analyzing", photoCount=0}){
   const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
     if (!active) { setElapsed(0); return; }
@@ -1784,12 +1806,16 @@ function AnalyzeProgress({active, label="Analyzing"}){
     return () => clearInterval(id);
   }, [active]);
   if (!active) return null;
+  let note = "";
+  if (elapsed >= 40) note = " — still working, heavier requests can take a minute or more";
+  else if (elapsed >= 15) note = " — still working";
+  else if (photoCount > 3) note = ` — ${photoCount} photos, this will take a while`;
   return (<div style={{marginTop:8}} role="status" aria-live="polite">
     <div style={{height:4,borderRadius:2,background:C.dim,overflow:"hidden"}}>
       <div style={{height:"100%",width:"38%",background:C.blue,borderRadius:2,animation:"analyzeSlide 1.3s ease-in-out infinite"}}/>
     </div>
     <div style={{fontSize:10,color:C.muted,marginTop:5,textAlign:"center",fontFamily:"monospace"}}>
-      {label}… {elapsed}s{elapsed>=12?" — multiple photos with scales can take 15–25s":""}
+      {label}… {elapsed}s{note}
     </div>
   </div>);
 }
@@ -2762,7 +2788,7 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
           <textarea value={photoDesc} onChange={e=>setPhotoDesc(e.target.value)} rows={1} placeholder="Optional description (e.g. 'green beans 100g + soy sauce')" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:12,outline:"none",resize:"none",marginTop:7,fontFamily:"inherit"}}/>
           {photoErr&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:6,padding:"6px 9px",fontSize:11,color:"#ff8080",marginTop:7,wordBreak:"break-word"}}>{photoErr}</div>}
           {photoImgs.length>0&&<button onClick={async()=>{setPhotoLoading(true);setPhotoErr(null);try{const r=await aFood(photoImgs,products,"home",photoDesc,apiKey);if(r?.ingredients?.length){setPhotoIngs(r.ingredients);}else{setPhotoErr("No ingredients detected — try a clearer photo or use Manual.");}}catch(e){setPhotoErr(String(e.message||e));}setPhotoLoading(false);}} disabled={photoLoading} style={{width:"100%",padding:"9px 0",borderRadius:8,background:photoLoading?C.faint:C.blue,color:"#000",fontWeight:700,border:"none",cursor:photoLoading?"default":"pointer",fontSize:12,marginTop:8}}>{photoLoading?"Analyzing…":"🔍 Analyze"}</button>}
-          <AnalyzeProgress active={photoLoading}/>
+          <AnalyzeProgress active={photoLoading} photoCount={photoImgs.length}/>
         </>):(<>
           <div style={{fontSize:11,color:C.muted,marginBottom:7}}>Confirm what was detected — adjust weights as needed:</div>
           <IngredientConfirmPanel ingredients={photoIngs} setIngredients={setPhotoIngs} products={products} apiKey={apiKey} confirmLabel="Add These Extras" onSkip={()=>{setExtrasMode(null);setPhotoIngs(null);setPhotoImgs([]);}} onConfirm={(ings)=>{const newExtras=ings.filter(i=>parseFloat(i.weightG)>0).map(i=>{const g=parseFloat(i.weightG)||0;const s=g/100;return{id:Date.now()+Math.random(),source:"photo",name:i.name||"extra",weightG:g,kcal:(i.kcal||i._kcal100||0)*s,protein:(i.protein||i._p100||0)*s,carbs:(i.carbs||i._c100||0)*s,fat:(i.fat||i._f100||0)*s};});setExtras(p=>[...p,...newExtras]);setExtrasMode(null);setPhotoIngs(null);setPhotoImgs([]);}}/>
@@ -2956,7 +2982,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
       <button onClick={analyze} disabled={!canAnalyze} style={{width:"100%",padding:"12px 0",borderRadius:10,background:canAnalyze?C.lime:C.faint,color:"#000",fontWeight:700,border:"none",cursor:canAnalyze?"pointer":"default",fontSize:15,marginTop:10}}>
         {loading?"Analyzing…":mt==="canteen"?"Estimate Meal":`Analyze ${imgs.length} photo${imgs.length!==1?"s":""}`}
       </button>
-      <AnalyzeProgress active={loading}/>
+      <AnalyzeProgress active={loading} photoCount={imgs.length}/>
       {mt==="canteen"&&!desc.trim()&&<div style={{fontSize:11,color:C.muted,marginTop:5,textAlign:"center"}}>Add a description first</div>}
     </>)}
     {mode==="manual"&&!result&&(<>
@@ -3157,7 +3183,7 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
 
     {/* Analyze — works with or without photos */}
     {!result&&!showPanel&&!buildMode&&<button onClick={analyze} disabled={loading||(!imgs.length&&!desc.trim())} style={{width:"100%",padding:"14px 0",borderRadius:10,background:loading?C.faint:(imgs.length||desc.trim())?C.lime:C.faint,color:"#000",fontWeight:800,border:"none",cursor:(loading||(!imgs.length&&!desc.trim()))?"default":"pointer",fontSize:15,marginTop:10,boxShadow:(!loading&&(imgs.length||desc.trim()))?`0 0 12px ${C.lime}40`:"none"}}>{loading?"Analyzing…":imgs.length?`🔍 Analyze ${imgs.length} photo${imgs.length!==1?"s":""}${desc.trim()?" + description":""}`:desc.trim()?"🔍 Estimate from description":"Add photos or a description first"}</button>}
-    <AnalyzeProgress active={loading}/>
+    <AnalyzeProgress active={loading} photoCount={imgs.length}/>
     {!result&&!showPanel&&!buildMode&&<button onClick={()=>{setBuildMode("labels");setLabelIngs([]);setPickedProd(null);setPickSearch("");}} style={{width:"100%",padding:"10px 0",borderRadius:10,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12,marginTop:8}}>🏷️ Build from product labels manually</button>}
     {err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ff8080",margin:"10px 0",wordBreak:"break-word"}}>{err}</div>}
 
@@ -3243,7 +3269,7 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
   </Sheet>);
 }
 // ── Today Tab ─────────────────────────────────────────────────────────────────
-function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProducts,profile,latestWeight,weights,setWeights,onGoToSettings,medications,medLog,onMarkMed}){
+function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProducts,profile,latestWeight,weights,setWeights,onGoToSettings,medications,medLog,onMarkMed,gymSessions}){
   const [modal,setModal]=useState(null);const [wInput,setWInput]=useState("");
   // Re-render on the minute so a reminder appears/disappears exactly when its window opens or
   // closes, without needing any user action to refresh the tab.
@@ -3255,8 +3281,8 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
   const extraBurn=(dayData.activities||[]).reduce((s,a)=>s+a.kcal,0)+(dayData.burnedExtra||0);
   const hasLoggedAct=(dayData.activities||[]).length>0||(dayData.burnedExtra||0)>0;
   const dailySteps=dayData.dailySteps||0;
-  const dt=getDT(profile,dayData.dayType,latestWeight,extraBurn,hasLoggedAct,dailySteps);
-  const maint=getMaint(profile,dayData.dayType,latestWeight,extraBurn,hasLoggedAct,dailySteps);
+  const dt=getDT(profile,dayData.dayType,latestWeight,extraBurn,hasLoggedAct,dailySteps,gymSessions);
+  const maint=getMaint(profile,dayData.dayType,latestWeight,extraBurn,hasLoggedAct,dailySteps,gymSessions);
   const tot=dayData.meals.reduce((a,m)=>({kcal:a.kcal+m.kcal,protein:a.protein+m.protein,carbs:a.carbs+m.carbs,fat:a.fat+m.fat}),{kcal:0,protein:0,carbs:0,fat:0});
   const remKcal=dt.kcal-tot.kcal,remProt=dt.protein-tot.protein;
   const profileOK=profile.birthday&&profile.heightCm;const gc=gCol(profile.goal);
@@ -3373,7 +3399,7 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
       {/* Day type */}
       <div style={{marginBottom:10}}>
         <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:7}}>Day Type</div>
-        <div style={{display:"flex",gap:5}}>{Object.entries(DAY_TYPES).map(([key,val])=>{const active=dayData.dayType===key;const tKcal=getDT(profile,key,latestWeight,0,false,dailySteps).kcal;return(<button key={key} onClick={()=>setDayData(p=>({...p,dayType:key,goalMode:profile.goal,goalSubmode:profile.goalSubmode}))} style={{flex:1,padding:"7px 3px",borderRadius:10,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.card,color:active?C.lime:C.muted,fontWeight:active?700:400,cursor:"pointer",fontSize:9.5,lineHeight:1.4,textAlign:"center"}}><div style={{fontSize:14}}>{val.icon}</div><div>{val.label}</div><div style={{fontFamily:"monospace",fontSize:10,opacity:0.75,marginTop:1}}>{tKcal}</div></button>);})}</div>
+        <div style={{display:"flex",gap:5}}>{Object.entries(DAY_TYPES).map(([key,val])=>{const active=dayData.dayType===key;const tKcal=getDT(profile,key,latestWeight,0,false,dailySteps,gymSessions).kcal;return(<button key={key} onClick={()=>setDayData(p=>({...p,dayType:key,goalMode:profile.goal,goalSubmode:profile.goalSubmode}))} style={{flex:1,padding:"7px 3px",borderRadius:10,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.card,color:active?C.lime:C.muted,fontWeight:active?700:400,cursor:"pointer",fontSize:9.5,lineHeight:1.4,textAlign:"center"}}><div style={{fontSize:14}}>{val.icon}</div><div>{val.label}</div><div style={{fontFamily:"monospace",fontSize:10,opacity:0.75,marginTop:1}}>{tKcal}</div></button>);})}</div>
       </div>
 
       {/* Daily steps — optional but recalculates target when set */}
@@ -3491,6 +3517,7 @@ function GymTemplateEditor({weekday, template, setTemplate, gymExerciseLibrary, 
   const [editingNoteFor, setEditingNoteFor] = useState(null); // exercise id currently editing its note
   const [noteDraft, setNoteDraft] = useState("");
   const [swapOpenFor, setSwapOpenFor] = useState(null); // exercise id currently showing swap alternatives
+  const [moveOpenFor, setMoveOpenFor] = useState(null); // exercise id currently showing the "move to combo" picker
   const warmupMachine = CARDIO_MACHINES.find(m=>m.id===warmupType)||CARDIO_MACHINES[0];
   const cooldownMachine = CARDIO_MACHINES.find(m=>m.id===cooldownType)||CARDIO_MACHINES[CARDIO_MACHINES.length-1];
 
@@ -3513,6 +3540,24 @@ function GymTemplateEditor({weekday, template, setTemplate, gymExerciseLibrary, 
     const arr=[...c.exercises]; const j=idx+dir; if(j<0||j>=arr.length) return c;
     [arr[idx],arr[j]]=[arr[j],arr[idx]]; return {...c, exercises:arr};
   }));
+  // Move an exercise to a different combo entirely — the up/down buttons only reorder within
+  // one combo, so a day plan with the wrong exercise in the wrong combo had no way to fix that
+  // short of removing and re-adding it. Tap-based rather than drag, matching the live session
+  // panel: drag-and-drop turned out unreliable on mobile Safari for this same kind of move.
+  const moveExerciseToCombo = (fromComboId, exId, toComboId) => {
+    if (fromComboId===toComboId) return;
+    setCombos(p => {
+      const from = p.find(c=>c.id===fromComboId);
+      const ex = from?.exercises.find(e=>e.id===exId);
+      if (!ex) return p;
+      return p.map(c => {
+        if (c.id===fromComboId) return {...c, exercises:c.exercises.filter(e=>e.id!==exId)};
+        if (c.id===toComboId) return {...c, exercises:[...c.exercises, ex]};
+        return c;
+      });
+    });
+    setMoveOpenFor(null);
+  };
   const addCombo = () => setCombos(p => [...p, {id:Date.now(),exercises:[]}]);
   const removeCombo = (comboId) => setCombos(p => p.filter(c=>c.id!==comboId));
   const saveNote = (exId) => {
@@ -3603,6 +3648,7 @@ function GymTemplateEditor({weekday, template, setTemplate, gymExerciseLibrary, 
                 {lib?.note&&<span style={{fontSize:10,color:C.yellow,fontStyle:"italic"}}>📌 {lib.note}</span>}
                 <button onClick={()=>{setEditingNoteFor(ex.id);setNoteDraft(lib?.note||"");}} style={{fontSize:9.5,color:C.muted,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>{lib?.note?"edit note":"+ add note"}</button>
                 {lib&&<button onClick={()=>setSwapOpenFor(swapOpenFor===ex.id?null:ex.id)} style={{fontSize:9.5,color:C.blue,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>⇄ swap</button>}
+                {combos.length>1&&<button onClick={()=>setMoveOpenFor(moveOpenFor===ex.id?null:ex.id)} style={{fontSize:9.5,color:C.orange,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>⇥ move to combo</button>}
               </div>
             )}
             {swapOpenFor===ex.id&&lib&&(()=>{
@@ -3613,6 +3659,14 @@ function GymTemplateEditor({weekday, template, setTemplate, gymExerciseLibrary, 
                 <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{alts.map(a=>(<button key={a.name} onClick={()=>swapExercise(combo.id,ex.id,a)} style={{padding:"4px 9px",borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,color:C.text,cursor:"pointer",fontSize:10.5}}>{a.name}</button>))}</div>
               </div>);
             })()}
+            {moveOpenFor===ex.id&&(<div style={{marginTop:6,background:C.card,border:`1px solid ${C.orange}40`,borderRadius:7,padding:"7px 9px"}}>
+              <div style={{fontSize:9.5,color:C.muted,marginBottom:5}}>Move "{ex.name}" to:</div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{combos.map((tc,tci)=>tc.id===combo.id?null:(
+                <button key={tc.id} onClick={()=>moveExerciseToCombo(combo.id,ex.id,tc.id)} style={{padding:"4px 9px",borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,color:C.text,cursor:"pointer",fontSize:10.5}}>
+                  Combo {tci+1}{tc.exercises.length===0?" (empty)":""}
+                </button>
+              ))}</div>
+            </div>)}
           </div>);
         })}
         {pickerOpen===combo.id ? (
@@ -4219,11 +4273,18 @@ function SessionExerciseList({session, compact=false}){
       <div key={i} style={{display:"flex",alignItems:"baseline",gap:8,fontSize:compact?11:12}}>
         <span style={{flex:1,minWidth:0,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{it.name}</span>
         {it.weight&&<span style={{fontFamily:"monospace",color:C.lime,fontWeight:700,flexShrink:0}}>{it.weight}{it.unit}</span>}
-        {/* Weight varied across sets, so pair each weight with its reps rather than hiding it. */}
-        <span style={{fontFamily:"monospace",color:C.muted,flexShrink:0}}>
+        {/* Weight varied across sets, so pair each weight with its reps rather than hiding it.
+            The whole thing used to be one flat muted-gray string ("120×5 120×5 110×4"), which
+            buried the actual weight numbers — the useful part of a varied-weight set — in the
+            same low-contrast color as punctuation. Each weight now gets the same lime treatment
+            the single-weight case above already uses; only the "×" separator and rep count
+            stay muted. */}
+        <span style={{fontFamily:"monospace",flexShrink:0,display:"flex",flexWrap:"wrap",gap:6}}>
           {it.perSetWeights
-            ? it.reps.map((r,n)=>`${it.perSetWeights[n]||"?"}×${r}`).join(" ")
-            : it.reps.join("/")}
+            ? it.reps.map((r,n)=>(
+                <span key={n}><span style={{color:C.lime,fontWeight:700}}>{it.perSetWeights[n]||"?"}</span><span style={{color:C.muted}}>×{r}</span></span>
+              ))
+            : <span style={{color:C.muted}}>{it.reps.join("/")}</span>}
         </span>
       </div>
     ))}
@@ -4638,6 +4699,21 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
     // show the exercise breakdown inline. Older activities predate this field and are matched
     // by date instead (see findSessionFor).
     setDayData(p=>({...p,activities:[...(p.activities||[]),{id:sessionId,sessionId,type:"gym",label:`Gym — ${WEEKDAYS[sess.weekday].full}`,kcal,durationMin:durMin,time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}]}));
+    // The live session's combo/exercise order reflects however it was ACTUALLY done — reordered
+    // mid-workout (equipment busy, jumped ahead, moved into a different combo), not necessarily
+    // the order the template started with. Writing that final order back into the template means
+    // next week's session for this weekday starts pre-arranged the way it was last actually
+    // performed, instead of always reverting to whatever the template originally said. Only the
+    // combo/exercise structure is synced — warmup/cooldown config stays whatever was configured.
+    setGymTemplates(prev=>({
+      ...(prev||{}),
+      [sess.weekday]: {
+        ...(prev?.[sess.weekday]||{}),
+        combos: (sess.combos||[])
+          .filter(c=>(c.exercises||[]).length>0)
+          .map(c=>({id:c.id, exercises:(c.exercises||[]).map(ex=>({id:ex.id, name:ex.name, type:ex.type||"weighted"}))})),
+      },
+    }));
     setGymActiveSession(null);
   };
   useEffect(()=>{if(view==="history"&&!histLoaded){store.get("fit_dates",[]).then(async ds=>{const e={};for(const d of ds){const log=await store.get(`fit_day_${d}`,null);if(log&&(log.activities||[]).length>0)e[d]=log;}setHistLogs(e);setHistDates(Object.keys(e).sort((a,b)=>b.localeCompare(a)));setHistLoaded(true);});}},[view]);
@@ -5433,7 +5509,7 @@ const defaultGramsFor = prod => {
   return serving ? String(serving) : "100";
 };
 
-function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,weightPhases,recipes,setRecipes,onLogMeal}){
+function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,weightPhases,recipes,setRecipes,onLogMeal,gymSessions}){
   const [modal,setModal]=useState(false);const [editPrep,setEditPrep]=useState(null);const [showProd,setShowProd]=useState(false);
   const [search,setSearch]=useState("");const [showAdd,setShowAdd]=useState(false);const [editPIdx,setEditPIdx]=useState(null);
   const formRef=useRef(null); // ref on the add/edit form div — scrolled to on edit
@@ -5584,7 +5660,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
     <div style={{height:"100%",overflowY:"auto",padding:"0 16px 90px"}}>
       <div style={{padding:"18px 0 14px"}}><div style={{fontSize:26,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>Food</div><div style={{fontSize:12,color:C.muted}}>{active.length} active prep{active.length!==1?"s":""} · {products.length} products</div></div>
       {/* Food Coach */}
-      <CoachPanel profile={profile} weights={weights||[]} products={products} mealPreps={mealPreps} weightPhases={weightPhases||[]} recipes={recipes} mode="food"/>
+      <CoachPanel profile={profile} weights={weights||[]} products={products} mealPreps={mealPreps} weightPhases={weightPhases||[]} recipes={recipes} gymSessions={gymSessions} mode="food"/>
       <div style={{marginBottom:16}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Meal Preps</div>{mealPreps.length===0&&<div style={{textAlign:"center",padding:"16px 0",color:C.muted,fontSize:13}}>No meal preps yet. Tap + to create.</div>}{active.length>0&&<div style={{marginBottom:8}}><div style={{display:"flex",flexDirection:"column",gap:8}}>{active.map(p=><PrepCard key={p.id} prep={p}/>)}</div></div>}{done.length>0&&<div><button onClick={()=>setShowDone(p=>!p)} style={{width:"100%",padding:"8px 12px",borderRadius:10,background:C.card,border:`1px solid ${showDone?C.border:C.dim}`,color:C.muted,fontWeight:600,cursor:"pointer",fontSize:11,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:showDone?8:0,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}><span>Finished ({done.length})</span><span>{showDone?"▲":"▼"}</span></button>{showDone&&<div style={{display:"flex",flexDirection:"column",gap:8}}>{done.map(p=><PrepCard key={p.id} prep={p}/>)}</div>}</div>}</div>
       <RecipesSection recipes={recipes} setRecipes={setRecipes} products={products} profile={profile} onLogMeal={onLogMeal}/>
       <button onClick={()=>setShowProd(p=>!p)} style={{width:"100%",padding:"12px 16px",borderRadius:12,background:C.card,border:`1px solid ${showProd?C.lime:C.border}`,color:showProd?C.lime:C.text,fontWeight:600,cursor:"pointer",fontSize:13,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:showProd?10:0}}><span>Product Labels ({products.length})</span><span style={{fontSize:11}}>{showProd?"▲":"▼"}</span></button>
@@ -5759,7 +5835,7 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases, gymSes
       ctx += "  NOTE: week and month trends point in OPPOSITE directions (e.g. lost this week but net gained over the month, or vice versa) — when answering, be explicit about which window you're citing.\n";
     }
     ctx += "Day-type targets (kcal): ";
-    ctx += Object.entries(DAY_TYPES).map(([k,v]) => v.label + " " + getDT(profile,k,latest,0,false).kcal).join(", ") + ".\n";
+    ctx += Object.entries(DAY_TYPES).map(([k,v]) => v.label + " " + getDT(profile,k,latest,0,false,0,gymSessions).kcal).join(", ") + ".\n";
     if (todayLog) {
       const tot = (todayLog.meals||[]).reduce((a,m)=>({k:a.k+m.kcal,p:a.p+m.protein,c:a.c+m.carbs,f:a.f+m.fat}),{k:0,p:0,c:0,f:0});
       const burn = (todayLog.activities||[]).reduce((s,a)=>s+a.kcal,0)+(todayLog.burnedExtra||0);
@@ -6640,6 +6716,33 @@ function App(){
   // Track whether a date-rollover banner should appear (user's old dayData was kept open).
   const [rolloverBanner, setRolloverBanner] = useState(null); // null | {fromDate, toDate}
 
+  // Keep --app-height in sync with the REAL visible viewport. iOS Safari hides its own
+  // URL/toolbar on scroll and doesn't always re-measure position:fixed elements against the
+  // taller viewport that results — the .app-shell can stay sized to the pre-scroll height,
+  // leaving a gap below the tab bar where the toolbar used to be. window.visualViewport fires
+  // resize events exactly when that chrome shows/hides, which is what a static 100dvh/inset:0
+  // can't react to.
+  useEffect(() => {
+    const vv = window.visualViewport;
+    const setAppHeight = () => {
+      const h = vv ? vv.height : window.innerHeight;
+      document.documentElement.style.setProperty("--app-height", `${h}px`);
+    };
+    setAppHeight();
+    if (vv) {
+      vv.addEventListener("resize", setAppHeight);
+      vv.addEventListener("scroll", setAppHeight);
+    } else {
+      window.addEventListener("resize", setAppHeight);
+    }
+    window.addEventListener("orientationchange", setAppHeight);
+    return () => {
+      if (vv) { vv.removeEventListener("resize", setAppHeight); vv.removeEventListener("scroll", setAppHeight); }
+      else { window.removeEventListener("resize", setAppHeight); }
+      window.removeEventListener("orientationchange", setAppHeight);
+    };
+  }, []);
+
   // Detect midnight rollover via interval + visibility/focus listeners.
   useEffect(() => {
     const check = () => {
@@ -6846,9 +6949,9 @@ function App(){
       <button onClick={()=>setRolloverBanner(null)} style={{background:"none",border:"none",color:C.lime,fontSize:18,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button>
     </div>}
     <div style={{flex:1,overflow:"hidden"}}>
-      {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence}/>}
+      {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence} gymSessions={gymSessions}/>}
       {viewTab==="activity"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary}/>}
-      {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes} onLogMeal={meal=>setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}))}/>}
+      {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes} onLogMeal={meal=>setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}))} gymSessions={gymSessions}/>}
       {viewTab==="history"&&<HistoryTab weights={weights} products={products} profile={profile} medications={medications} medLog={medLog}/>}
       {viewTab==="settings"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight} medications={medications} setMedications={setMedications}/>}
     </div>

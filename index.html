@@ -7,7 +7,7 @@
        failure (blocks pinch-zoom) and iOS Safari has ignored it since iOS 10 anyway. The
        reason it was there — iOS auto-zooming when you focus a small input — is fixed
        properly below by forcing form controls to 16px. -->
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"/>
   <meta name="apple-mobile-web-app-capable" content="yes"/>
   <meta name="mobile-web-app-capable" content="yes"/>
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
@@ -103,6 +103,33 @@ const catById=id=>PRODUCT_CATEGORIES.find(c=>c.id===id);
 // in setProducts (and once to whatever was already in storage at boot) fixes every consumer at
 // once instead of patching a dozen render sites individually.
 const sortProducts = arr => [...(arr||[])].sort((a,b)=>(a.name||"").localeCompare(b.name||"",undefined,{sensitivity:"base"}));
+// Sort choices for the Food tab's product list specifically — name stays the global default
+// (every "pick a label" picker elsewhere in the app relies on `products` already being
+// name-sorted, via sortProducts above), but browsing your own label list benefits from being
+// able to switch to newest-first, or ranked by a macro. "Protein/kcal" is protein density
+// (grams of protein per kcal) rather than raw protein grams — useful for finding the most
+// protein-efficient option, which raw protein-content sort doesn't surface (a 600kcal item
+// with 40g protein and a 120kcal item with 15g protein rank very differently by density).
+const PRODUCT_SORTS = [
+  {id:"name",           label:"Name"},
+  {id:"dateAdded",      label:"Date added"},
+  {id:"protein",        label:"Protein (g)"},
+  {id:"proteinDensity", label:"Protein/kcal"},
+  {id:"carbs",          label:"Carbs (g)"},
+  {id:"kcal",           label:"Kcal"},
+];
+const sortProductsBy = (arr, mode) => {
+  const list = [...(arr||[])];
+  if (mode === "dateAdded") return list.sort((a,b)=>(b.addedAt||0)-(a.addedAt||0));
+  if (mode === "protein") return list.sort((a,b)=>(b.p||0)-(a.p||0));
+  if (mode === "proteinDensity") return list.sort((a,b)=>{
+    const da = a.kcal>0 ? (a.p||0)/a.kcal : 0, db = b.kcal>0 ? (b.p||0)/b.kcal : 0;
+    return db-da;
+  });
+  if (mode === "carbs") return list.sort((a,b)=>(b.c||0)-(a.c||0));
+  if (mode === "kcal") return list.sort((a,b)=>(a.kcal||0)-(b.kcal||0));
+  return sortProducts(list);
+};
 // Recipe categories — shown as a dedicated icon on each recipe card even before opening it.
 const RECIPE_CATEGORIES = [
   { id:"breakfast", label:"Breakfast",   emoji:"🥞" },
@@ -139,6 +166,41 @@ const MED_WINDOWS = [
   {id:"evening", label:"Evening", range:"17:00–04:00", emoji:"🌙"},
 ];
 const medWindowById = id => MED_WINDOWS.find(w=>w.id===id);
+// Stroke-based glyph for each reminder window, matching NavIcon's family (currentColor, 24×24,
+// 1.75 stroke) rather than the emoji used in the medication-setup form — emoji render
+// differently per OS and can't be recoloured to signal "overdue", which the reminder rows need.
+function WindowIcon({id, size=16}){
+  const p = {fill:"none",stroke:"currentColor",strokeWidth:1.9,strokeLinecap:"round",strokeLinejoin:"round"};
+  const glyphs = {
+    morning: <><path d="M3 18h18" {...p}/><path d="M6 18a6 6 0 0 1 12 0" {...p}/><path d="M12 6v3M6.5 10.5l1.8 1.8M17.5 10.5l-1.8 1.8" {...p}/></>,
+    day:     <><circle cx="12" cy="12" r="4.3" {...p}/><path d="M12 3.5v2.2M12 18.3v2.2M4.5 4.5l1.6 1.6M17.9 17.9l1.6 1.6M3.5 12h2.2M18.3 12h2.2M4.5 19.5l1.6-1.6M17.9 6.1l1.6-1.6" {...p}/></>,
+    evening: <path d="M20 14.2A8.2 8.2 0 1 1 9.8 4a6.8 6.8 0 0 0 10.2 10.2z" {...p}/>,
+  };
+  return <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" style={{display:"block",flexShrink:0}}>{glyphs[id]}</svg>;
+}
+// Compact reminder row — tap the checkmark to log "taken", the small × to skip. Uses pointer
+// events (not CSS :active) for the press feedback because iOS Safari only honours :active when
+// some ancestor already has a touchstart listener bound, which nothing here does.
+function MedReminderRow({med, onMark}){
+  const [pressed, setPressed] = useState(false);
+  const win = medWindowById(med.dueWindow);
+  const low = med.packageSize && med.remaining!=null && med.remaining<=(med.dosePerTake||1);
+  return(<div style={{display:"flex",alignItems:"center",gap:9,background:med.overdue?`${C.red}0d`:C.bg,border:`1px solid ${med.overdue?C.red+"45":C.border}`,borderRadius:9,padding:"6px 7px 6px 10px",minHeight:44}}>
+    <span style={{color:med.overdue?C.red:C.muted,flexShrink:0}} title={`${win?.label} (${win?.range})${med.overdue?" · overdue":""}`}><WindowIcon id={med.dueWindow} size={16}/></span>
+    <div style={{flex:1,minWidth:0}}>
+      <div style={{fontSize:12.5,fontWeight:600,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{med.name}</div>
+      <div style={{fontSize:10,color:low?C.red:C.muted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{med.dosePerTake||1} dose{(med.dosePerTake||1)!==1?"s":""}{med.overdue?" · overdue":""}{low?` · ⚠ ${med.remaining??0} left`:""}</div>
+    </div>
+    <button onClick={()=>onMark(med,"skipped")} aria-label={`Skip ${med.name}`} style={{flexShrink:0,width:30,height:30,minWidth:30,minHeight:30,borderRadius:"50%",background:"none",border:"none",color:C.faint,fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>
+    <button
+      onPointerDown={()=>setPressed(true)} onPointerUp={()=>setPressed(false)} onPointerLeave={()=>setPressed(false)} onPointerCancel={()=>setPressed(false)}
+      onClick={()=>onMark(med,"taken")} aria-label={`Mark ${med.name} taken`}
+      style={{flexShrink:0,width:30,height:30,minWidth:30,minHeight:30,borderRadius:"50%",border:`1.5px solid ${C.lime}`,
+        background:pressed?C.lime:"none",color:pressed?"#000":C.lime,fontSize:15,fontWeight:900,cursor:"pointer",
+        display:"flex",alignItems:"center",justifyContent:"center",
+        transform:pressed?"scale(0.88)":"scale(1)",transition:"transform .15s cubic-bezier(.34,1.56,.64,1), background .12s ease, color .12s ease"}}>✓</button>
+  </div>);
+}
 // Local (not UTC) calendar-date string, matching whichever local day a given moment falls on.
 // TODAY() is deliberately NOT used for medication windows: it derives the date from
 // toISOString(), which is UTC — while window boundaries (04:00/11:00/17:00) are local wall-clock
@@ -402,9 +464,20 @@ button[disabled]:active,button:disabled:active{transform:none;opacity:.45}
    bar floating short of the true bottom edge. --app-height is kept in sync with
    window.visualViewport (see the effect in App()) specifically to track that live, so the shell
    is always exactly the currently-visible height rather than whatever the layout viewport
-   happened to be at last reflow. 100dvh is the fallback for browsers without visualViewport. */
+   happened to be at last reflow. 100dvh is the fallback for browsers without visualViewport.
+
+   --app-top matters for a DIFFERENT bug: focusing a field inside a sheet (e.g. Create Meal
+   Prep's description textarea) makes iOS pan the visual viewport down to keep the caret clear
+   of the keyboard, even though the sheet has its own internal scroll and body{overflow:hidden}
+   — that pan happens at the OS/viewport level, below the reach of any CSS. A 'position:fixed;
+   top:0' element is fixed to the LAYOUT viewport, not the panned visual one, so its top edge
+   stays put while --app-height (correctly) shrinks — net effect: the content above appears to
+   sit still while the tab bar rides up toward the middle of the screen. Tracking
+   visualViewport.offsetTop into --app-top keeps the shell's top edge glued to whatever is
+   actually visible, so the whole shell shrinks from the bottom (tab bar hugging the keyboard)
+   instead of drifting as a block. */
 .app-shell{
-  position:fixed; top:0; left:0; right:0; margin:0 auto; max-width:520px;
+  position:fixed; top:var(--app-top, 0px); left:0; right:0; margin:0 auto; max-width:520px;
   height:var(--app-height, 100dvh);
   display:flex; flex-direction:column; overflow:hidden;
   background:${C.bg};
@@ -3309,7 +3382,7 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
   };
   const handleAdd=entry=>{
     if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode}));}
-    else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}));if(newProduct)setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,newProduct]);}
+    else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}));if(newProduct)setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);}
     setModal(null);
   };
   const updateMeal=updated=>{setDayData(p=>({...p,meals:p.meals.map(m=>m.id===updated.id?updated:m)}));setEditingMealId(null);};
@@ -3325,29 +3398,16 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
         </div>
       </div>
 
-      {/* Medication/supplement reminders — one card per window that has opened today and
-          hasn't been marked yet. A reminder from an earlier window that closed without being
-          marked stays here (flagged "overdue") rather than silently disappearing — it only
-          goes away once Taken or Skip is tapped. */}
-      {dueMeds.length>0&&<div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:10}}>
-        {dueMeds.map(med=>{
-          const win=medWindowById(med.dueWindow);
-          const low=med.packageSize&&med.remaining!=null&&med.remaining<=(med.dosePerTake||1);
-          return(<div key={med.id} style={{background:med.overdue?`${C.red}0d`:`${C.orange}10`,border:`1px solid ${med.overdue?C.red:C.orange}55`,borderRadius:12,padding:"11px 14px"}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{fontSize:10,color:C.orange,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:2}}>{win?.emoji} {win?.label} reminder{med.overdue?" · overdue":""}</div>
-                <div style={{fontSize:14,fontWeight:700,color:C.text}}>💊 {med.name}</div>
-                <div style={{fontSize:11,color:C.muted,marginTop:2}}>{med.dosePerTake||1} dose{(med.dosePerTake||1)!==1?"s":""}{med.notes?` · ${med.notes}`:""}</div>
-                {med.packageSize?<div style={{fontSize:11,marginTop:2,color:low?C.red:C.muted}}>{low?"⚠ ":""}{med.remaining??med.packageSize} left in package</div>:null}
-              </div>
-            </div>
-            <div style={{display:"flex",gap:8,marginTop:9}}>
-              <button onClick={()=>onMarkMed(med,"skipped")} style={{flex:1,padding:"9px 0",borderRadius:8,background:"none",border:`1px solid ${C.border}`,color:C.muted,fontWeight:600,cursor:"pointer",fontSize:12}}>Skip</button>
-              <button onClick={()=>onMarkMed(med,"taken")} style={{flex:2,padding:"9px 0",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:13}}>✓ Taken</button>
-            </div>
-          </div>);
-        })}
+      {/* Medication/supplement reminders — one compact section for every window that has opened
+          today and hasn't been marked yet, instead of repeating "Morning reminder" etc. on every
+          card. Tap ✓ to log taken, × to skip; a reminder left over from an earlier window stays
+          here (flagged "overdue" via the row's icon colour) rather than silently disappearing —
+          it only goes away once tapped. */}
+      {dueMeds.length>0&&<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"10px 12px",marginBottom:10}}>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:7}}>💊 Supplement / Vitamin Reminders</div>
+        <div style={{display:"flex",flexDirection:"column",gap:6}}>
+          {dueMeds.map(med=><MedReminderRow key={med.id} med={med} onMark={onMarkMed}/>)}
+        </div>
       </div>}
 
       {/* Weight card */}
@@ -5520,6 +5580,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
   const [saveToast,setSaveToast]=useState(null);
   const [catFilter,setCatFilter]=useState(null); // category id, "uncategorized", or null
   const [martFilter,setMartFilter]=useState(null);
+  const [prodSort,setProdSort]=useState("name"); // one of PRODUCT_SORTS' ids
   const [confirmDelete,setConfirmDelete]=useState(null); // index of product to delete
   const pff=k=>v=>setPForm(p=>({...p,[k]:v}));
   const active=mealPreps.filter(p=>p.remaining>0);const done=mealPreps.filter(p=>p.remaining===0);
@@ -5543,7 +5604,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
       setSaveToast({type:"duplicate",name:np.name,dupIdx,np});
       return;
     }
-    setProducts(prev=>[...prev,np]);
+    setProducts(prev=>[...prev,{...np,addedAt:Date.now()}]);
     setSaveToast({type:"added",name:np.name});
     clearForm();setShowAdd(false);setEditPIdx(null);
   };
@@ -5564,7 +5625,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
   const saveEditP=()=>{
     const np=buildProductFromForm(pForm);
     if(!np.name)return;
-    setProducts(prev=>prev.map((x,i)=>i===editPIdx?np:x));
+    setProducts(prev=>prev.map((x,i)=>i===editPIdx?{...np,addedAt:x.addedAt||Date.now()}:x));
     setSaveToast({type:"updated",name:np.name});
     clearForm();setEditPIdx(null);
     setTimeout(()=>window.scrollTo({top:savedScrollRef.current,behavior:"smooth"}),60);
@@ -5574,12 +5635,12 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
     if(!saveToast||saveToast.type!=="duplicate")return;
     const {name, dupIdx, np} = saveToast;
     if(mode==="update"){
-      setProducts(prev=>prev.map((x,i)=>i===dupIdx?np:x));
+      setProducts(prev=>prev.map((x,i)=>i===dupIdx?{...np,addedAt:x.addedAt||Date.now()}:x));
       setSaveToast({type:"updated",name});
     } else { // "new" — append a uniqueness suffix
       let candidate = name + " (2)"; let n = 2;
       while(products.some(x=>x.name.toLowerCase()===candidate.toLowerCase())){n++;candidate = name + " ("+n+")";}
-      setProducts(prev=>[...prev,{...np,name:candidate}]);
+      setProducts(prev=>[...prev,{...np,name:candidate,addedAt:Date.now()}]);
       setSaveToast({type:"added",name:candidate});
     }
     clearForm();setShowAdd(false);setEditPIdx(null);
@@ -5607,7 +5668,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
       // field isn't left empty — silently skip on failure, it's a nice-to-have not a blocker.
       if(!res.subtitle&&name){aSubtitle(name,profile.apiKey).then(s=>{if(s)setPForm(f=>(f.name===name&&!f.subtitle)?{...f,subtitle:s}:f);}).catch(()=>{});}
     }}catch(e){setScanErr(String(e.message||e));}setScanning(false);};
-  const filtered=products.filter(p=>{
+  const filtered=sortProductsBy(products,prodSort).filter(p=>{
     const marketsOf=x=>x.supermarkets||(x.supermarket?[x.supermarket]:[]);
     if(search&&!p.name.toLowerCase().includes(search.toLowerCase())&&!(p.subtitle||"").toLowerCase().includes(search.toLowerCase()))return false;
     if(catFilter==="uncategorized"&&(p.categories||[]).length>0)return false;
@@ -5661,10 +5722,28 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
       <div style={{padding:"18px 0 14px"}}><div style={{fontSize:26,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>Food</div><div style={{fontSize:12,color:C.muted}}>{active.length} active prep{active.length!==1?"s":""} · {products.length} products</div></div>
       {/* Food Coach */}
       <CoachPanel profile={profile} weights={weights||[]} products={products} mealPreps={mealPreps} weightPhases={weightPhases||[]} recipes={recipes} gymSessions={gymSessions} mode="food"/>
-      <div style={{marginBottom:16}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Meal Preps</div>{mealPreps.length===0&&<div style={{textAlign:"center",padding:"16px 0",color:C.muted,fontSize:13}}>No meal preps yet. Tap + to create.</div>}{active.length>0&&<div style={{marginBottom:8}}><div style={{display:"flex",flexDirection:"column",gap:8}}>{active.map(p=><PrepCard key={p.id} prep={p}/>)}</div></div>}{done.length>0&&<div><button onClick={()=>setShowDone(p=>!p)} style={{width:"100%",padding:"8px 12px",borderRadius:10,background:C.card,border:`1px solid ${showDone?C.border:C.dim}`,color:C.muted,fontWeight:600,cursor:"pointer",fontSize:11,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:showDone?8:0,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}><span>Finished ({done.length})</span><span>{showDone?"▲":"▼"}</span></button>{showDone&&<div style={{display:"flex",flexDirection:"column",gap:8}}>{done.map(p=><PrepCard key={p.id} prep={p}/>)}</div>}</div>}</div>
+      <div style={{marginBottom:16}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+          <span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em"}}>Meal Preps</span>
+          {/* Moved off the screen-corner FAB (see note below) and onto the section it belongs
+              to — it was getting hit by accident while reaching for "+ Add" on product labels. */}
+          <button onClick={()=>setModal(true)} aria-label="New meal prep" style={{padding:"6px 13px",minHeight:30,borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>+ New</button>
+        </div>
+        {mealPreps.length===0&&<div style={{textAlign:"center",padding:"16px 0",color:C.muted,fontSize:13}}>No meal preps yet — tap + New above.</div>}{active.length>0&&<div style={{marginBottom:8}}><div style={{display:"flex",flexDirection:"column",gap:8}}>{active.map(p=><PrepCard key={p.id} prep={p}/>)}</div></div>}{done.length>0&&<div><button onClick={()=>setShowDone(p=>!p)} style={{width:"100%",padding:"8px 12px",borderRadius:10,background:C.card,border:`1px solid ${showDone?C.border:C.dim}`,color:C.muted,fontWeight:600,cursor:"pointer",fontSize:11,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:showDone?8:0,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}><span>Finished ({done.length})</span><span>{showDone?"▲":"▼"}</span></button>{showDone&&<div style={{display:"flex",flexDirection:"column",gap:8}}>{done.map(p=><PrepCard key={p.id} prep={p}/>)}</div>}</div>}</div>
       <RecipesSection recipes={recipes} setRecipes={setRecipes} products={products} profile={profile} onLogMeal={onLogMeal}/>
-      <button onClick={()=>setShowProd(p=>!p)} style={{width:"100%",padding:"12px 16px",borderRadius:12,background:C.card,border:`1px solid ${showProd?C.lime:C.border}`,color:showProd?C.lime:C.text,fontWeight:600,cursor:"pointer",fontSize:13,display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:showProd?10:0}}><span>Product Labels ({products.length})</span><span style={{fontSize:11}}>{showProd?"▲":"▼"}</span></button>
-      {showProd&&<div><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}><span style={{fontSize:11,color:C.muted}}>per 100g</span><button onClick={()=>{setShowAdd(p=>!p);setEditPIdx(null);setPForm(EMPTY_PFORM);setScanImgs([]);}} style={{padding:"7px 14px",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>+ Add</button></div><input placeholder="Search products…" value={search} onChange={e=>setSearch(e.target.value)} style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"9px 14px",color:C.text,fontSize:13,outline:"none",marginBottom:8}}/>
+      {/* "+ Add" now sits on the header itself — reachable in one tap whether or not the
+          section is expanded — and carries more visual weight (bigger, glowing like the old
+          corner FAB did) since it was easy to overlook nested a level deeper, after the
+          collapsed-by-default section. */}
+      <div style={{display:"flex",gap:8,marginBottom:showProd?10:8}}>
+        <button onClick={()=>setShowProd(p=>!p)} style={{flex:1,minWidth:0,padding:"12px 16px",borderRadius:12,background:C.card,border:`1px solid ${showProd?C.lime:C.border}`,color:showProd?C.lime:C.text,fontWeight:600,cursor:"pointer",fontSize:13,display:"flex",justifyContent:"space-between",alignItems:"center"}}><span>Product Labels ({products.length})</span><span style={{fontSize:11}}>{showProd?"▲":"▼"}</span></button>
+        <button onClick={()=>{setShowProd(true);setShowAdd(true);setEditPIdx(null);setPForm(EMPTY_PFORM);setScanImgs([]);}} aria-label="Add product label" style={{flexShrink:0,padding:"12px 18px",minHeight:44,borderRadius:12,background:C.lime,border:"none",color:"#000",fontWeight:800,cursor:"pointer",fontSize:14,boxShadow:`0 0 14px ${C.lime}45`}}>+ Add</button>
+      </div>
+      {showProd&&<div><input placeholder="Search products…" value={search} onChange={e=>setSearch(e.target.value)} style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"9px 14px",color:C.text,fontSize:13,outline:"none",marginBottom:8}}/>
+      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,overflowX:"auto",paddingBottom:2}}>
+        <span style={{fontSize:10,color:C.muted,flexShrink:0,fontFamily:"monospace",textTransform:"uppercase"}}>Sort</span>
+        {PRODUCT_SORTS.map(s=>{const on=prodSort===s.id;return(<button key={s.id} type="button" onClick={()=>setProdSort(s.id)} style={{flexShrink:0,padding:"4px 10px",borderRadius:12,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:10.5,fontWeight:on?700:400,whiteSpace:"nowrap"}}>{s.label}</button>);})}
+      </div>
       {saveToast&&(saveToast.type==="added"||saveToast.type==="updated")&&<div style={{background:`${C.lime}15`,border:`1px solid ${C.lime}66`,borderRadius:10,padding:"9px 13px",marginBottom:10,display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}><div style={{fontSize:12,color:C.lime,fontWeight:600}}>✓ {saveToast.type==="added"?"Added":"Updated"}: <span style={{fontFamily:"monospace"}}>{saveToast.name}</span></div><button onClick={()=>setSaveToast(null)} style={{background:"none",border:"none",color:C.lime,fontSize:16,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button></div>}
       {saveToast&&saveToast.type==="duplicate"&&<div style={{background:`${C.yellow}12`,border:`1px solid ${C.yellow}66`,borderRadius:10,padding:"10px 13px",marginBottom:10}}><div style={{fontSize:12,color:C.yellow,fontWeight:600,marginBottom:7,lineHeight:1.4}}>⚠ A product named <span style={{fontFamily:"monospace"}}>"{saveToast.name}"</span> already exists.</div><div style={{display:"flex",gap:6}}><button onClick={()=>resolveDup("update")} style={{flex:1,padding:"7px 0",borderRadius:7,background:C.yellow,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>Update existing</button><button onClick={()=>resolveDup("new")} style={{flex:1,padding:"7px 0",borderRadius:7,background:C.bg,border:`1px solid ${C.yellow}66`,color:C.yellow,fontWeight:600,cursor:"pointer",fontSize:11}}>Save as new (2)</button><button onClick={()=>setSaveToast(null)} style={{padding:"7px 10px",borderRadius:7,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button></div></div>}
       {(showAdd||editPIdx!==null)&&<div ref={formRef} style={{background:C.card,border:`1px solid ${editPIdx!==null?C.lime:C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:10}}>
@@ -5760,7 +5839,9 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
   ?<span style={{fontSize:10,color:C.lime,fontFamily:"monospace"}} title="Always eaten as a full pack">📦{p.packSizeG}g</span>
   :(p.servingG||p.packageG)&&<span style={{fontSize:10,color:C.lime,fontFamily:"monospace"}}>🍽{p.servingG||p.packageG}g</span>}{(p.categories||[]).map(cid=>{const cat=catById(cid);return cat?<span key={cid} style={{fontSize:9}} title={cat.label}>{cat.emoji}</span>:null;})}{pMarkets.map(m=>(<span key={m} style={{fontSize:8.5,color:C.blue,fontFamily:"monospace"}}>🏪{m}</span>))}</div></div><div style={{display:"flex",gap:5,alignItems:"center",flexShrink:0}}><div style={{display:"flex",gap:6}}><Chip val={p.kcal} label="k" color={C.lime}/><Chip val={p.p} label="P" color={C.blue}/><Chip val={p.c} label="C" color={C.orange}/><Chip val={p.f} label="F" color={C.purple}/></div><button onClick={()=>startEditP(ri)} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:11,cursor:"pointer",padding:"3px 6px",borderRadius:5,marginLeft:3}}>✎</button><button onClick={()=>setConfirmDelete(confirmDelete===ri?null:ri)} style={{background:"none",border:"none",color:confirmDelete===ri?"#ff4040":C.faint,fontSize:14,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div></div>);})}</div></div>}
     </div>
-    <button onClick={()=>setModal(true)} style={{position:"absolute",bottom:16,right:16,width:54,height:54,borderRadius:"50%",background:C.lime,border:"none",cursor:"pointer",fontSize:28,color:"#000",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 0 20px ${C.lime}55`,zIndex:10}}>+</button>
+    {/* No more floating corner FAB here — it sat exactly where a thumb lands reaching for the
+        product-label "+ Add" button below, so it kept getting hit by accident. Meal-prep
+        creation now lives as an explicit button on its own section, right where it's used. */}
     {modal&&<CreatePrepSheet products={products} onSave={prep=>{setMealPreps(p=>[prep,...p]);setModal(false);}} onClose={()=>setModal(false)} apiKey={profile.apiKey}/>}
     {editPrep&&<EditPrepSheet prep={editPrep} onSave={updated=>{setMealPreps(p=>p.map(x=>x.id===updated.id?updated:x));setEditPrep(null);}} onClose={()=>setEditPrep(null)}/>}
   </div>);
@@ -6716,30 +6797,40 @@ function App(){
   // Track whether a date-rollover banner should appear (user's old dayData was kept open).
   const [rolloverBanner, setRolloverBanner] = useState(null); // null | {fromDate, toDate}
 
-  // Keep --app-height in sync with the REAL visible viewport. iOS Safari hides its own
-  // URL/toolbar on scroll and doesn't always re-measure position:fixed elements against the
-  // taller viewport that results — the .app-shell can stay sized to the pre-scroll height,
+  // Keep --app-height AND --app-top in sync with the REAL visible viewport. iOS Safari hides
+  // its own URL/toolbar on scroll and doesn't always re-measure position:fixed elements against
+  // the taller viewport that results — the .app-shell can stay sized to the pre-scroll height,
   // leaving a gap below the tab bar where the toolbar used to be. window.visualViewport fires
   // resize events exactly when that chrome shows/hides, which is what a static 100dvh/inset:0
   // can't react to.
+  //
+  // --app-top covers a second, distinct case: focusing an input inside a sheet makes iOS pan
+  // the visual viewport (visualViewport.offsetTop > 0) to keep the caret clear of the keyboard,
+  // independent of any CSS scroll-locking on body. Without tracking that offset, the
+  // position:fixed shell stays glued to the layout viewport's top while its height correctly
+  // shrinks — the tab bar then rides up toward the middle of the screen instead of hugging the
+  // keyboard. Keeping --app-top synced to offsetTop keeps the whole shell visually pinned to
+  // whatever is actually on screen.
   useEffect(() => {
     const vv = window.visualViewport;
-    const setAppHeight = () => {
+    const setAppMetrics = () => {
       const h = vv ? vv.height : window.innerHeight;
+      const t = vv ? vv.offsetTop : 0;
       document.documentElement.style.setProperty("--app-height", `${h}px`);
+      document.documentElement.style.setProperty("--app-top", `${t}px`);
     };
-    setAppHeight();
+    setAppMetrics();
     if (vv) {
-      vv.addEventListener("resize", setAppHeight);
-      vv.addEventListener("scroll", setAppHeight);
+      vv.addEventListener("resize", setAppMetrics);
+      vv.addEventListener("scroll", setAppMetrics);
     } else {
-      window.addEventListener("resize", setAppHeight);
+      window.addEventListener("resize", setAppMetrics);
     }
-    window.addEventListener("orientationchange", setAppHeight);
+    window.addEventListener("orientationchange", setAppMetrics);
     return () => {
-      if (vv) { vv.removeEventListener("resize", setAppHeight); vv.removeEventListener("scroll", setAppHeight); }
-      else { window.removeEventListener("resize", setAppHeight); }
-      window.removeEventListener("orientationchange", setAppHeight);
+      if (vv) { vv.removeEventListener("resize", setAppMetrics); vv.removeEventListener("scroll", setAppMetrics); }
+      else { window.removeEventListener("resize", setAppMetrics); }
+      window.removeEventListener("orientationchange", setAppMetrics);
     };
   }, []);
 

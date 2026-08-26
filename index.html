@@ -58,7 +58,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
   <script type="text/babel" data-presets="react">
-    const { useState, useEffect, useRef, useCallback } = React;
+    const { useState, useEffect, useRef, useCallback, useMemo } = React;
     window.storage = undefined;
 
 const TODAY = () => new Date().toISOString().split("T")[0];
@@ -68,12 +68,67 @@ const parseNum = s => {
   const v = parseFloat(String(s).replace(",", "."));
   return v;
 };
-const DAY_TYPES = {
-  rest:      { label:"Rest Day",          icon:"😴" },
-  gym:       { label:"Gym",               icon:"🏋️" },
-  run_short: { label:"Short Run (5–8km)", icon:"🏃" },
-  run_long:  { label:"Long Run (10km+)",  icon:"🏃" },
-};
+// ── Day types ─────────────────────────────────────────────────────────────────
+// A day type is "what am I doing today", and it sets the extra burn added on top of TDEE.
+// These four were hardcoded, which meant a football match or a long walk had to be logged as
+// "Rest" (crediting nothing) or mis-logged as a run. They are now the DEFAULTS of a
+// user-editable list — the four ids below must keep existing, because every historical day log
+// stores its day type by id and would otherwise lose its meaning.
+//
+// `burn` is a model, not a number, so each type scales to the person's bodyweight the same way
+// the rest of the energy engine does:
+//   rest  — nothing above TDEE
+//   lift  — resistance training; personalised from real gym history when available
+//   run   — distance × bodyweight (running cost is near-linear in both)
+//   walk  — same, at roughly half the cost per km
+//   met   — any activity, from its Compendium of Physical Activities MET value × duration
+//   fixed — a flat figure the user supplies, for anything not worth modelling
+const DEFAULT_DAY_TYPES = [
+  { id:"rest",      label:"Rest Day",   icon:"😴", burn:{kind:"rest"},            builtin:true },
+  { id:"gym",       label:"Gym",        icon:"🏋️", burn:{kind:"lift", min:60},     builtin:true },
+  { id:"run_short", label:"Short Run",  icon:"🏃", burn:{kind:"run",  km:5},       builtin:true },
+  { id:"run_long",  label:"Long Run",   icon:"🏃", burn:{kind:"run",  km:10},      builtin:true },
+];
+// Add-a-day-type library. MET values are from the Compendium of Physical Activities; the
+// durations are typical-session defaults the user can edit after adding.
+const DAY_TYPE_PRESETS = [
+  { id:"football",   label:"Football",    icon:"⚽", burn:{kind:"met",  mets:7.0, min:90} },
+  { id:"walk_extra", label:"Extra Walk",  icon:"🚶", burn:{kind:"walk", km:5} },
+  { id:"cycling",    label:"Cycling",     icon:"🚴", burn:{kind:"met",  mets:7.5, min:45} },
+  { id:"swimming",   label:"Swimming",    icon:"🏊", burn:{kind:"met",  mets:5.8, min:45} },
+  { id:"basketball", label:"Basketball",  icon:"🏀", burn:{kind:"met",  mets:6.5, min:60} },
+  { id:"tennis",     label:"Tennis",      icon:"🎾", burn:{kind:"met",  mets:7.3, min:60} },
+  { id:"hiking",     label:"Hiking",      icon:"🥾", burn:{kind:"met",  mets:5.3, min:90} },
+  { id:"climbing",   label:"Climbing",    icon:"🧗", burn:{kind:"met",  mets:7.5, min:60} },
+  { id:"yoga",       label:"Yoga",        icon:"🧘", burn:{kind:"met",  mets:2.5, min:60} },
+  { id:"martial",    label:"Martial Arts",icon:"🥋", burn:{kind:"met",  mets:8.0, min:60} },
+  { id:"skiing",     label:"Skiing",      icon:"⛷️", burn:{kind:"met",  mets:6.8, min:120} },
+  { id:"rowing",     label:"Rowing",      icon:"🚣", burn:{kind:"met",  mets:7.0, min:30} },
+  { id:"other",      label:"Other",       icon:"⭐", burn:{kind:"met",  mets:5.0, min:45} },
+];
+// Day-type definitions are global configuration rather than per-component state: the energy
+// engine (plannedDayBurn → dayBurnTotal → getDT/getMaint) is called from roughly fifteen
+// places, most of them several layers deep, and threading a defs array through all of them
+// would touch far more code than the feature warrants. App keeps this registry in step with
+// its own `dayTypes` state inside the same setter, so a change still re-renders the tree
+// normally — the registry only decides which definitions the pure helpers below read.
+let DAY_TYPE_REGISTRY = null;
+const setDayTypeRegistry = defs => { DAY_TYPE_REGISTRY = (Array.isArray(defs) && defs.length) ? defs : null; };
+const activeDayTypes = () => DAY_TYPE_REGISTRY || DEFAULT_DAY_TYPES;
+// Never returns undefined: an id from an old log whose type the user has since deleted still
+// has to render and still has to price, so it falls back to the builtin, then to Rest.
+const dayTypeById = id =>
+  activeDayTypes().find(d=>d.id===id)
+  || DEFAULT_DAY_TYPES.find(d=>d.id===id)
+  || DEFAULT_DAY_TYPES[0];
+// Legacy shim: a few call sites read DAY_TYPES[id].label / .icon. Kept so those keep working
+// against user-defined types too, rather than silently showing "Rest" for a custom type.
+const DAY_TYPES = new Proxy({}, {
+  get: (_t, id) => (typeof id === "string" ? dayTypeById(id) : undefined),
+  has: (_t, id) => activeDayTypes().some(d=>d.id===id),
+  ownKeys: () => activeDayTypes().map(d=>d.id),
+  getOwnPropertyDescriptor: () => ({enumerable:true, configurable:true}),
+});
 const DAY_TAGS = [
   { id:"drinking", emoji:"🍺", label:"Drinking"  },
   { id:"junk",     emoji:"🍕", label:"Junk food" },
@@ -189,13 +244,13 @@ function MedReminderRow({med, onMark}){
     <span style={{color:med.overdue?C.red:C.muted,flexShrink:0}} title={`${win?.label} (${win?.range})${med.overdue?" · overdue":""}`}><WindowIcon id={med.dueWindow} size={16}/></span>
     <div style={{flex:1,minWidth:0}}>
       <div style={{fontSize:12.5,fontWeight:600,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{med.name}</div>
-      <div style={{fontSize:10,color:low?C.red:C.muted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{med.dosePerTake||1} dose{(med.dosePerTake||1)!==1?"s":""}{med.overdue?" · overdue":""}{low?` · ⚠ ${med.remaining??0} left`:""}</div>
+      <div style={{fontSize:T.sm,color:low?C.red:C.muted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{med.dosePerTake||1} dose{(med.dosePerTake||1)!==1?"s":""}{med.overdue?" · overdue":""}{low?` · ⚠ ${med.remaining??0} left`:""}</div>
     </div>
-    <button onClick={()=>onMark(med,"skipped")} aria-label={`Skip ${med.name}`} style={{flexShrink:0,width:30,height:30,minWidth:30,minHeight:30,borderRadius:"50%",background:"none",border:"none",color:C.faint,fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>
+    <button onClick={()=>onMark(med,"skipped")} aria-label={`Skip ${med.name}`} style={{flexShrink:0,width:44,height:44,minWidth:44,minHeight:44,borderRadius:"50%",background:"none",border:"none",color:C.faint,fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>
     <button
       onPointerDown={()=>setPressed(true)} onPointerUp={()=>setPressed(false)} onPointerLeave={()=>setPressed(false)} onPointerCancel={()=>setPressed(false)}
       onClick={()=>onMark(med,"taken")} aria-label={`Mark ${med.name} taken`}
-      style={{flexShrink:0,width:30,height:30,minWidth:30,minHeight:30,borderRadius:"50%",border:`1.5px solid ${C.lime}`,
+      style={{flexShrink:0,width:44,height:44,minWidth:44,minHeight:44,borderRadius:"50%",border:`1.5px solid ${C.lime}`,
         background:pressed?C.lime:"none",color:pressed?"#000":C.lime,fontSize:15,fontWeight:900,cursor:"pointer",
         display:"flex",alignItems:"center",justifyContent:"center",
         transform:pressed?"scale(0.88)":"scale(1)",transition:"transform .15s cubic-bezier(.34,1.56,.64,1), background .12s ease, color .12s ease"}}>✓</button>
@@ -415,8 +470,28 @@ const C = {
 // Everything here is deliberately global because the app styles via ~1,500 inline style
 // objects — a rule written once here is the only way to change all of them at once.
 const GLOBAL_CSS = `
+:root{
+  /* Kept in sync with the EASE token in JS. CSS is the source of truth for CSS-driven motion. */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
 *{-webkit-tap-highlight-color:transparent;box-sizing:border-box}
 input,textarea,select{color-scheme:dark}
+
+/* Tap-target floor. The audit found 16 controls under the 44px minimum on the Today tab alone
+   (30x30 reminder buttons, 29x22 step presets, 18x18 info dots). Rather than hunting every
+   inline style, this gives any small control an invisible centred hit area that meets the
+   minimum without changing how it looks or how the layout flows. Opt out with .no-hit on the
+   rare control that is genuinely decorative. */
+button:not(.no-hit),[role="button"]:not(.no-hit){position:relative}
+button:not(.no-hit)::after,[role="button"]:not(.no-hit)::after{
+  content:"";position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+  width:max(100%,44px);height:max(100%,44px);
+}
+/* ...but only where it cannot swallow a neighbouring control: inside dense rows the pseudo
+   element is clipped back to the button box. */
+.hit-tight button::after,.hit-tight [role="button"]::after{width:100%;height:100%}
 
 /* iOS Safari zooms the whole page when you focus a form control smaller than 16px, and it
    never zooms back out. Every input in this app was 14px. Forcing 16px is the standard fix
@@ -432,8 +507,13 @@ input,textarea,select{font-size:16px!important}
 
 /* Press feedback within the 80-150ms window users read as "responsive". Opacity+scale only:
    neither affects layout bounds, so nothing around the control jitters. */
-button{cursor:pointer;transition:opacity .16s ease,transform .16s ease,background-color .16s ease,border-color .16s ease}
-button:active{opacity:.82;transform:scale(.975)}
+button{cursor:pointer;transition:opacity .16s var(--ease-out),transform .16s var(--ease-out),background-color .16s var(--ease-out),border-color .16s var(--ease-out)}
+button:active{opacity:.82;transform:scale(.97)}
+/* Touch devices fire :hover on tap and then leave it stuck, so hover styling is gated to
+   real pointers. Without this a tapped card stays highlighted after the finger lifts. */
+@media (hover:hover) and (pointer:fine){
+  button:hover{filter:brightness(1.08)}
+}
 button[disabled],button:disabled{cursor:default;opacity:.45}
 button[disabled]:active,button:disabled:active{transform:none;opacity:.45}
 
@@ -493,6 +573,43 @@ button[disabled]:active,button:disabled:active{transform:none;opacity:.45}
 // indicator and its bottom third is untappable — one of the most common PWA-on-iOS defects.
 const SAFE_BOTTOM = "env(safe-area-inset-bottom, 0px)";
 const SAFE_TOP = "env(safe-area-inset-top, 0px)";
+
+// ── Design tokens ─────────────────────────────────────────────────────────────
+// Before these existed the app used 13 distinct font sizes on the Today tab alone (9.5, 10,
+// 11, 12, 12.5, 13, 14, 15, 16, 18, 22, 26, 29) with 84 of ~111 text nodes at 11px or below.
+// That is the actual reason the interface felt cramped and hard to scan: not the colours
+// (measured contrast passes), but that nothing was bigger than anything else, so no element
+// could carry hierarchy. T is a 7-step scale with an 11px floor — anything smaller is
+// unreadable at arm's length on a phone, and 10px labels were the app's default.
+const T = {
+  hero:  34,   // the one number a screen exists to show
+  h1:    24,   // screen title
+  h2:    17,   // card title
+  h3:    15,   // row title / primary control
+  body:  13.5, // default readable text
+  sm:    12,   // secondary/meta text — the FLOOR for anything a user must read
+  label: 11,   // uppercase eyebrow only, never prose
+};
+// 4px base grid. Using named steps stops the drift into 3/5/7/9/13px paddings.
+const SP = { xs:4, sm:8, md:12, lg:16, xl:20, xxl:28 };
+// One radius system: controls are soft, cards are softer, pills are round. Mixed radii inside
+// one card is the single most common "this looks unfinished" tell.
+const R = { sm:8, md:12, lg:16, pill:999 };
+// Motion. The built-in CSS easings are too weak to read as intentional; these are the standard
+// strong variants. ease-out for anything entering or responding to a tap (the user is watching
+// the first frame most closely, so movement must start immediately), ease-in-out only for
+// something moving across the screen. Durations stay under 300ms: UI motion that outlasts that
+// reads as lag, not polish.
+const EASE = {
+  out:   "cubic-bezier(0.23, 1, 0.32, 1)",
+  inOut: "cubic-bezier(0.77, 0, 0.175, 1)",
+  spring:"cubic-bezier(0.34, 1.56, 0.64, 1)",
+};
+// Uppercase section label. 37 hand-rolled copies of this exact style existed across the app.
+const eyebrow = (color=C.muted) => ({
+  fontSize:T.label, color, fontFamily:"monospace", textTransform:"uppercase",
+  letterSpacing:"0.08em", fontWeight:600,
+});
 
 // ── Gym tracking ─────────────────────────────────────────────────────────────
 const WEEKDAYS = [
@@ -1108,16 +1225,31 @@ function getTDEE(profile,weight){
 // generic formula guess and starts being "the worst you've actually done lately, minus a
 // margin," which degrades gracefully to the old formula for anyone with no gym history yet.
 function plannedDayBurn(dayType, weightKg, gymSessions) {
+  return burnModelKcal(dayTypeById(dayType)?.burn, weightKg, gymSessions);
+}
+// Prices a burn model directly, without needing it to be a saved day type yet — this is what
+// lets the day-type editor show the live "+320 kcal" figure while you are still choosing the
+// numbers, and what plannedDayBurn delegates to once the type exists.
+function burnModelKcal(burnModel, weightKg, gymSessions) {
   const w = weightKg || 75;
-  if (dayType === "gym") {
-    const recent = (gymSessions||[]).filter(s=>(s.kcalBurned||0)>0).slice(0,7);
-    if (recent.length > 0) return Math.round(Math.min(...recent.map(s=>s.kcalBurned)) * 0.95);
-  }
-  switch (dayType) {
-    case "gym":       return Math.round(netMetKcal(ENERGY.LIFT_METS, w, ENERGY.PLANNED_LIFT_MIN));
-    case "run_short": return Math.round(runKcal(ENERGY.PLANNED_RUN_SHORT_KM, w));
-    case "run_long":  return Math.round(runKcal(ENERGY.PLANNED_RUN_LONG_KM, w));
-    default:          return 0; // rest, and anything unrecognised
+  const burn = burnModel || {kind:"rest"};
+  switch (burn.kind) {
+    case "lift": {
+      // Real history beats the generic formula: the lowest of the last 7 logged sessions,
+      // less a 5% margin. Lowest-of-recent rather than mean so one heavy session cannot
+      // inflate every future day's eating target.
+      const recent = (gymSessions||[]).filter(s=>(s.kcalBurned||0)>0).slice(0,7);
+      if (recent.length > 0) return Math.round(Math.min(...recent.map(s=>s.kcalBurned)) * 0.95);
+      return Math.round(netMetKcal(ENERGY.LIFT_METS, w, burn.min || ENERGY.PLANNED_LIFT_MIN));
+    }
+    case "run":   return Math.round(runKcal(burn.km || 0, w));
+    case "walk":  return Math.round(walkKcal(burn.km || 0, w));
+    case "met":   return Math.round(netMetKcal(burn.mets || 0, w, burn.min || 0));
+    // A flat figure is the one model that cannot scale to bodyweight, because the user gave us
+    // a number rather than an activity. Taken at face value.
+    case "fixed": return Math.round(burn.kcal || 0);
+    case "rest":
+    default:      return 0;
   }
 }
 
@@ -1248,6 +1380,151 @@ function linRegTrend(entries) {
   const ssXY = xs.reduce((a,x,i)=>a+(x-mx)*(ys[i]-my),0);
   if (ssXX === 0) return null;
   return ssXY / ssXX; // kg per week
+}
+
+// ── Streaks and achievements ──────────────────────────────────────────────────
+// Everything here is DERIVED from logs that already exist. Nothing new is recorded, which
+// matters for two reasons: a streak can never disagree with the history it is drawn from, and
+// importing a backup restores your streaks along with your data.
+//
+// The deliberate design decision is that a streak does not break at midnight. It breaks when a
+// day *ends* unlogged. Counting a still-unfinished today as a miss would show the user a
+// broken streak every morning before breakfast, which punishes them for the app's clock rather
+// than their behaviour — so today is only ever counted as a win or as "still open".
+const dayBefore = (dateStr, n=1) => {
+  const d = new Date(dateStr+"T12:00:00"); d.setDate(d.getDate()-n);
+  return localDateStr(d);
+};
+// Did this day's intake land on the right side of its own target? Uses the goal that was
+// active ON that day, not today's goal — otherwise switching from maintain to cut would
+// retroactively mark months of good maintenance days as failures.
+function dayHitKcalGoal(log, profile, weightForDay, gymSessions) {
+  if (!log || !(log.meals||[]).length) return false;
+  const consumed = log.meals.reduce((a,m)=>a+(m.kcal||0),0);
+  if (consumed <= 0) return false;
+  const goal = log.goalMode || profile?.goal || "maintain";
+  const histProfile = {...(profile||{}), goal, goalSubmode: log.goalSubmode || goal};
+  const actBurn = (log.activities||[]).reduce((s,a)=>s+(a.kcal||0),0) + (log.burnedExtra||0);
+  const target = getDT(histProfile, log.dayType||"rest", weightForDay, actBurn,
+                       (log.activities||[]).length>0, log.dailySteps||0, gymSessions).kcal;
+  if (!target) return false;
+  const MARGIN = 150;
+  if (goal === "cut")  return consumed <= target + MARGIN;
+  if (goal === "bulk") return consumed >= target - MARGIN;
+  return Math.abs(consumed - target) <= MARGIN; // maintain
+}
+// Were all medications that came due on this date actually taken (not skipped)?
+// A day with nothing due does not count as a win — you cannot earn a supplement streak on a
+// day you had no supplements to take, but it does not break the streak either.
+function dayMedStatus(dateStr, medications, medLog) {
+  const weekday = new Date(dateStr+"T12:00:00").getDay();
+  let due = 0, taken = 0;
+  for (const win of MED_WINDOWS) {
+    for (const m of (medications||[])) {
+      if (m.active === false) continue;
+      if (!(m.windows||[]).includes(win.id)) continue;
+      if (!(m.daily || (m.days||[]).includes(weekday))) continue;
+      due++;
+      if ((medLog||[]).some(l=>l.medId===m.id && l.date===dateStr && l.window===win.id && l.status==="taken")) taken++;
+    }
+  }
+  return {due, taken, complete: due>0 && taken===due};
+}
+// Walk backwards from today counting consecutive wins. `hit` returns true/false/null, where
+// null means "this day does not count either way" (nothing was due) and the walk continues.
+function streakBack(today, hit, maxDays=400) {
+  let current = 0, cursor = today, openToday = false;
+  const todayResult = hit(today);
+  if (todayResult === true) { current = 1; }
+  else { openToday = true; } // today unfinished or missed — start counting from yesterday
+  cursor = dayBefore(today);
+  for (let i = 0; i < maxDays; i++) {
+    const r = hit(cursor);
+    if (r === true) current++;
+    else if (r === null) { /* neutral day, keep going without incrementing */ }
+    else break;
+    cursor = dayBefore(cursor);
+  }
+  return {current, openToday};
+}
+// Achievements are milestones, not busywork: each one marks a real behaviour the app can
+// verify from data. They unlock permanently — a badge you earned does not disappear because
+// this week went badly, which is the difference between encouragement and nagging.
+const ACHIEVEMENTS = [
+  {id:"first_meal",  icon:"🌱", label:"First Bite",     desc:"Log your first meal",                test:s=>s.daysLogged>=1},
+  {id:"log_7",       icon:"🔥", label:"Week Logged",    desc:"7-day logging streak",               test:s=>s.bestLog>=7},
+  {id:"log_30",      icon:"🌋", label:"Month Logged",   desc:"30-day logging streak",              test:s=>s.bestLog>=30},
+  {id:"log_100",     icon:"💎", label:"Century",        desc:"100 days logged in total",           test:s=>s.daysLogged>=100},
+  {id:"kcal_7",      icon:"🎯", label:"On Target",      desc:"Hit your calorie goal 7 days running",test:s=>s.bestKcal>=7},
+  {id:"kcal_30",     icon:"🏹", label:"Dialled In",     desc:"Hit your calorie goal 30 days running",test:s=>s.bestKcal>=30},
+  {id:"gym_10",      icon:"🏋️", label:"Ten Sessions",   desc:"Finish 10 gym sessions",             test:s=>s.gymSessions>=10},
+  {id:"gym_50",      icon:"⚡", label:"Fifty Sessions", desc:"Finish 50 gym sessions",             test:s=>s.gymSessions>=50},
+  {id:"gym_week",    icon:"📅", label:"Full Week",      desc:"Complete every scheduled gym day in a week",test:s=>s.fullTrainingWeeks>=1},
+  {id:"supp_7",      icon:"💊", label:"Consistent",     desc:"7-day supplement streak",            test:s=>s.bestSupp>=7},
+  {id:"supp_30",     icon:"🧬", label:"Never Misses",   desc:"30-day supplement streak",           test:s=>s.bestSupp>=30},
+  {id:"weigh_20",    icon:"⚖️", label:"Tracked",        desc:"Log your weight 20 times",           test:s=>s.weighIns>=20},
+];
+// One pass over the loaded history producing everything the UI needs.
+// `logs` is {dateStr: dayLog}; only the days already in memory are considered, so streaks are
+// bounded by however much history the app has loaded (60 days at boot).
+function computeProgress({logs, today, profile, weights, gymSessions, medications, medLog, gymSchedule}) {
+  const weightAt = date => {
+    const exact = (weights||[]).find(w=>w.date===date);
+    if (exact) return exact.weight;
+    const earlier = (weights||[]).find(w=>w.date<=date);
+    return earlier?.weight || weights?.[0]?.weight || null;
+  };
+  const hasMeals = d => { const l=logs[d]; return !!(l && (l.meals||[]).length); };
+
+  const logStreak  = streakBack(today, d => hasMeals(d) ? true : false);
+  const kcalStreak = streakBack(today, d => hasMeals(d) ? dayHitKcalGoal(logs[d], profile, weightAt(d), gymSessions) : false);
+  const suppStreak = streakBack(today, d => {
+    const st = dayMedStatus(d, medications, medLog);
+    if (st.due === 0) return null;      // nothing due — neutral, does not break the streak
+    return st.complete;
+  });
+
+  const dates = Object.keys(logs).sort();
+  const daysLogged = dates.filter(hasMeals).length;
+  // Best-ever runs, scanned across the loaded window.
+  const bestRun = pred => {
+    let best=0, run=0;
+    for (const d of dates) { if (pred(d)) { run++; best=Math.max(best,run); } else run=0; }
+    return best;
+  };
+  const bestLog  = Math.max(bestRun(hasMeals), logStreak.current);
+  const bestKcal = Math.max(bestRun(d=>hasMeals(d)&&dayHitKcalGoal(logs[d],profile,weightAt(d),gymSessions)), kcalStreak.current);
+  const bestSupp = Math.max(bestRun(d=>dayMedStatus(d,medications,medLog).complete), suppStreak.current);
+
+  // This week's training, Monday-first, against the user's own gym schedule.
+  const now = new Date(today+"T12:00:00");
+  const mondayOffset = (now.getDay()+6)%7;
+  const weekStart = dayBefore(today, mondayOffset);
+  const weekDates = Array.from({length:7},(_,i)=>dayBefore(weekStart,-i));
+  const trainedThisWeek = weekDates.filter(d=>{
+    const l=logs[d];
+    return !!(l && ((l.activities||[]).length>0 || (l.dayType && l.dayType!=="rest")));
+  }).length;
+  const scheduledPerWeek = (gymSchedule||[]).length || 0;
+  // A "full training week" needs a schedule to measure against, so this stays 0 until one is set.
+  const fullTrainingWeeks = scheduledPerWeek>0 && trainedThisWeek>=scheduledPerWeek ? 1 : 0;
+
+  const stats = {
+    daysLogged, bestLog, bestKcal, bestSupp,
+    gymSessions:(gymSessions||[]).length,
+    weighIns:(weights||[]).length,
+    fullTrainingWeeks,
+  };
+  return {
+    streaks: {
+      logging:     {...logStreak,  best:bestLog},
+      kcal:        {...kcalStreak, best:bestKcal},
+      supplements: {...suppStreak, best:bestSupp, anyConfigured:(medications||[]).some(m=>m.active!==false)},
+    },
+    week: {trained:trainedThisWeek, scheduled:scheduledPerWeek, dates:weekDates},
+    stats,
+    achievements: ACHIEVEMENTS.map(a=>({...a, earned:!!a.test(stats)})),
+  };
 }
 
 function weeklyTrend(weights) {
@@ -2633,6 +2910,18 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
   const [photoLoading,setPhotoLoading]=useState(false);
   const [photoErr,setPhotoErr]=useState(null);
   const [logErr,setLogErr]=useState("");
+  // Meal preps had no search at all, unlike every product-label picker in the app. With a
+  // long-running prep list that is a wall of near-identical cards you have to scroll past to
+  // find today's. Sorting newest-first matters as much as the search box: the prep you are
+  // most likely to be eating is almost always the one you cooked most recently.
+  const [prepSearch,setPrepSearch]=useState("");
+  const shownPreps = (()=>{
+    const q = prepSearch.trim().toLowerCase();
+    const matched = q
+      ? activePreps.filter(p=>(p.name||"").toLowerCase().includes(q))
+      : activePreps;
+    return [...matched].sort((a,b)=>String(b.createdDate||"").localeCompare(String(a.createdDate||"")));
+  })();
 
   // A prep is "broken" if it has no macros and no per-100 macros saved — usually means
   // it was created before the macro fields were filled in. Let the user know rather
@@ -2727,9 +3016,17 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
   return(<div>
     {activePreps.length===0
       ? <div style={{background:C.faint,borderRadius:10,padding:"12px 14px",marginBottom:10,textAlign:"center"}}><div style={{fontSize:22,marginBottom:4}}>🍱</div><div style={{fontSize:12,color:C.muted}}>No active preps — but you can still log labels below.</div></div>
-      : <div style={{fontSize:11,color:C.muted,marginBottom:8}}>Tap a prep to select, enter grams eaten. Multi-select to combine.</div>}
+      : <div style={{fontSize:T.sm,color:C.muted,marginBottom:SP.sm}}>Tap a prep to select, enter grams eaten. Multi-select to combine.</div>}
+    {/* Search appears only once the list is long enough to need it — a filter box above three
+        items is noise, above a dozen it is the only way to find anything. */}
+    {activePreps.length>3&&<input
+      value={prepSearch} onChange={e=>setPrepSearch(e.target.value)}
+      placeholder={`Search ${activePreps.length} preps…`} aria-label="Search meal preps"
+      style={{width:"100%",boxSizing:"border-box",minHeight:44,background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.text,outline:"none",marginBottom:SP.sm}}/>}
     <div style={{display:"flex",flexDirection:"column",gap:7,marginBottom:10}}>
-      {activePreps.map(prep=>{
+      {activePreps.length>3&&shownPreps.length===0&&
+        <div style={{fontSize:T.sm,color:C.muted,padding:`${SP.sm}px 2px`,fontStyle:"italic"}}>No prep matches “{prepSearch}”.</div>}
+      {shownPreps.map(prep=>{
         const isSelected=selected[prep.id]!==undefined;
         const broken = isPrepBroken(prep);
         const remG=prep.remainingWeightG??prep.totalWeightG??0;
@@ -3342,7 +3639,108 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
   </Sheet>);
 }
 // ── Today Tab ─────────────────────────────────────────────────────────────────
-function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProducts,profile,latestWeight,weights,setWeights,onGoToSettings,medications,medLog,onMarkMed,gymSessions}){
+// ── Today-tab building blocks ─────────────────────────────────────────────────
+// A titled card. Roughly forty hand-rolled copies of this exact container existed, each with
+// its own padding and radius, which is where the "every block looks equally important" feeling
+// came from. One component means one visual weight, and changing it changes all of them.
+function Card({title, right, children, accent, style}){
+  return(<section style={{background:C.card,border:`1px solid ${accent?accent+"55":C.border}`,borderRadius:R.md,padding:`${SP.md}px ${SP.lg}px`,marginBottom:SP.md,...style}}>
+    {(title||right)&&<header style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:SP.md,gap:SP.sm}}>
+      {title&&<h2 style={{...eyebrow(accent||C.muted),margin:0}}>{title}</h2>}
+      {right}
+    </header>}
+    {children}
+  </section>);
+}
+// Progressive disclosure. The Today tab previously showed weight entry, day type, step count
+// and day tags permanently expanded above the calorie budget — four blocks of controls you
+// touch once a day, sitting on top of the number you check ten times a day. Folding them puts
+// the answer first without removing anything.
+function Collapse({title, subtitle, children, defaultOpen=false}){
+  const [open,setOpen]=useState(defaultOpen);
+  return(<section style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:R.md,marginBottom:SP.md,overflow:"hidden"}}>
+    <button onClick={()=>setOpen(o=>!o)} aria-expanded={open} className="no-hit"
+      style={{width:"100%",minHeight:52,padding:`${SP.md}px ${SP.lg}px`,background:"none",border:"none",display:"flex",justifyContent:"space-between",alignItems:"center",gap:SP.sm,textAlign:"left"}}>
+      <span style={{minWidth:0}}>
+        <span style={{display:"block",fontSize:T.body,fontWeight:600,color:C.text}}>{title}</span>
+        {subtitle&&<span style={{display:"block",fontSize:T.sm,color:C.muted,marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{subtitle}</span>}
+      </span>
+      <span aria-hidden="true" style={{color:C.muted,fontSize:T.sm,flexShrink:0,transition:`transform .2s ${EASE.out}`,transform:open?"rotate(180deg)":"none"}}>▼</span>
+    </button>
+    {open&&<div style={{padding:`0 ${SP.lg}px ${SP.lg}px`}}>{children}</div>}
+  </section>);
+}
+// The one number this screen exists to answer: how much is left today.
+// Previously this sat seventh down the page at 22px, below four blocks of settings; the ring
+// row above it showed the same information a second time in 15px text. Here it is the first
+// thing rendered and by far the largest thing on screen.
+function BudgetHero({tot, dt, remKcal, remProt, goal}){
+  const over = remKcal < 0;
+  const pct = dt.kcal>0 ? Math.min(tot.kcal/dt.kcal,1) : 0;
+  // Over-eating on a cut is the case worth flagging; on a bulk, going over is the point.
+  const barCol = over ? (goal==="bulk" ? C.lime : C.red) : C.lime;
+  return(<section style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:R.lg,padding:`${SP.xl}px ${SP.lg}px ${SP.lg}px`,marginBottom:SP.md}}>
+    <div style={{display:"flex",alignItems:"baseline",justifyContent:"center",gap:SP.sm}}>
+      <span style={{fontSize:T.hero,fontWeight:800,fontFamily:"monospace",color:over?barCol:C.text,lineHeight:1,letterSpacing:"-0.02em"}}>
+        {Math.abs(Math.round(remKcal))}
+      </span>
+      <span style={{fontSize:T.h2,color:C.muted,fontWeight:600}}>kcal {over?"over":"left"}</span>
+    </div>
+    <div style={{textAlign:"center",fontSize:T.sm,color:C.muted,marginTop:SP.xs}}>
+      {Math.round(tot.kcal)} of {Math.round(dt.kcal)} eaten
+    </div>
+    {/* A single bar rather than four rings: at a glance you want one answer, and the macro
+        detail directly below already carries the breakdown. */}
+    <div style={{height:8,background:C.dim,borderRadius:R.pill,marginTop:SP.md,overflow:"hidden"}}>
+      <div style={{height:"100%",width:`${pct*100}%`,background:barCol,borderRadius:R.pill,transition:`width .5s ${EASE.out}`}}/>
+    </div>
+    <div style={{display:"flex",marginTop:SP.lg,gap:SP.sm}}>
+      {[["Protein",tot.protein,dt.protein,C.blue],["Carbs",tot.carbs,dt.carbs,C.orange],["Fat",tot.fat,dt.fat,C.purple]].map(([lbl,val,max,col])=>{
+        const p = max>0?Math.min(val/max,1):0;
+        return(<div key={lbl} style={{flex:1,minWidth:0}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:5}}>
+            <span style={{fontSize:T.sm,color:C.muted}}>{lbl}</span>
+            <span style={{fontSize:T.sm,fontFamily:"monospace",color:col,fontWeight:700}}>{Math.round(val)}</span>
+          </div>
+          <div style={{height:4,background:C.dim,borderRadius:R.pill,overflow:"hidden"}}>
+            <div style={{height:"100%",width:`${p*100}%`,background:col,transition:`width .5s ${EASE.out}`}}/>
+          </div>
+          <div style={{fontSize:T.label,color:C.muted2,fontFamily:"monospace",marginTop:3}}>of {Math.round(max)}g</div>
+        </div>);
+      })}
+    </div>
+    {remProt>0&&<div style={{fontSize:T.sm,color:C.blue,marginTop:SP.md,textAlign:"center"}}>
+      {Math.round(remProt)}g protein still to go
+    </div>}
+  </section>);
+}
+// Streaks. Deliberately shows the CURRENT run, not a score: a number that only goes up stops
+// meaning anything, whereas a run you can break is the thing that actually gets people to log.
+// "at risk" is the honest state for a streak that is alive but needs today to be finished —
+// showing it as already broken before the day is over would be a lie that discourages.
+function StreakStrip({progress, medsConfigured}){
+  if(!progress) return null;
+  const s = progress.streaks;
+  const items = [
+    {key:"log",  icon:"🔥", label:"Logging",  cur:s.logging.current,     atRisk:s.logging.openToday,     col:C.orange},
+    {key:"kcal", icon:"🎯", label:"On target",cur:s.kcal.current,        atRisk:s.kcal.openToday,        col:C.lime},
+    ...(medsConfigured?[{key:"supp",icon:"💊",label:"Supps",cur:s.supplements.current,atRisk:s.supplements.openToday,col:C.blue}]:[]),
+    {key:"week", icon:"🏋️", label:"This week", cur:progress.week.trained, total:progress.week.scheduled, col:C.purple},
+  ];
+  return(<div style={{display:"flex",gap:SP.sm,marginBottom:SP.md}}>
+    {items.map(it=>(
+      <div key={it.key} style={{flex:1,minWidth:0,background:C.card,border:`1px solid ${C.border}`,borderRadius:R.md,padding:`${SP.md}px ${SP.xs}px`,textAlign:"center"}}>
+        <div style={{fontSize:15,lineHeight:1}} aria-hidden="true">{it.icon}</div>
+        <div style={{fontSize:T.h2,fontWeight:800,fontFamily:"monospace",color:it.cur>0?it.col:C.muted2,marginTop:5,lineHeight:1}}>
+          {it.total!=null ? `${it.cur}/${it.total}` : it.cur}
+        </div>
+        <div style={{fontSize:T.label,color:C.muted,marginTop:4,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{it.label}</div>
+        {it.atRisk&&it.cur>0&&<div style={{fontSize:T.label,color:C.yellow,marginTop:2}}>today?</div>}
+      </div>
+    ))}
+  </div>);
+}
+function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProducts,profile,latestWeight,weights,setWeights,onGoToSettings,medications,medLog,onMarkMed,gymSessions,progress}){
   const [modal,setModal]=useState(null);const [wInput,setWInput]=useState("");
   // Re-render on the minute so a reminder appears/disappears exactly when its window opens or
   // closes, without needing any user action to refresh the tab.
@@ -3390,41 +3788,49 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
   const toggleTag=tagId=>{const tags=dayData.tags||[];setDayData(p=>({...p,tags:tags.includes(tagId)?tags.filter(t=>t!==tagId):[...tags,tagId]}));};
   return(<div style={{height:"100%",position:"relative"}}>
     <div style={{height:"100%",overflowY:"auto",padding:"0 16px 90px"}}>
-      <div style={{padding:"18px 0 8px"}}>
-        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",letterSpacing:"0.06em"}}>{new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long"}).toUpperCase()}</div>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-          <div style={{fontSize:26,fontWeight:800,color:C.text,letterSpacing:"-0.03em",lineHeight:1.15}}>Today</div>
-          {profile.goal&&<div style={{fontSize:11,background:`${gc}20`,color:gc,padding:"4px 10px",borderRadius:20,fontWeight:700}}>{profile.goal==="cut"?"Cut":profile.goal==="bulk"?"Bulk":"Maintain"}</div>}
+      <div style={{padding:`${SP.xl}px 0 ${SP.md}px`}}>
+        <div style={{...eyebrow(),letterSpacing:"0.06em"}}>{new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long"}).toUpperCase()}</div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:2}}>
+          <h1 style={{fontSize:T.h1,fontWeight:800,color:C.text,letterSpacing:"-0.03em",lineHeight:1.15,margin:0}}>Today</h1>
+          {profile.goal&&<div style={{fontSize:T.sm,background:`${gc}20`,color:gc,padding:"5px 12px",borderRadius:R.pill,fontWeight:700}}>{profile.goal==="cut"?"Cut":profile.goal==="bulk"?"Bulk":"Maintain"}</div>}
         </div>
       </div>
+
+      {/* The budget comes first. Everything that used to sit above it — weight entry, day type,
+          steps, tags — is configuration you set once and then stop thinking about; this is the
+          number the screen is opened to check. */}
+      {!dt.unavailable&&<BudgetHero tot={tot} dt={dt} remKcal={remKcal} remProt={remProt} goal={profile.goal}/>}
+
+      <StreakStrip progress={progress} medsConfigured={(medications||[]).some(m=>m.active!==false)}/>
 
       {/* Medication/supplement reminders — one compact section for every window that has opened
           today and hasn't been marked yet, instead of repeating "Morning reminder" etc. on every
           card. Tap ✓ to log taken, × to skip; a reminder left over from an earlier window stays
           here (flagged "overdue" via the row's icon colour) rather than silently disappearing —
           it only goes away once tapped. */}
-      {dueMeds.length>0&&<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"10px 12px",marginBottom:10}}>
-        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:7}}>💊 Supplement / Vitamin Reminders</div>
-        <div style={{display:"flex",flexDirection:"column",gap:6}}>
+      {dueMeds.length>0&&<Card title="💊 Supplements due">
+        <div className="hit-tight" style={{display:"flex",flexDirection:"column",gap:SP.sm}}>
           {dueMeds.map(med=><MedReminderRow key={med.id} med={med} onMark={onMarkMed}/>)}
         </div>
-      </div>}
+      </Card>}
 
-      {/* Weight card */}
-      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"10px 14px",marginBottom:10}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-          <span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Weight today</span>
-          {todayW&&<div style={{display:"flex",alignItems:"baseline",gap:6}}><span style={{fontFamily:"monospace",fontSize:18,fontWeight:800,color:C.lime}}>{todayW.weight.toFixed(2)}</span><span style={{fontSize:12,color:C.muted}}>kg</span>{wDelta!==null&&<span style={{fontFamily:"monospace",fontSize:11,color:wDelta<0?C.lime:C.red}} title="Difference from previous logged weight">{wDelta<0?"↓":"↑"}{Math.abs(wDelta).toFixed(2)} vs prev</span>}</div>}
-        </div>
-        <div style={{display:"flex",gap:8}}>
-          <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" step="0.05" aria-label="Weight in kilograms" placeholder={todayW?"Update weight…":"e.g. 75.00"} value={wInput} onChange={e=>{setWInput(e.target.value.replace(",","."));if(wErr)setWErr("");}} onKeyDown={e=>e.key==="Enter"&&logWeight()} style={{flex:1,background:C.bg,border:`1px solid ${wErr?C.red:C.border}`,borderRadius:8,padding:"8px 11px",color:C.text,fontFamily:"monospace",outline:"none",minHeight:44}}/>
-          <button onClick={logWeight} style={{padding:"0 18px",minHeight:44,borderRadius:8,background:saved?C.dim:C.lime,border:"none",color:saved?C.lime:"#000",fontWeight:700,fontSize:13,flexShrink:0}}>{saved?"✓ Saved":"Log"}</button>
+      {/* Weight. Folded by default once today's weight exists — there is nothing to do here
+          until tomorrow, and an empty input is not worth permanent screen space. */}
+      <Collapse
+        title="Weight"
+        defaultOpen={!todayW}
+        subtitle={todayW
+          ? `${todayW.weight.toFixed(2)} kg today${wDelta!==null?`  ·  ${wDelta<0?"↓":"↑"}${Math.abs(wDelta).toFixed(2)} vs previous`:""}`
+          : "Not logged today"}>
+        <div style={{display:"flex",gap:SP.sm}}>
+          <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" step="0.05" aria-label="Weight in kilograms" placeholder={todayW?"Update weight…":"e.g. 75.00"} value={wInput} onChange={e=>{setWInput(e.target.value.replace(",","."));if(wErr)setWErr("");}} onKeyDown={e=>e.key==="Enter"&&logWeight()} style={{flex:1,background:C.bg,border:`1px solid ${wErr?C.red:C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.text,fontFamily:"monospace",outline:"none",minHeight:44}}/>
+          <button onClick={logWeight} style={{padding:`0 ${SP.xl}px`,minHeight:44,borderRadius:R.sm,background:saved?C.dim:C.lime,border:"none",color:saved?C.lime:"#000",fontWeight:700,fontSize:T.body,flexShrink:0}}>{saved?"✓ Saved":"Log"}</button>
         </div>
         {/* Error sits next to the field it belongs to, not in a banner at the top of the
             screen — role=alert so it is announced the moment it appears. */}
-        {wErr&&<div role="alert" style={{fontSize:12,color:C.red,marginTop:6,lineHeight:1.4}}>{wErr}</div>}
-        {weights.slice(1,4).map(e=>(<div key={e.date} style={{display:"flex",justifyContent:"space-between",marginTop:4}}><span style={{fontSize:11,color:C.muted}}>{new Date(e.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span><span style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{e.weight.toFixed(2)} kg</span></div>))}
-      </div>
+        {wErr&&<div role="alert" style={{fontSize:T.sm,color:C.red,marginTop:SP.sm,lineHeight:1.4}}>{wErr}</div>}
+        {weights.slice(1,4).map(e=>(<div key={e.date} style={{display:"flex",justifyContent:"space-between",marginTop:SP.sm}}><span style={{fontSize:T.sm,color:C.muted}}>{new Date(e.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span><span style={{fontFamily:"monospace",fontSize:T.sm,color:C.muted}}>{e.weight.toFixed(2)} kg</span></div>))}
+      </Collapse>
 
       {!profileOK&&<button onClick={onGoToSettings} style={{width:"100%",marginBottom:10,background:"#1a1400",border:`1px solid ${C.yellow}40`,borderRadius:10,padding:"9px 14px",display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}}><span style={{fontSize:12,color:C.yellow}}>Complete profile for personalized targets</span><span style={{color:C.muted,fontSize:12}}>→</span></button>}
 
@@ -3456,40 +3862,48 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
         {extraBurn>0&&(dayData.activities||[]).length>1&&<div style={{borderTop:"1px solid #2e1e07",marginTop:6,paddingTop:5,display:"flex",justifyContent:"space-between"}}><span style={{fontSize:11,color:C.muted}}>Total burn</span><span style={{fontFamily:"monospace",fontSize:12,fontWeight:800,color:C.orange}}>+{Math.round(extraBurn)} → target {Math.round(dt.kcal)}</span></div>}
       </div>}
 
-      {/* Day type */}
-      <div style={{marginBottom:10}}>
-        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:7}}>Day Type</div>
-        <div style={{display:"flex",gap:5}}>{Object.entries(DAY_TYPES).map(([key,val])=>{const active=dayData.dayType===key;const tKcal=getDT(profile,key,latestWeight,0,false,dailySteps,gymSessions).kcal;return(<button key={key} onClick={()=>setDayData(p=>({...p,dayType:key,goalMode:profile.goal,goalSubmode:profile.goalSubmode}))} style={{flex:1,padding:"7px 3px",borderRadius:10,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.card,color:active?C.lime:C.muted,fontWeight:active?700:400,cursor:"pointer",fontSize:9.5,lineHeight:1.4,textAlign:"center"}}><div style={{fontSize:14}}>{val.icon}</div><div>{val.label}</div><div style={{fontFamily:"monospace",fontSize:10,opacity:0.75,marginTop:1}}>{tKcal}</div></button>);})}</div>
-      </div>
+      {/* Day setup. Day type, steps and tags are all "tell the app about today" controls that
+          you touch once and then ignore, so they share one folded section instead of three
+          permanently-expanded blocks above the budget. The summary line keeps the current
+          state visible without opening it. */}
+      <Collapse
+        title="Day setup"
+        subtitle={`${dayTypeById(dayData.dayType).icon} ${dayTypeById(dayData.dayType).label}${dailySteps>0?`  ·  ${dailySteps.toLocaleString()} steps`:""}${(dayData.tags||[]).length?`  ·  ${(dayData.tags||[]).length} tag${(dayData.tags||[]).length!==1?"s":""}`:""}`}>
 
-      {/* Daily steps — optional but recalculates target when set */}
-      <div style={{marginBottom:12,background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px"}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-          <span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",display:"flex",alignItems:"center",gap:5}}>Daily Steps <InfoTip text="For background movement only — commuting, errands, walking around home. If you did a deliberate walk, log it as an Activity instead. Logging both double-counts."/></span>
-          {dailySteps>0&&(()=>{const adj=stepsKcal(dailySteps,profile.activityLevel||"sedentary",latestWeight||70);if(adj===0)return <span style={{fontSize:10,color:C.muted,fontFamily:"monospace"}}>on baseline</span>;return <span style={{fontSize:10,color:adj>0?C.orange:C.muted,fontFamily:"monospace"}}>{adj>0?"+":"−"}{Math.abs(adj)} kcal {adj>0?"bonus":"vs baseline"}</span>;})()}
+        <div style={{...eyebrow(),marginBottom:SP.sm}}>Day type</div>
+        {/* Horizontally scrollable: the list is user-editable now, so it can hold a dozen
+            entries and must not squeeze them into unreadable slivers the way a flex row did. */}
+        <div style={{display:"flex",gap:SP.sm,overflowX:"auto",paddingBottom:SP.xs,marginBottom:SP.lg,scrollbarWidth:"none"}}>
+          {activeDayTypes().map(d=>{
+            const active=dayData.dayType===d.id;
+            const tKcal=getDT(profile,d.id,latestWeight,0,false,dailySteps,gymSessions).kcal;
+            return(<button key={d.id} onClick={()=>setDayData(p=>({...p,dayType:d.id,goalMode:profile.goal,goalSubmode:profile.goalSubmode}))}
+              className="no-hit"
+              style={{flexShrink:0,minWidth:84,minHeight:72,padding:`${SP.sm}px ${SP.md}px`,borderRadius:R.md,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,fontWeight:active?700:500,textAlign:"center"}}>
+              <div style={{fontSize:18,lineHeight:1.2}}>{d.icon}</div>
+              <div style={{fontSize:T.sm,marginTop:3,whiteSpace:"nowrap"}}>{d.label}</div>
+              <div style={{fontFamily:"monospace",fontSize:T.label,opacity:0.8,marginTop:2}}>{tKcal}</div>
+            </button>);
+          })}
         </div>
-        <div style={{display:"flex",gap:6,alignItems:"center"}}>
-          <input type="text" inputMode="numeric" pattern="[0-9]*" value={dailySteps||""} onChange={e=>{const v=parseInt(e.target.value.replace(/\D/g,""))||0;setDayData(p=>({...p,dailySteps:v}));}} placeholder="0" style={{width:90,background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"7px 10px",color:C.text,fontSize:14,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
-          <span style={{fontSize:11,color:C.muted}}>steps</span>
-          <div style={{display:"flex",gap:5,marginLeft:"auto"}}>{[2000,5000,8000,10000].map(n=>(<button key={n} onClick={()=>setDayData(p=>({...p,dailySteps:n}))} style={{padding:"4px 8px",borderRadius:6,border:`1px solid ${dailySteps===n?C.orange:C.border}`,background:dailySteps===n?`${C.orange}18`:C.bg,color:dailySteps===n?C.orange:C.muted,cursor:"pointer",fontSize:10,fontFamily:"monospace"}}>{n>=1000?`${n/1000}k`:n}</button>))}</div>
-        </div>
-        <div style={{fontSize:10,color:C.muted,marginTop:5,lineHeight:1.4}}>Your activity level ({ACT_LEVELS.find(l=>l.id===(profile.activityLevel||"sedentary"))?.label||"?"}) assumes ~{(STEP_BASELINE[profile.activityLevel||"sedentary"]||6500).toLocaleString()} steps/day. Logging your actual steps adjusts today's target up or down from there. Change your base level in Settings.</div>
-      </div>
 
-      {/* Macro rings */}
-      <div style={{background:C.card,borderRadius:14,padding:"16px 8px 14px",border:`1px solid ${C.border}`,marginBottom:12}}>
-        <div style={{display:"flex",justifyContent:"space-around"}}><Ring value={tot.kcal} max={dt.kcal} color={C.lime} label="kcal"/><Ring value={tot.protein} max={dt.protein} color={C.blue} label="protein"/><Ring value={tot.carbs} max={dt.carbs} color={C.orange} label="carbs"/><Ring value={tot.fat} max={dt.fat} color={C.purple} label="fat"/></div>
-        <div style={{marginTop:14,paddingTop:12,borderTop:`1px solid ${C.border}`,display:"flex",justifyContent:"space-around",textAlign:"center"}}>
-          <div><div style={{fontSize:22,fontWeight:800,fontFamily:"monospace",color:remKcal<0?C.red:C.lime,lineHeight:1}}>{Math.abs(Math.round(remKcal))}</div><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginTop:3}}>{remKcal<0?"over":"left"} kcal</div></div>
-          <div style={{width:1,background:C.border}}/>
-          <div><div style={{fontSize:22,fontWeight:800,fontFamily:"monospace",color:remProt<0?C.lime:C.blue,lineHeight:1}}>{Math.abs(Math.round(remProt))}g</div><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginTop:3}}>{remProt<0?"💪 extra":"left"} protein</div></div>
-          <div style={{width:1,background:C.border}}/>
-          <div><div style={{fontSize:22,fontWeight:800,fontFamily:"monospace",color:C.text,lineHeight:1}}>{Math.round(tot.kcal)}</div><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginTop:3}}>consumed</div></div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:SP.sm}}>
+          <span style={{...eyebrow(),display:"flex",alignItems:"center",gap:5}}>Daily steps <InfoTip text="For background movement only — commuting, errands, walking around home. If you did a deliberate walk, log it as an Activity instead. Logging both double-counts."/></span>
+          {dailySteps>0&&(()=>{const adj=stepsKcal(dailySteps,profile.activityLevel||"sedentary",latestWeight||70);if(adj===0)return <span style={{fontSize:T.sm,color:C.muted,fontFamily:"monospace"}}>on baseline</span>;return <span style={{fontSize:T.sm,color:adj>0?C.orange:C.muted,fontFamily:"monospace"}}>{adj>0?"+":"−"}{Math.abs(adj)} kcal</span>;})()}
         </div>
-      </div>
+        <div style={{display:"flex",gap:SP.sm,alignItems:"center",flexWrap:"wrap"}}>
+          <input type="text" inputMode="numeric" pattern="[0-9]*" aria-label="Daily steps" value={dailySteps||""} onChange={e=>{const v=parseInt(e.target.value.replace(/\D/g,""))||0;setDayData(p=>({...p,dailySteps:v}));}} placeholder="0" style={{width:96,minHeight:44,background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.text,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
+          <div style={{display:"flex",gap:6,marginLeft:"auto"}}>{[2000,5000,8000,10000].map(n=>(
+            <button key={n} onClick={()=>setDayData(p=>({...p,dailySteps:n}))} className="no-hit"
+              style={{padding:`${SP.sm}px ${SP.md}px`,minHeight:40,borderRadius:R.sm,border:`1px solid ${dailySteps===n?C.orange:C.border}`,background:dailySteps===n?`${C.orange}18`:C.bg,color:dailySteps===n?C.orange:C.muted,fontSize:T.sm,fontFamily:"monospace"}}>{n>=1000?`${n/1000}k`:n}</button>))}</div>
+        </div>
+        <div style={{fontSize:T.sm,color:C.muted,marginTop:SP.sm,lineHeight:1.5}}>Your activity level ({ACT_LEVELS.find(l=>l.id===(profile.activityLevel||"sedentary"))?.label||"?"}) already assumes ~{(STEP_BASELINE[profile.activityLevel||"sedentary"]||6500).toLocaleString()} steps a day. Logging actual steps moves today's target up or down from there.</div>
 
-      {/* Tags */}
-      <div style={{marginBottom:12}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Tag today</div><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{DAY_TAGS.map(tag=>{const active=(dayData.tags||[]).includes(tag.id);return(<button key={tag.id} onClick={()=>toggleTag(tag.id)} style={{padding:"5px 10px",borderRadius:20,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,cursor:"pointer",fontSize:11}}>{tag.emoji} {tag.label}</button>);})}</div></div>
+        <div style={{...eyebrow(),margin:`${SP.lg}px 0 ${SP.sm}px`}}>Tag today</div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:SP.sm}}>{DAY_TAGS.map(tag=>{const active=(dayData.tags||[]).includes(tag.id);return(
+          <button key={tag.id} onClick={()=>toggleTag(tag.id)} aria-pressed={active} className="no-hit"
+            style={{padding:`${SP.sm}px ${SP.md}px`,minHeight:40,borderRadius:R.pill,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,fontSize:T.sm}}>{tag.emoji} {tag.label}</button>);})}</div>
+      </Collapse>
 
       {/* Active preps */}
       {activePreps.length>0&&<div style={{marginBottom:12}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Active Preps</div><div style={{display:"flex",flexDirection:"column",gap:6}}>{activePreps.map(prep=>{const remGrams=Math.round(prep.remainingWeightG??prep.totalWeightG??0);const remPortions=Math.max(prep.remaining||1,1);const liveSuggested=remPortions>0?Math.round(remGrams/remPortions):0;return(<div key={prep.id} style={{background:C.card,border:`1px solid ${C.dim}`,borderRadius:10,padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontSize:13,fontWeight:600,color:C.text}}>{prep.name}</div><div style={{fontSize:10,color:C.muted,marginTop:2}}>{remGrams}g left · {remPortions} portion{remPortions!==1?"s":""} · <span style={{fontFamily:"monospace",color:C.lime}}>~{liveSuggested}g each</span></div></div><button onClick={()=>setModal("mealprep")} style={{padding:"7px 13px",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>+ Eat</button></div>);})}</div></div>}
@@ -3513,7 +3927,7 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
                   <div style={{display:"flex",alignItems:"baseline",gap:8,marginBottom:4}}>
                     <span style={{fontSize:14,fontWeight:600,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{mealEmoji} {m.name}</span>
                     {isCanteen&&<span style={{fontSize:9,color:C.yellow,background:C.yellow+"15",padding:"1px 6px",borderRadius:6,flexShrink:0,fontWeight:600}}>🍴 canteen</span>}
-                    <span style={{fontSize:10,color:C.muted,fontFamily:"monospace",flexShrink:0,marginLeft:"auto"}}>{m.time}</span>
+                    <span style={{fontSize:T.sm,color:C.muted,fontFamily:"monospace",flexShrink:0,marginLeft:"auto"}}>{m.time}</span>
                   </div>
                   <div style={{display:"flex",gap:10}}><Chip val={m.kcal} label="kcal" color={C.lime}/><Chip val={m.protein} label="P" color={C.blue}/><Chip val={m.carbs} label="C" color={C.orange}/><Chip val={m.fat} label="F" color={C.purple}/></div>
                 </div>
@@ -6064,7 +6478,58 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases, gymSes
 }
 
 // ── History Tab (shows weight per day) ───────────────────────────────────────
-function HistoryTab({weights,products,profile,medications,medLog}){
+// Streak detail and badge shelf. Lives in History because this is the "how am I doing over
+// time" tab; the Today tab only carries the compact strip.
+function ProgressCard({progress}){
+  const [showAll,setShowAll]=useState(false);
+  if(!progress) return null;
+  const {streaks,stats,achievements,week}=progress;
+  const earned=achievements.filter(a=>a.earned);
+  const locked=achievements.filter(a=>!a.earned);
+  const shown=showAll?achievements:[...earned,...locked.slice(0,3)];
+  const rows=[
+    {label:"Logging streak",    cur:streaks.logging.current,     best:streaks.logging.best,     col:C.orange, unit:"days"},
+    {label:"Calorie goal",      cur:streaks.kcal.current,        best:streaks.kcal.best,        col:C.lime,   unit:"days"},
+    ...(streaks.supplements.anyConfigured?[{label:"Supplements",cur:streaks.supplements.current,best:streaks.supplements.best,col:C.blue,unit:"days"}]:[]),
+  ];
+  return(<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:R.md,padding:`${SP.md}px ${SP.lg}px`,marginBottom:SP.md}}>
+    <div style={{fontSize:T.h3,fontWeight:600,color:C.text,marginBottom:SP.md}}>Progress</div>
+    <div style={{display:"flex",flexDirection:"column",gap:SP.sm}}>
+      {rows.map(r=>(
+        <div key={r.label} style={{display:"flex",alignItems:"center",gap:SP.md}}>
+          <span style={{fontSize:T.body,color:C.text,flex:1,minWidth:0}}>{r.label}</span>
+          <span style={{fontFamily:"monospace",fontSize:T.h3,fontWeight:800,color:r.cur>0?r.col:C.muted2}}>{r.cur}</span>
+          <span style={{fontSize:T.sm,color:C.muted,width:74,textAlign:"right"}}>best {r.best}</span>
+        </div>
+      ))}
+      <div style={{display:"flex",alignItems:"center",gap:SP.md,paddingTop:SP.sm,borderTop:`1px solid ${C.border}`}}>
+        <span style={{fontSize:T.body,color:C.text,flex:1}}>Training this week</span>
+        <span style={{fontFamily:"monospace",fontSize:T.h3,fontWeight:800,color:C.purple}}>{week.trained}{week.scheduled>0?`/${week.scheduled}`:""}</span>
+        <span style={{fontSize:T.sm,color:C.muted,width:74,textAlign:"right"}}>{week.scheduled>0?"scheduled":"no plan"}</span>
+      </div>
+    </div>
+
+    <div style={{...eyebrow(),margin:`${SP.lg}px 0 ${SP.sm}px`}}>Badges · {earned.length}/{achievements.length}</div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(88px,1fr))",gap:SP.sm}}>
+      {shown.map(a=>(
+        <div key={a.id} title={a.desc}
+          style={{background:a.earned?`${C.lime}0d`:C.bg,border:`1px solid ${a.earned?C.lime+"45":C.border}`,borderRadius:R.sm,padding:`${SP.md}px ${SP.xs}px`,textAlign:"center",opacity:a.earned?1:0.45}}>
+          <div style={{fontSize:20,lineHeight:1,filter:a.earned?"none":"grayscale(1)"}} aria-hidden="true">{a.icon}</div>
+          <div style={{fontSize:T.sm,fontWeight:600,color:a.earned?C.text:C.muted,marginTop:5,lineHeight:1.25}}>{a.label}</div>
+          <div style={{fontSize:T.label,color:C.muted2,marginTop:3,lineHeight:1.3}}>{a.desc}</div>
+        </div>
+      ))}
+    </div>
+    {locked.length>3&&<button onClick={()=>setShowAll(v=>!v)} className="no-hit"
+      style={{width:"100%",marginTop:SP.md,minHeight:40,borderRadius:R.sm,background:"none",border:`1px dashed ${C.border}`,color:C.muted,fontSize:T.sm}}>
+      {showAll?"Show fewer":`Show all ${achievements.length} badges`}
+    </button>}
+    <div style={{fontSize:T.sm,color:C.muted,marginTop:SP.md,lineHeight:1.5}}>
+      Streaks are worked out from your logs, so importing a backup brings them with it. A day only breaks a streak once it is over, not the moment it starts.
+    </div>
+  </div>);
+}
+function HistoryTab({weights,products,profile,medications,medLog,progress}){
   const [dates,setDates]=useState([]);const [logs,setLogs]=useState({});const [expanded,setExpanded]=useState(null);const [loading,setLoading]=useState(true);
   const [editMeal,setEditMeal]=useState(null);const [editAct,setEditAct]=useState(null);const [addMealDate,setAddMealDate]=useState(null);const [addActDate,setAddActDate]=useState(null);
   const [newDayPicker,setNewDayPicker]=useState(false);const [newDayDate,setNewDayDate]=useState("");
@@ -6092,6 +6557,7 @@ function HistoryTab({weights,products,profile,medications,medLog}){
   const toggleTag=(date,tagId)=>{const log=logs[date];const tags=log.tags||[];updateLog(date,{...log,tags:tags.includes(tagId)?tags.filter(t=>t!==tagId):[...tags,tagId]});};
   return(<div style={{height:"100%",overflowY:"auto",padding:"0 16px 20px"}}>
     <div style={{padding:"18px 0 12px",display:"flex",justifyContent:"space-between",alignItems:"flex-end"}}><div><div style={{fontSize:26,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>History</div><div style={{fontSize:12,color:C.muted}}>{dates.length} days logged</div></div><button onClick={()=>setNewDayPicker(p=>!p)} style={{padding:"8px 14px",borderRadius:8,background:newDayPicker?`${C.lime}20`:C.card,border:`1px solid ${newDayPicker?C.lime:C.border}`,color:newDayPicker?C.lime:C.muted,fontWeight:600,cursor:"pointer",fontSize:12}}>+ Past day</button></div>
+    <ProgressCard progress={progress}/>
     {newDayPicker&&<div style={{background:C.card,border:`1px solid ${C.lime}`,borderRadius:12,padding:"12px 14px",marginBottom:12,display:"flex",gap:8,alignItems:"center"}}>
       <input type="date" value={newDayDate} onChange={e=>setNewDayDate(e.target.value)} max={TODAY()} style={{flex:1,background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:14,outline:"none"}}/>
       <button onClick={()=>createDay(newDayDate)} disabled={!newDayDate} style={{padding:"9px 14px",borderRadius:8,background:newDayDate?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,cursor:newDayDate?"pointer":"default",fontSize:13}}>Add</button>
@@ -6190,7 +6656,7 @@ function HistoryTab({weights,products,profile,medications,medLog}){
             <span style={{color:C.muted,fontSize:11}}>{isExp?"▲":"▼"}</span>
           </button>
           {isExp&&<div style={{padding:"0 14px 14px",borderTop:`1px solid ${C.border}`}}>
-            <div style={{marginTop:10,marginBottom:10}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Day type</div><div style={{display:"flex",gap:5}}>{Object.entries(DAY_TYPES).map(([key,val])=>{const active=log.dayType===key;return(<button key={key} onClick={()=>updateLog(date,{...log,dayType:key})} style={{flex:1,padding:"6px 3px",borderRadius:8,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,fontWeight:active?700:400,cursor:"pointer",fontSize:9,lineHeight:1.3,textAlign:"center"}}><div style={{fontSize:13}}>{val.icon}</div><div>{val.label}</div></button>);})}</div></div>
+            <div style={{marginTop:10,marginBottom:10}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Day type</div><div style={{display:"flex",gap:5,flexWrap:"wrap"}}>{activeDayTypes().map(val=>{const key=val.id;const active=log.dayType===key;return(<button key={key} onClick={()=>updateLog(date,{...log,dayType:key})} style={{flex:1,padding:"6px 3px",borderRadius:8,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,fontWeight:active?700:400,cursor:"pointer",fontSize:9,lineHeight:1.3,textAlign:"center"}}><div style={{fontSize:13}}>{val.icon}</div><div>{val.label}</div></button>);})}</div></div>
             {/* Steps for past days — affects the displayed target retroactively */}
             <div style={{marginBottom:10,display:"flex",alignItems:"center",gap:8,background:C.bg,borderRadius:8,padding:"8px 11px"}}>
               <span style={{fontSize:11,color:C.muted,flexShrink:0}}>👣 Steps</span>
@@ -6420,14 +6886,136 @@ function MedsSettingsCard({medications,setMedications}){
   </div>);
 }
 
-function SettingsTab({profile,setProfile,weights,setWeights,weightPhases,setWeightPhases,latestWeight,medications,setMedications}){
+// Day-type manager. Add an activity you actually do, so it can be priced instead of being
+// squeezed into "Rest" (credits nothing) or mis-logged as a run.
+function DayTypesSettingsCard({dayTypes,setDayTypes,latestWeight}){
+  const [adding,setAdding]=useState(false);
+  const [editId,setEditId]=useState(null);
+  const [form,setForm]=useState(null);
+  const w = latestWeight || 75;
+  const unused = DAY_TYPE_PRESETS.filter(p=>!dayTypes.some(d=>d.id===p.id));
+  const startEdit = d => { setForm({...d, burn:{...d.burn}}); setEditId(d.id); setAdding(false); };
+  const addPreset = p => {
+    // Distinct id per added copy so "Other" can be added more than once with different names.
+    const id = dayTypes.some(d=>d.id===p.id) ? `${p.id}_${Date.now()}` : p.id;
+    setDayTypes(list=>[...list,{...p,id,burn:{...p.burn}}]);
+    setAdding(false);
+  };
+  const save = () => {
+    if(!form?.label?.trim()) return;
+    setDayTypes(list=>list.map(d=>d.id===editId?{...form,label:form.label.trim()}:d));
+    setEditId(null); setForm(null);
+  };
+  const remove = id => {
+    const d = dayTypes.find(x=>x.id===id);
+    if(!confirm(`Remove "${d?.label}"?\n\nPast days already logged as this type keep their label and their calorie figure.`)) return;
+    setDayTypes(list=>list.filter(x=>x.id!==id));
+    if(editId===id){setEditId(null);setForm(null);}
+  };
+  const move = (id,dir) => setDayTypes(list=>{
+    const i=list.findIndex(d=>d.id===id), j=i+dir;
+    if(i<0||j<0||j>=list.length) return list;
+    const n=[...list]; [n[i],n[j]]=[n[j],n[i]]; return n;
+  });
+  const describe = d => {
+    const b=d.burn||{};
+    if(b.kind==="rest") return "No extra burn";
+    if(b.kind==="lift") return `Lifting · ~${b.min||60}min · uses your gym history`;
+    if(b.kind==="run")  return `Run · ${b.km}km`;
+    if(b.kind==="walk") return `Walk · ${b.km}km`;
+    if(b.kind==="met")  return `${b.mets} METs · ${b.min}min`;
+    if(b.kind==="fixed")return `Flat ${b.kcal} kcal`;
+    return "";
+  };
+  return(<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:R.md,padding:`${SP.md}px ${SP.lg}px`,marginBottom:SP.md}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:SP.sm}}>
+      <span style={{fontSize:T.h3,fontWeight:600,color:C.text}}>Day Types</span>
+      {!adding&&!editId&&<button onClick={()=>setAdding(true)} style={{fontSize:T.sm,color:C.lime,background:"none",border:`1px solid ${C.lime}`,borderRadius:R.sm,padding:"5px 11px",minHeight:34}}>+ Add</button>}
+    </div>
+    <div style={{fontSize:T.sm,color:C.muted,marginBottom:SP.md,lineHeight:1.5}}>What you pick on the Today tab. Each one adds its own estimated burn on top of your maintenance, scaled to your bodyweight.</div>
+
+    {!adding&&!editId&&<div style={{display:"flex",flexDirection:"column",gap:SP.sm}}>
+      {dayTypes.map((d,i)=>(
+        <div key={d.id} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,display:"flex",alignItems:"center",gap:SP.md}}>
+          <span style={{fontSize:19,flexShrink:0}}>{d.icon}</span>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:T.body,fontWeight:600,color:C.text}}>{d.label}</div>
+            <div style={{fontSize:T.sm,color:C.muted,marginTop:1}}>{describe(d)}</div>
+          </div>
+          <span style={{fontFamily:"monospace",fontSize:T.sm,color:C.orange,flexShrink:0}}>
+            {plannedDayBurn(d.id,w,null)>0?`+${plannedDayBurn(d.id,w,null)}`:"—"}
+          </span>
+          <div style={{display:"flex",gap:2,flexShrink:0}} className="hit-tight">
+            <button onClick={()=>move(d.id,-1)} disabled={i===0} aria-label={`Move ${d.label} up`} style={{background:"none",border:"none",color:i===0?C.faint:C.muted,fontSize:T.sm,padding:"6px 4px"}}>▲</button>
+            <button onClick={()=>move(d.id,1)} disabled={i===dayTypes.length-1} aria-label={`Move ${d.label} down`} style={{background:"none",border:"none",color:i===dayTypes.length-1?C.faint:C.muted,fontSize:T.sm,padding:"6px 4px"}}>▼</button>
+            <button onClick={()=>startEdit(d)} aria-label={`Edit ${d.label}`} style={{background:"none",border:`1px solid ${C.border}`,borderRadius:6,color:C.muted,fontSize:T.sm,padding:"4px 7px",marginLeft:2}}>✎</button>
+            <button onClick={()=>remove(d.id)} aria-label={`Remove ${d.label}`} style={{background:"none",border:"none",color:C.faint,fontSize:T.h3,padding:"0 4px",lineHeight:1}}>×</button>
+          </div>
+        </div>
+      ))}
+      {dayTypes.length===0&&<div style={{fontSize:T.sm,color:C.muted,fontStyle:"italic"}}>No day types left. Add at least one so the Today tab has something to select.</div>}
+    </div>}
+
+    {adding&&<div style={{background:C.bg,border:`1px solid ${C.lime}40`,borderRadius:R.sm,padding:`${SP.md}px`}}>
+      <div style={{...eyebrow(),marginBottom:SP.sm}}>Add a day type</div>
+      {unused.length===0&&<div style={{fontSize:T.sm,color:C.muted,marginBottom:SP.sm}}>Every preset is already in your list. Edit one instead, or add "Other" again for a custom activity.</div>}
+      <div style={{display:"flex",flexWrap:"wrap",gap:SP.sm}}>
+        {(unused.length?unused:DAY_TYPE_PRESETS.filter(p=>p.id==="other")).map(p=>(
+          <button key={p.id} onClick={()=>addPreset(p)} style={{display:"flex",alignItems:"center",gap:6,padding:"9px 12px",minHeight:44,borderRadius:R.sm,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontSize:T.body}}>
+            <span style={{fontSize:17}}>{p.icon}</span>{p.label}
+            <span style={{fontFamily:"monospace",fontSize:T.sm,color:C.orange}}>+{burnModelKcal(p.burn,w)}</span>
+          </button>
+        ))}
+      </div>
+      <button onClick={()=>setAdding(false)} style={{width:"100%",marginTop:SP.md,padding:"10px 0",minHeight:44,borderRadius:R.sm,background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:T.body}}>Cancel</button>
+    </div>}
+
+    {editId&&form&&<div style={{background:C.bg,border:`1px solid ${C.lime}40`,borderRadius:R.sm,padding:`${SP.md}px`}}>
+      <div style={{display:"grid",gridTemplateColumns:"64px 1fr",gap:SP.sm,alignItems:"end"}}>
+        <Field label="Icon" value={form.icon||""} onChange={v=>setForm(f=>({...f,icon:v.slice(0,2)}))}/>
+        <Field label="Name" value={form.label||""} onChange={v=>setForm(f=>({...f,label:v}))} placeholder="e.g. Football"/>
+      </div>
+      <div style={{marginTop:SP.md}}>
+        <div style={{...eyebrow(),marginBottom:SP.sm}}>How it burns</div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+          {[["rest","None"],["lift","Lifting"],["run","Run"],["walk","Walk"],["met","Activity"],["fixed","Flat kcal"]].map(([k,lbl])=>{
+            const on=(form.burn?.kind||"rest")===k;
+            return <button key={k} onClick={()=>setForm(f=>({...f,burn:{...f.burn,kind:k}}))} style={{padding:"8px 12px",minHeight:40,borderRadius:R.pill,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.card,color:on?C.lime:C.muted,fontSize:T.sm,fontWeight:on?700:400}}>{lbl}</button>;
+          })}
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:SP.md,marginTop:SP.md}}>
+        {(form.burn?.kind==="run"||form.burn?.kind==="walk")&&
+          <Field label="Distance km" value={String(form.burn.km??"")} onChange={v=>setForm(f=>({...f,burn:{...f.burn,km:parseFloat(v)||0}}))} type="number"/>}
+        {form.burn?.kind==="met"&&<>
+          <Field label="METs" value={String(form.burn.mets??"")} onChange={v=>setForm(f=>({...f,burn:{...f.burn,mets:parseFloat(v)||0}}))} type="number"/>
+          <Field label="Minutes" value={String(form.burn.min??"")} onChange={v=>setForm(f=>({...f,burn:{...f.burn,min:parseFloat(v)||0}}))} type="number"/>
+        </>}
+        {form.burn?.kind==="lift"&&
+          <Field label="Minutes" value={String(form.burn.min??"")} onChange={v=>setForm(f=>({...f,burn:{...f.burn,min:parseFloat(v)||0}}))} type="number"/>}
+        {form.burn?.kind==="fixed"&&
+          <Field label="Kcal" value={String(form.burn.kcal??"")} onChange={v=>setForm(f=>({...f,burn:{...f.burn,kcal:parseFloat(v)||0}}))} type="number"/>}
+      </div>
+      <div style={{fontSize:T.sm,color:C.muted,marginTop:SP.sm,lineHeight:1.5}}>
+        At {Math.round(w)}kg this adds <span style={{fontFamily:"monospace",color:C.orange}}>+{burnModelKcal(form.burn,w)} kcal</span> to your target.
+        {form.burn?.kind==="fixed"&&" A flat figure does not scale with bodyweight."}
+        {form.burn?.kind==="lift"&&" Replaced by your real session burn once you have gym history."}
+      </div>
+      <div style={{display:"flex",gap:SP.sm,marginTop:SP.lg}}>
+        <button onClick={()=>{setEditId(null);setForm(null);}} style={{flex:1,padding:"11px 0",minHeight:44,borderRadius:R.sm,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,fontSize:T.body}}>Cancel</button>
+        <button onClick={save} disabled={!form.label?.trim()} style={{flex:2,padding:"11px 0",minHeight:44,borderRadius:R.sm,background:form.label?.trim()?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,fontSize:T.h3}}>Save</button>
+      </div>
+    </div>}
+  </div>);
+}
+function SettingsTab({profile,setProfile,weights,setWeights,weightPhases,setWeightPhases,latestWeight,medications,setMedications,dayTypes,setDayTypes}){
   const [editProf,setEditProf]=useState(false);const [pf,setPf]=useState({...profile});
   const [exportMsg,setExportMsg]=useState("");const [editWIdx,setEditWIdx]=useState(null);const [editWVal,setEditWVal]=useState("");const [showAllW,setShowAllW]=useState(false);
   const [pendingGoal,setPendingGoal]=useState(null); // goal being transitioned to
   const AGE=calcAge(profile.birthday);
   const saveProfile=()=>{setProfile({...pf,heightCm:parseFloat(pf.heightCm)||null,apiKey:pf.apiKey||""});setEditProf(false);};
   const exportData=async()=>{
-    const keys=["fit_dates","fit_weights","fit_products","fit_mealpreps","fit_profile","fit_photos","fit_weight_phases","fit_seeded_presets","fit_gym_schedule","fit_gym_templates","fit_gym_sessions","fit_gym_settings","fit_gym_exercise_library","fit_recipes","fit_medications","fit_med_log"];
+    const keys=["fit_dates","fit_weights","fit_products","fit_mealpreps","fit_profile","fit_photos","fit_weight_phases","fit_seeded_presets","fit_gym_schedule","fit_gym_templates","fit_gym_sessions","fit_gym_settings","fit_gym_exercise_library","fit_recipes","fit_medications","fit_med_log","fit_day_types"];
     const out={};for(const k of keys){out[k]=await store.get(k,null);}
     const dates=out.fit_dates||[];for(const d of dates){out["fit_day_"+d]=await store.get("fit_day_"+d,null);}
     const blob=new Blob([JSON.stringify(out,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="fitness-data-"+TODAY()+".json";a.click();URL.revokeObjectURL(url);setExportMsg("Exported!");setTimeout(()=>setExportMsg(""),2000);
@@ -6518,6 +7106,8 @@ function SettingsTab({profile,setProfile,weights,setWeights,weightPhases,setWeig
     </div>
 
     {/* Medications / Supplements */}
+    <DayTypesSettingsCard dayTypes={dayTypes} setDayTypes={setDayTypes} latestWeight={latestWeight}/>
+
     <MedsSettingsCard medications={medications} setMedications={setMedications}/>
 
     {/* Standalone API key + test */}
@@ -6678,7 +7268,7 @@ function Nav({tab,setTab}){
             by hue alone (fails for the ~8% of men with red-green colour deficiency). */}
         <span aria-hidden="true" style={{position:"absolute",top:0,left:"50%",transform:"translateX(-50%)",width:active?26:0,height:2.5,borderRadius:"0 0 3px 3px",background:C.lime,transition:"width .2s ease"}}/>
         <NavIcon name={id}/>
-        <span style={{fontSize:10,letterSpacing:"0.01em",fontWeight:active?700:500,lineHeight:1}}>{label}</span>
+        <span style={{fontSize:T.label,letterSpacing:"0.01em",fontWeight:active?700:500,lineHeight:1}}>{label}</span>
       </button>);
     })}
   </nav>);
@@ -6787,6 +7377,13 @@ function App(){
   // per-day log object, so history reads don't depend on that object's own rollover timing.
   const [medications,setMedications_]=useState([]);
   const [medLog,setMedLog_]=useState([]);
+  // User-editable day types. Seeded lazily from DEFAULT_DAY_TYPES on first render so the
+  // energy engine has definitions to read even before the async boot load resolves.
+  const [dayTypes,setDayTypes_]=useState(()=>{ setDayTypeRegistry(DEFAULT_DAY_TYPES); return DEFAULT_DAY_TYPES; });
+  // A window of recent day logs, kept in memory purely so streaks can be computed without
+  // hitting storage on every render. 60 days is enough to show any streak worth displaying
+  // while keeping the boot read small.
+  const [recentLogs,setRecentLogs]=useState({});
   // `today` is reactive state, not a const. If we use a const, leaving the app open across
   // midnight means React renders with a NEW today value but dayData still holds yesterday's
   // meals — and the setDayData closure writes that stale payload to today's storage key,
@@ -6944,9 +7541,24 @@ function App(){
     const rRecipes=await store.get("fit_recipes",[]);
     const meds=await store.get("fit_medications",[]);
     const mLog=await store.get("fit_med_log",[]);
+    // Day types load before any target is computed below, so the first render prices the day
+    // with the user's own definitions rather than briefly showing the builtin figures.
+    const storedDayTypes=await store.get("fit_day_types",null);
+    const dTypes=(Array.isArray(storedDayTypes)&&storedDayTypes.length)?storedDayTypes:DEFAULT_DAY_TYPES;
+    setDayTypeRegistry(dTypes);
     setProducts_(sortProducts(prods));setDayData_(day);setWeights_(wts);setMealPreps_(preps);setProfile_(prof);setProgressPhotos_(photos);setWeightPhases_(Array.isArray(phases)?phases:[]);
     setGymSchedule_(Array.isArray(gSchedule)?gSchedule:[]);setGymTemplates_(gTemplates||{});setGymSessions_(Array.isArray(gSessions)?gSessions:[]);setGymSettings_(gSettings||{trainingMethod:"maintain",customNote:""});setGymActiveSession_(normalizeGymSession(gActive));setGymExerciseLibrary_(gLibrary);setRecipes_(Array.isArray(rRecipes)?rRecipes:[]);
-    setMedications_(Array.isArray(meds)?meds:[]);setMedLog_(Array.isArray(mLog)?mLog:[]);
+    setMedications_(Array.isArray(meds)?meds:[]);setMedLog_(Array.isArray(mLog)?mLog:[]);setDayTypes_(dTypes);
+    // Recent history for streaks. Read after the main state is set so the first paint is not
+    // delayed by it — streaks appearing a moment later is fine, a slower cold start is not.
+    (async()=>{
+      const idx = await store.get("fit_dates", []);
+      const recent = (Array.isArray(idx)?idx:[]).slice(0, 60);
+      const out = {};
+      for (const d of recent) { const l = await store.get(`fit_day_${d}`, null); if (l) out[d] = l; }
+      out[bootDate] = day;
+      setRecentLogs(out);
+    })();
     setToday(bootDate); // Make sure state matches what we just loaded
     lastLoadedDate.current = bootDate;
     setReady(true);
@@ -6986,6 +7598,9 @@ function App(){
   const setRecipes=useCallback(upd=>{setRecipes_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_recipes",n);return n;});},[]);
   const setMedications=useCallback(upd=>{setMedications_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_medications",n);return n;});},[]);
   const setMedLog=useCallback(upd=>{setMedLog_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_med_log",n);return n;});},[]);
+  // The registry is updated inside the same setter as the state, so the pure energy helpers
+  // and the rendered tree can never disagree about which day types exist.
+  const setDayTypes=useCallback(upd=>{setDayTypes_(p=>{const n=typeof upd==="function"?upd(p):upd;setDayTypeRegistry(n);store.set("fit_day_types",n);return n;});},[]);
   // Mark a due medication occurrence taken or skipped: appends the log entry and, on "taken"
   // with a tracked pack size, decrements remaining stock by the dose just taken.
   const markMedOccurrence = useCallback((med, status) => {
@@ -7004,6 +7619,12 @@ function App(){
     addToIndex(med.dueDate);
   }, [setMedLog, setMedications]);
   const latestWeight=weights[0]?.weight;
+  // Today's log lives in `dayData`; mirroring it into the streak window means logging a meal
+  // updates the streak immediately instead of only after a reload.
+  useEffect(()=>{ if(dayData) setRecentLogs(p=>p[today]===dayData?p:{...p,[today]:dayData}); },[dayData,today]);
+  const progress = useMemo(()=>computeProgress({
+    logs:recentLogs, today, profile, weights, gymSessions, medications, medLog, gymSchedule,
+  }),[recentLogs,today,profile,weights,gymSessions,medications,medLog,gymSchedule]);
   // Auto-revert temporary goal when its revert date arrives
   useEffect(()=>{
     if(!profile?.temporaryGoal)return;
@@ -7040,11 +7661,11 @@ function App(){
       <button onClick={()=>setRolloverBanner(null)} style={{background:"none",border:"none",color:C.lime,fontSize:18,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button>
     </div>}
     <div style={{flex:1,overflow:"hidden"}}>
-      {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence} gymSessions={gymSessions}/>}
+      {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence} progress={progress} gymSessions={gymSessions}/>}
       {viewTab==="activity"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary}/>}
       {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes} onLogMeal={meal=>setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}))} gymSessions={gymSessions}/>}
-      {viewTab==="history"&&<HistoryTab weights={weights} products={products} profile={profile} medications={medications} medLog={medLog}/>}
-      {viewTab==="settings"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight} medications={medications} setMedications={setMedications}/>}
+      {viewTab==="history"&&<HistoryTab weights={weights} products={products} profile={profile} medications={medications} medLog={medLog} progress={progress}/>}
+      {viewTab==="settings"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight} medications={medications} setMedications={setMedications} dayTypes={dayTypes} setDayTypes={setDayTypes}/>}
     </div>
     {/* The tab bar is hidden while a gym session is live so "gym mode" is genuinely modal:
         no stray tap can reveal weight or food data to someone standing behind you, and no

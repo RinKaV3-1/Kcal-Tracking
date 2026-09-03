@@ -764,8 +764,53 @@ const WEEKDAYS = [
   {id:6,label:"Sat",full:"Saturday"},
 ];
 // Display/sort order for weekdays, Monday-first (WEEKDAYS itself stays indexed 0=Sun..6=Sat
-// to match Date.getDay(), which is what gymSchedule/gymTemplates are keyed by).
+// to match Date.getDay(), which is what gymSchedule is keyed by).
 const WEEKDAY_ORDER = [1,2,3,4,5,6,0];
+
+// ── Gym plan days ─────────────────────────────────────────────────────────────
+// Plans are numbered TRAINING DAYS ("Day 1", "Day 2"...), not weekdays, and a separate
+// assignment map says which weekday each one runs on.
+//
+// They used to be keyed by weekday directly, which meant the plan and the calendar slot were
+// the same object: moving your Thursday session to Friday did not move the plan with it, it
+// just left you facing an empty Friday and a Thursday plan you could not reach — every
+// exercise had to be re-entered by hand. Splitting the two means re-assigning a day is a
+// one-tap change and the plan itself is untouched.
+const gymDayIds = templates => Object.keys(templates||{})
+  .filter(k => /^d\d+$/.test(k))
+  .sort((a,b) => Number(a.slice(1)) - Number(b.slice(1)));
+const gymDayLabel = (templates, id) => (templates?.[id]?.name) || (id ? `Day ${String(id).slice(1)}` : "Day");
+const nextGymDayId = templates => {
+  const used = gymDayIds(templates).map(id => Number(id.slice(1)));
+  return `d${(used.length ? Math.max(...used) : 0) + 1}`;
+};
+// One-time upgrade of the old weekday-keyed shape. Templates stored under a bare weekday number
+// become Day 1..N in weekday order (Monday first), and the assignment map preserves exactly
+// which weekday each plan was on, so nothing moves for the user on the upgrade itself.
+function migrateGymPlans(templates, schedule) {
+  const t = templates || {};
+  const legacyKeys = Object.keys(t).filter(k => /^[0-6]$/.test(k));
+  if (!legacyKeys.length) return null; // already migrated (or empty) — nothing to do
+  const ordered = legacyKeys.slice().sort((a,b) => WEEKDAY_ORDER.indexOf(Number(a)) - WEEKDAY_ORDER.indexOf(Number(b)));
+  const nextTemplates = {};
+  const assign = {};
+  ordered.forEach((wd, i) => {
+    const id = `d${i+1}`;
+    nextTemplates[id] = {...t[wd], name: t[wd]?.name || `Day ${i+1}`};
+    assign[wd] = id;
+  });
+  // Keep any already-migrated day plans that were sitting alongside the legacy ones.
+  for (const k of gymDayIds(t)) if (!nextTemplates[k]) nextTemplates[k] = t[k];
+  // A weekday marked as a training day but with no template still deserves a plan slot.
+  for (const wd of (schedule||[])) {
+    if (assign[wd] == null) {
+      const id = nextGymDayId(nextTemplates);
+      nextTemplates[id] = {name:`Day ${id.slice(1)}`, warmup:null, cooldown:null, combos:[]};
+      assign[wd] = id;
+    }
+  }
+  return {templates: nextTemplates, assign};
+}
 // Cardio machine types for warmup — each has type-appropriate fields. "other" falls back to free text.
 const CARDIO_MACHINES = [
   {id:"treadmill",label:"Treadmill",emoji:"🏃",fields:["speed","incline","distanceKm"]},
@@ -1137,6 +1182,96 @@ function BodyMap({primary, secondary=[], size=132, showLegend=true}){
         <span aria-hidden="true" style={{width:10,height:10,borderRadius:3,background:C.lime,opacity:0.34,flexShrink:0}}/>{secondary.join(", ")}
       </span>}
     </div>}
+  </div>);
+}
+
+// ── Equipment icons ───────────────────────────────────────────────────────────
+// The catalog names 207 distinct pieces of equipment ("D-handle or rope", "45-degree or
+// horizontal leg press", "Bumper plates"...). Drawing 207 icons would be absurd and unreadable
+// at tile size, so they collapse into 12 classes that are actually distinguishable at a glance
+// — which is the whole point of picking an exercise by picture instead of by reading a name.
+//
+// Order matters: the first class that matches any of an exercise's equipment strings wins, so
+// the more specific/distinctive apparatus is checked before the generic "bench"/"floor" props
+// that accompany almost everything.
+const EQUIPMENT_CLASSES = [
+  {id:"cardio",   label:"Cardio machine", match:/treadmill|bike|ergomet|elliptical|stair|arc trainer|jump rope|rower/i},
+  {id:"cable",    label:"Cable",          match:/cable|d-handle|pulldown|rope|v-bar|lat pull/i},
+  {id:"machine",  label:"Machine",        match:/machine|smith|pec deck|leg press|hack squat|pendulum|glute-ham|roman chair|captain's chair|reverse hyper/i},
+  // NOT a bare /\bbar\b/ — that swallowed "Pull-up bar", classifying pull-ups as a barbell
+  // movement. Only the actual bar types, plus a standalone "Bar" entry, count.
+  {id:"barbell",  label:"Barbell",        match:/barbell|ez-bar|trap bar|straight bar|safety squat|power rack|bumper|landmine|\bplates?\b|^bar$/i},
+  {id:"dumbbell", label:"Dumbbell",       match:/dumbbell/i},
+  {id:"kettlebell",label:"Kettlebell",    match:/kettlebell/i},
+  {id:"band",     label:"Band",           match:/band|cord/i},
+  {id:"rings",    label:"Rings / straps", match:/rings|suspension|trx|straps/i},
+  {id:"ball",     label:"Ball",           match:/ball/i},
+  {id:"sled",     label:"Sled / carry",   match:/sled|prowler|sandbag|battle rope|farmer|wheel/i},
+  {id:"bodyweight",label:"Bodyweight",    match:/bodyweight|floor|mat|pull-up bar|parallel bars|wall|box|step|platform|bench|pad/i},
+];
+const EQUIPMENT_FALLBACK = {id:"other", label:"Other"};
+function equipmentClassFor(guide){
+  const list = (guide?.equipment||[]);
+  if (!list.length) return EQUIPMENT_FALLBACK;
+  for (const cls of EQUIPMENT_CLASSES) {
+    if (list.some(e => cls.match.test(e))) return cls;
+  }
+  return EQUIPMENT_FALLBACK;
+}
+// Stroke-only glyphs on a 24px grid, matching the nav icon family, so they read at tile size
+// and tint with currentColor.
+function EquipmentIcon({cls, size=22, color=C.muted}){
+  const p = {fill:"none", stroke:"currentColor", strokeWidth:1.9, strokeLinecap:"round", strokeLinejoin:"round"};
+  const art = {
+    barbell:   <><path d="M3 12h18" {...p}/><path d="M6 8v8M8.5 6.5v11M15.5 6.5v11M18 8v8" {...p}/></>,
+    dumbbell:  <><path d="M7 12h10" {...p}/><path d="M5 8.5v7M7.5 7v10M16.5 7v10M19 8.5v7" {...p}/></>,
+    kettlebell:<><path d="M9 7a3 3 0 0 1 6 0" {...p}/><path d="M8.5 8.5C6 10 5 12.5 5.5 15.5A2.5 2.5 0 0 0 8 18h8a2.5 2.5 0 0 0 2.5-2.5c.5-3-.5-5.5-3-7Z" {...p}/></>,
+    cable:     <><path d="M5 3v18" {...p}/><path d="M5 6h8a3 3 0 0 1 3 3v4" {...p}/><circle cx="16" cy="15.5" r="2" {...p}/><path d="M14 19h4" {...p}/></>,
+    machine:   <><rect x="4" y="3" width="16" height="18" rx="2" {...p}/><path d="M8 7h8M8 11h8M8 15h8" {...p}/></>,
+    band:      <><path d="M4 15c3-6 5 6 8 0s5-6 8 0" {...p}/><circle cx="4" cy="15" r="1.4" {...p}/><circle cx="20" cy="15" r="1.4" {...p}/></>,
+    rings:     <><path d="M8 3v6M16 3v6" {...p}/><circle cx="8" cy="14" r="4.2" {...p}/><circle cx="16" cy="14" r="4.2" {...p}/></>,
+    ball:      <><circle cx="12" cy="12" r="8.2" {...p}/><path d="M4 12h16M12 4c3 4 3 12 0 16M12 4c-3 4-3 12 0 16" {...p}/></>,
+    sled:      <><path d="M4 17h13a3 3 0 0 0 3-3V8" {...p}/><path d="M4 17l3-4h8" {...p}/><path d="M4 20h16" {...p}/></>,
+    bodyweight:<><circle cx="12" cy="5" r="2.2" {...p}/><path d="M12 8v6M12 14l-3 6M12 14l3 6M7 10l5 1 5-1" {...p}/></>,
+    cardio:    <><circle cx="14" cy="4.5" r="2" {...p}/><path d="M13 7l-3 4 3 3 1 6" {...p}/><path d="M10 11l-4 1M13 10l4 2" {...p}/></>,
+    other:     <><circle cx="12" cy="12" r="8.2" {...p}/><path d="M12 8v4l3 2" {...p}/></>,
+  }[cls?.id||"other"];
+  return <svg width={size} height={size} viewBox="0 0 24 24" role="img" aria-label={cls?.label||"Equipment"} style={{display:"block",flexShrink:0,color}}>{art}</svg>;
+}
+// A pick-by-picture tile: body silhouette with the worked muscle marked, the equipment glyph
+// badged on it, and the name UNDER the picture. Replaces the plain text rows the pickers used,
+// where every option looked identical and had to be read word by word.
+function ExerciseTile({name, muscleGroup, onPick, onGuide}){
+  const guide = guideFor(name);
+  const mg = guide?.muscleGroup || muscleGroup;
+  const cls = equipmentClassFor(guide);
+  return(<div style={{position:"relative"}}>
+    <button onClick={onPick} title={name}
+      style={{width:"100%",background:C.card,border:`1px solid ${C.border}`,borderRadius:R.md,padding:`${SP.sm}px ${SP.xs}px`,
+        display:"flex",flexDirection:"column",alignItems:"center",gap:4,textAlign:"center"}}>
+      <span style={{position:"relative",display:"block",lineHeight:0}}>
+        <MuscleIcon muscleGroup={mg} size={34}/>
+        {/* Equipment badge sits on the figure so both signals — what it trains, what you need —
+            land in one glance without reading. */}
+        <span style={{position:"absolute",right:-8,bottom:-2,background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.pill,padding:2,display:"flex"}}>
+          <EquipmentIcon cls={cls} size={15} color={C.lime}/>
+        </span>
+      </span>
+      <span style={{fontSize:T.label,color:C.text,lineHeight:1.25,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden",wordBreak:"break-word",marginTop:2}}>{name}</span>
+      <span style={{fontSize:9.5,color:C.muted2,lineHeight:1}}>{cls.label}</span>
+    </button>
+    {onGuide&&guide&&<button onClick={e=>{e.stopPropagation();onGuide(name);}} aria-label={`How to do ${name}`} className="no-hit"
+      style={{position:"absolute",top:2,right:2,width:22,height:22,borderRadius:"50%",background:C.bg,border:`1px solid ${C.blue}55`,color:C.blue,fontSize:T.label,fontWeight:700,lineHeight:1,display:"flex",alignItems:"center",justifyContent:"center"}}>?</button>}
+  </div>);
+}
+// Grid wrapper — three across on a phone, so a screenful shows ~12 options as pictures.
+function ExerciseTileGrid({items, onPick, onGuide, empty="No matches."}){
+  if(!items.length) return <div style={{fontSize:T.sm,color:C.muted,padding:`${SP.sm}px 0`}}>{empty}</div>;
+  return(<div className="hit-tight" style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(84px,1fr))",gap:SP.sm}}>
+    {items.map(it=>(
+      <ExerciseTile key={it.id||it.name} name={it.name} muscleGroup={it.muscleGroup}
+        onPick={()=>onPick(it)} onGuide={onGuide}/>
+    ))}
   </div>);
 }
 
@@ -2663,38 +2798,145 @@ function TimerRing({remaining,total,label,size=120,accent=C.blue}){
 // structure to follow: you cannot say WHAT you held for 30 seconds, and a warmup had no timer
 // at all. These are named items, each with its own countdown, so the step doubles as a
 // checklist you work through and as a record of what you actually did.
-const WARMUP_PRESETS = [
-  {name:"Treadmill walk",          sec:300},
-  {name:"Bike easy spin",          sec:300},
-  {name:"Rower easy",              sec:240},
-  {name:"Arm circles",             sec:45},
-  {name:"Band pull-aparts",        sec:60},
-  {name:"Shoulder dislocates",     sec:45},
-  {name:"Leg swings",              sec:45},
-  {name:"Hip openers",             sec:60},
-  {name:"Bodyweight squats",       sec:60},
-  {name:"Cat-cow",                 sec:45},
-  {name:"World's greatest stretch",sec:60},
-  {name:"Empty-bar sets",          sec:120},
+// Routines are matched to what the session actually trains, rather than being one fixed list
+// for every day. A push day should not open with leg swings, and a leg day should not close on
+// a doorway chest stretch. Each movement declares the body regions it prepares or releases;
+// `general` items are the ones worth doing on any day (raise the heart rate / wind down).
+//
+// The regions are deliberately coarse. The muscle taxonomy has 22 entries, but nobody warms up
+// "rear delts" separately from "front delts" — mapping to 9 practical regions keeps the picked
+// routine short enough to actually do.
+const ROUTINE_REGION_OF = {
+  "Chest":"chest", "Upper Chest":"chest",
+  "Lats":"back", "Upper Back":"back", "Traps":"back", "Lower Traps":"back", "Lower Back":"back",
+  "Front Delts":"shoulders", "Side Delts":"shoulders", "Rear Delts":"shoulders",
+  "Rotator Cuff":"shoulders", "Shoulders":"shoulders",
+  "Biceps":"arms", "Triceps":"arms", "Forearms":"arms",
+  "Quads":"quads", "Hip Flexors":"quads",
+  "Hamstrings":"hamstrings",
+  "Glutes":"glutes", "Adductors":"glutes",
+  "Calves":"calves",
+  "Abs":"core", "Obliques":"core",
+  "Full Body":"general", "Cardio":"general",
+};
+const WARMUP_LIBRARY = [
+  {name:"Treadmill walk",           sec:300, general:true},
+  {name:"Bike easy spin",           sec:300, general:true},
+  {name:"Rower easy",               sec:240, general:true},
+  {name:"World's greatest stretch", sec:60,  general:true},
+  {name:"Cat-cow",                  sec:45,  general:true},
+  {name:"Arm circles",              sec:45,  regions:["shoulders","chest"]},
+  {name:"Shoulder dislocates",      sec:45,  regions:["shoulders"]},
+  {name:"Band pull-aparts",         sec:60,  regions:["shoulders","back"]},
+  {name:"Push-up to down dog",      sec:45,  regions:["chest","shoulders"]},
+  {name:"Scapular pull-ups",        sec:45,  regions:["back"]},
+  {name:"Bird dog",                 sec:45,  regions:["back","core"]},
+  {name:"Dead bug",                 sec:45,  regions:["core"]},
+  {name:"Wrist circles",            sec:30,  regions:["arms"]},
+  {name:"Light band curls",         sec:45,  regions:["arms"]},
+  {name:"Leg swings",               sec:45,  regions:["quads","hamstrings","glutes"]},
+  {name:"Hip openers",              sec:60,  regions:["glutes","quads"]},
+  {name:"Bodyweight squats",        sec:60,  regions:["quads","glutes"]},
+  {name:"Glute bridges",            sec:45,  regions:["glutes","hamstrings"]},
+  {name:"Walking lunges",           sec:60,  regions:["quads","glutes"]},
+  {name:"Ankle rocks",              sec:45,  regions:["calves"]},
+  {name:"Empty-bar sets",           sec:120, general:true},
 ];
-const COOLDOWN_PRESETS = [
-  {name:"Easy walk",               sec:300},
-  {name:"Hamstring stretch",       sec:30},
-  {name:"Quad stretch",            sec:30},
-  {name:"Hip flexor stretch",      sec:30},
-  {name:"Chest doorway stretch",   sec:30},
-  {name:"Lat stretch",             sec:30},
-  {name:"Child's pose",            sec:60},
-  {name:"Pigeon pose",             sec:60},
-  {name:"Calf stretch",            sec:30},
-  {name:"Deep breathing",          sec:60},
+const COOLDOWN_LIBRARY = [
+  {name:"Easy walk",                sec:300, general:true},
+  {name:"Deep breathing",           sec:60,  general:true},
+  {name:"Chest doorway stretch",    sec:30,  regions:["chest"]},
+  {name:"Cross-body shoulder stretch", sec:30, regions:["shoulders"]},
+  {name:"Thread the needle",        sec:30,  regions:["shoulders","back"]},
+  {name:"Lat stretch",              sec:30,  regions:["back"]},
+  {name:"Child's pose",             sec:60,  regions:["back","core"]},
+  {name:"Triceps overhead stretch", sec:30,  regions:["arms"]},
+  {name:"Wrist flexor stretch",     sec:30,  regions:["arms"]},
+  {name:"Quad stretch",             sec:30,  regions:["quads"]},
+  {name:"Hip flexor stretch",       sec:30,  regions:["quads","glutes"]},
+  {name:"Hamstring stretch",        sec:30,  regions:["hamstrings"]},
+  {name:"Pigeon pose",              sec:60,  regions:["glutes"]},
+  {name:"Figure-four stretch",      sec:30,  regions:["glutes"]},
+  {name:"Calf stretch",             sec:30,  regions:["calves"]},
+  {name:"Cobra stretch",            sec:30,  regions:["core"]},
+  {name:"Seated twist",             sec:30,  regions:["core"]},
 ];
+// Which body regions a set of combos actually trains. Derived from the exercises themselves
+// (primary + secondary muscles, via the bundled catalog, falling back to the user's library
+// row) rather than from a stored "push/pull/legs" label — that way a hand-built plan, or one
+// where exercises were swapped mid-session, still gets a routine that matches reality.
+// Returns a Map of region -> weight. A PRIMARY mover counts double a secondary one: a Romanian
+// deadlift genuinely loads the lower back, but on a leg day the quad and hamstring work is what
+// the routine should be built around. Weighting (rather than a flat set) is what stops one
+// exercise's incidental secondary muscles from crowding out the day's actual focus.
+// Map is used deliberately — it still answers .has(region), so callers read the same way.
+function sessionRegions(combos, exerciseLibrary){
+  const regions = new Map();
+  const add = (mg, weight) => {
+    const r = ROUTINE_REGION_OF[mg];
+    if (!r || r === "general") return;
+    regions.set(r, (regions.get(r)||0) + weight);
+  };
+  for (const c of (combos||[])) {
+    for (const ex of (c.exercises||[])) {
+      const g = guideFor(ex.name);
+      if (g) {
+        add(g.muscleGroup, 2);
+        for (const s of (g.secondary||[])) add(s, 1);
+      } else {
+        const mg = (exerciseLibrary||[]).find(e=>normExName(e.name)===normExName(ex.name))?.muscleGroup;
+        if (mg) add(mg, 2);
+      }
+    }
+  }
+  return regions;
+}
+// Build the suggested routine for a session: one general opener/closer plus the movements that
+// best match what is being trained, capped so it stays a routine and not a syllabus.
+function buildRoutineItems(kind, regions, {max=6, generals=1} = {}){
+  const lib = kind === "warmup" ? WARMUP_LIBRARY : COOLDOWN_LIBRARY;
+  const weightOf = r => (typeof regions?.get === "function" ? (regions.get(r)||0) : (regions?.has?.(r) ? 1 : 0));
+  const picked = [];
+  for (const item of lib) {
+    if (item.general && picked.filter(p=>p.general).length < generals) picked.push(item);
+  }
+  // Rank by how much of the day's actual emphasis each movement covers, so the leg-day cooldown
+  // leads with quad/hamstring work rather than whatever happened to be first in the library.
+  const scored = lib
+    .filter(item => !item.general && item.regions)
+    .map(item => ({item, score: item.regions.reduce((n,r)=>n+weightOf(r), 0)}))
+    .filter(x => x.score > 0)
+    .sort((a,b) => b.score - a.score);
+  for (const {item} of scored) {
+    if (picked.length >= max) break;
+    picked.push(item);
+  }
+  // Nothing matched (empty plan, or only cardio) — fall back to the general set so the step is
+  // never an empty screen, which is what "the default timers are gone" was describing.
+  if (picked.length < 2) {
+    for (const item of lib) {
+      if (picked.length >= 3) break;
+      if (item.general && !picked.includes(item)) picked.push(item);
+    }
+  }
+  return picked.slice(0, max).map((p,i) => ({id:Date.now()+i+Math.random(), name:p.name, targetSec:p.sec, done:false}));
+}
+// The preset chips offered inside the routine editor, ordered so the movements relevant to
+// this session come first and the rest stay reachable below them.
+function routinePresetsFor(kind, regions){
+  const lib = kind === "warmup" ? WARMUP_LIBRARY : COOLDOWN_LIBRARY;
+  const weightOf = r => (typeof regions?.get === "function" ? (regions.get(r)||0) : (regions?.has?.(r) ? 1 : 0));
+  const score = i => i.general ? 0.5 : (i.regions||[]).reduce((n,r)=>n+weightOf(r), 0);
+  const relevant = lib.filter(i => score(i) > 0).sort((a,b) => score(b) - score(a));
+  const rest = lib.filter(i => score(i) === 0);
+  return [...relevant, ...rest];
+}
 const fmtDur = s => s>=60 ? `${Math.floor(s/60)}m${s%60?` ${s%60}s`:""}` : `${s}s`;
 
 // A named, individually-timed checklist. One running item at a time (you cannot hold two
 // stretches at once), auto-marked done when its countdown reaches zero, and every item is
 // editable/removable so a routine can be adjusted mid-session.
-function TimedRoutineList({items, setItems, accent, presets, addPlaceholder="Custom item name…"}){
+function TimedRoutineList({items, setItems, accent, presets, addPlaceholder="Custom item name…", onSuggest}){
   const list = items || [];
   const [running, setRunning] = useState(null);   // {id, endsAt}
   const [now, setNow] = useState(Date.now());
@@ -2734,6 +2976,10 @@ function TimedRoutineList({items, setItems, accent, presets, addPlaceholder="Cus
     {list.length===0&&<div style={{fontSize:T.sm,color:C.muted,fontStyle:"italic",marginBottom:SP.sm}}>
       Nothing added yet — pick from the suggestions or add your own.
     </div>}
+    {onSuggest&&<button onClick={onSuggest} className="hit-tight"
+      style={{width:"100%",marginBottom:SP.sm,padding:"8px 0",borderRadius:R.sm,background:`${accent}12`,border:`1px solid ${accent}55`,color:accent,fontSize:T.sm,fontWeight:600}}>
+      ↻ {list.length ? "Reset to suggested for this session" : "Use the suggested routine for this session"}
+    </button>}
     <div style={{display:"flex",flexDirection:"column",gap:SP.sm,marginBottom:list.length?SP.md:0}}>
       {list.map(it=>{
         const isRunning = running?.id===it.id;
@@ -2841,9 +3087,17 @@ function ProductFilterBar({products, q, setQ, cat, setCat, sort, setSort, placeh
   // Only offer categories that at least one product actually uses — a filter that always
   // returns nothing is worse than no filter.
   const cats = PRODUCT_CATEGORIES.filter(c=>(products||[]).some(p=>(p.categories||[]).includes(c.id)));
+  // A clear button rather than making the user hold backspace through a long product name.
+  // It sits inside the field (the standard place people look for it) and only exists when
+  // there is something to clear, so it never occupies space for no reason.
   return(<div>
-    <input value={q} onChange={e=>setQ(e.target.value)} placeholder={placeholder} autoFocus={autoFocus}
-      style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.sm,padding:"8px 11px",color:C.text,outline:"none",marginBottom:SP.sm}}/>
+    <div style={{position:"relative",marginBottom:SP.sm}}>
+      <input value={q} onChange={e=>setQ(e.target.value)} placeholder={placeholder} autoFocus={autoFocus}
+        style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.sm,padding:"8px 11px",paddingRight:q?40:11,color:C.text,outline:"none"}}/>
+      {q&&<button type="button" onClick={()=>setQ("")} aria-label="Clear search" className="no-hit"
+        style={{position:"absolute",right:4,top:"50%",transform:"translateY(-50%)",width:32,height:32,borderRadius:"50%",
+          background:"none",border:"none",color:C.muted,fontSize:17,lineHeight:1,display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>}
+    </div>
     <div className="hit-tight" style={{display:"flex",flexWrap:"wrap",gap:SP.xs,marginBottom:SP.sm,alignItems:"center"}}>
       <button type="button" onClick={()=>setCat(null)}
         style={{padding:"4px 10px",borderRadius:R.pill,border:`1px solid ${!cat?C.lime:C.border}`,background:!cat?`${C.lime}18`:C.bg,color:!cat?C.lime:C.muted,fontSize:T.label}}>All</button>
@@ -2955,8 +3209,24 @@ function Sheet({onClose,title,children}){
     window.addEventListener("keydown",onKey);
     return()=>window.removeEventListener("keydown",onKey);
   },[onClose]);
+  // position:FIXED, not absolute.
+  //
+  // `absolute; inset:0` resolves against the nearest positioned ancestor (.app-shell), which
+  // looks right — but the element is still a DESCENDANT of whatever scroll container it was
+  // rendered from, so that container's scroll offset translates it and its overflow clips it.
+  // Opening the exercise guide from a gym session scrolled 2589px down therefore dragged the
+  // whole sheet — the sticky header and its × with it — up out of the visible area. That is the
+  // "exit button is hiding and hard to press" report, and it would hit any sheet opened from
+  // deep inside a scrolled list.
+  //
+  // Fixed positioning is immune to ancestor scrolling. The shell's own geometry is mirrored
+  // here (centred, max-width, and the live --app-top/--app-height the visualViewport effect
+  // maintains) so the sheet still fills exactly the app column and not the whole browser window
+  // on a wide screen.
   return(<div role="dialog" aria-modal="true" aria-label={title}
-    style={{position:"absolute",inset:0,background:"rgba(0,0,0,0.72)",backdropFilter:"blur(3px)",WebkitBackdropFilter:"blur(3px)",zIndex:60,display:"flex",flexDirection:"column",justifyContent:"flex-end",animation:"fadeIn .18s ease"}}
+    style={{position:"fixed",top:"var(--app-top, 0px)",left:0,right:0,margin:"0 auto",maxWidth:520,
+      height:"var(--app-height, 100dvh)",
+      background:"rgba(0,0,0,0.72)",backdropFilter:"blur(3px)",WebkitBackdropFilter:"blur(3px)",zIndex:60,display:"flex",flexDirection:"column",justifyContent:"flex-end",animation:"fadeIn .18s ease"}}
     onClick={e=>e.target===e.currentTarget&&onClose()}>
     <div data-scroll style={{background:C.surf,borderRadius:"20px 20px 0 0",border:`1px solid ${C.border}`,borderBottom:"none",maxHeight:"92%",overflow:"auto",padding:`10px 18px calc(30px + ${SAFE_BOTTOM})`,animation:"sheetIn .26s cubic-bezier(.32,.72,0,1)",boxShadow:"0 -8px 40px rgba(0,0,0,.55)"}}>
       {/* Grab handle — the standard affordance telling users this panel is dismissible. */}
@@ -4543,18 +4813,31 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
   useEffect(()=>{const id=setInterval(()=>setMedTick(t=>t+1),60000);return()=>clearInterval(id);},[]);
   const dueMeds=dueMedReminders(medications,medLog);
   const [showXp,setShowXp]=useState(false);
-  // Level-up celebration. Duolingo's most-copied trick is that crossing a threshold is never
-  // silent — the moment is the reward. The last level seen is remembered per device so the
-  // banner fires once, on the render where the level actually changed, and not again on reload.
+  // Level-up celebration — only for a level gained WHILE USING the app, never on launch.
+  //
+  // The first version compared against a level remembered in storage, and fired on every single
+  // launch. The reason is that history loads progressively: the first computed level is based on
+  // whatever days have arrived so far, so it starts low and climbs to the true value a moment
+  // later. That climb looked exactly like a level-up, and the stored "last seen" value got
+  // overwritten with the intermediate number each time, so it re-fired forever.
+  //
+  // The fix is to establish a baseline only once the value has stopped moving, and to celebrate
+  // solely increases after that. Nothing is persisted: a level earned in a previous session was
+  // already celebrated then, and re-announcing it on reopen is exactly the behaviour being fixed.
   const [levelUp,setLevelUp]=useState(null);
+  const levelBaseline=useRef(null);
   const curLevel=progress?.xp?.level;
   useEffect(()=>{
     if(!curLevel) return;
-    let seen=null;
-    try{ seen=parseInt(localStorage.getItem("fit_seen_level")||"",10); }catch{}
-    if(!Number.isFinite(seen)){ try{ localStorage.setItem("fit_seen_level",String(curLevel)); }catch{} return; }
-    if(curLevel>seen){ setLevelUp({from:seen,to:curLevel}); }
-    if(curLevel!==seen){ try{ localStorage.setItem("fit_seen_level",String(curLevel)); }catch{} }
+    if(levelBaseline.current!==null){
+      if(curLevel>levelBaseline.current){ setLevelUp({from:levelBaseline.current,to:curLevel}); levelBaseline.current=curLevel; }
+      else if(curLevel<levelBaseline.current){ levelBaseline.current=curLevel; } // edited a day downward
+      return;
+    }
+    // Baseline not set yet: wait for the level to hold still before trusting it. Each new value
+    // during boot restarts this timer, so the baseline lands on the settled figure.
+    const t=setTimeout(()=>{ if(levelBaseline.current===null) levelBaseline.current=curLevel; }, 2500);
+    return ()=>clearTimeout(t);
   },[curLevel]);
   const [expandedMealId,setExpandedMealId]=useState(null);
   const [editingMealId,setEditingMealId]=useState(null);
@@ -4804,11 +5087,12 @@ function LevelUpToast({info, xp, onClose}){
 
 // ── Activity Tab ──────────────────────────────────────────────────────────────
 // ── Gym Template Editor ────────────────────────────────────────────────────────
-// Edits the exercise plan for one weekday: an optional warmup default + an ordered list of
-// combos (supersets — exercises done back-to-back). Templates are a starting point only —
-// fully editable live during a session too, so nothing here is locked in.
-function GymTemplateEditor({weekday, template, setTemplate, gymExerciseLibrary, setGymExerciseLibrary, onClose}){
+// Edits ONE numbered training day (not a weekday): a nameable plan with an optional warmup
+// default + an ordered list of combos (supersets — exercises done back-to-back). Plans are a
+// starting point only — fully editable live during a session too, so nothing here is locked in.
+function GymTemplateEditor({dayId, template, assignedWeekdays=[], setTemplate, gymExerciseLibrary, setGymExerciseLibrary, onClose}){
   const t = template || {warmup:null, cooldown:null, combos:[]};
+  const [dayName, setDayName] = useState(t.name || `Day ${String(dayId||"d1").slice(1)}`);
   const [warmupOn, setWarmupOn] = useState(!!t.warmup);
   const [warmupType, setWarmupType] = useState(t.warmup?.type||"treadmill");
   const [warmupFields, setWarmupFields] = useState(t.warmup?.fields||{});
@@ -4886,6 +5170,7 @@ function GymTemplateEditor({weekday, template, setTemplate, gymExerciseLibrary, 
 
   const save = () => {
     setTemplate({
+      name: dayName.trim() || `Day ${String(dayId||"d1").slice(1)}`,
       warmup: warmupOn ? {type:warmupType, fields:warmupFields, notes:warmupNotes} : null,
       cooldown: cooldownOn ? {type:cooldownType, fields:cooldownFields, notes:cooldownNotes} : null,
       combos: combos.filter(c=>c.exercises.length>0),
@@ -4910,8 +5195,16 @@ function GymTemplateEditor({weekday, template, setTemplate, gymExerciseLibrary, 
       .map(x=>x.e);
   })();
 
-  return(<Sheet onClose={onClose} title={`${WEEKDAYS[weekday].full} Plan`}>
-    <div style={{fontSize:11,color:C.muted,marginBottom:12,lineHeight:1.4}}>This is your starting point for {WEEKDAYS[weekday].full}s — you can still add, remove, or change anything live during the session.</div>
+  return(<Sheet onClose={onClose} title={dayName || `Day ${String(dayId||"d1").slice(1)}`}>
+    {/* Naming the day is what makes the split readable at a glance ("Push", "Legs") instead of
+        a bare number, and the name travels with the plan when it moves to another weekday. */}
+    <Field label="Plan name" value={dayName} onChange={setDayName} placeholder={`Day ${String(dayId||"d1").slice(1)} — e.g. Push`}/>
+    <div style={{fontSize:11,color:C.muted,margin:"8px 0 12px",lineHeight:1.45}}>
+      {assignedWeekdays.length
+        ? <>Currently runs on <b style={{color:C.text}}>{assignedWeekdays.slice().sort((a,b)=>WEEKDAY_ORDER.indexOf(a)-WEEKDAY_ORDER.indexOf(b)).map(w=>WEEKDAYS[w].full).join(", ")}</b>. Change which weekdays in Gym Setup — the plan itself stays put.</>
+        : <>Not assigned to a weekday yet. Assign it in Gym Setup.</>}
+      {" "}You can still add, remove or change anything live during the session.
+    </div>
 
     {/* Warmup */}
     <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"11px 14px",marginBottom:9}}>
@@ -4979,8 +5272,8 @@ function GymTemplateEditor({weekday, template, setTemplate, gymExerciseLibrary, 
               const alts = findAlternatives(lib.muscleGroup, gymExerciseLibrary, ex.name);
               return(<div style={{marginTop:6,background:C.card,border:`1px solid ${C.blue}40`,borderRadius:7,padding:"7px 9px"}}>
                 <div style={{fontSize:9.5,color:C.muted,marginBottom:5}}>Same muscle group ({lib.muscleGroup}):</div>
-                {alts.length===0&&<div style={{fontSize:10.5,color:C.muted}}>No alternatives found for this muscle group yet.</div>}
-                <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{alts.map(a=>(<button key={a.name} onClick={()=>swapExercise(combo.id,ex.id,a)} style={{padding:"4px 9px",borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,color:C.text,cursor:"pointer",fontSize:10.5}}>{a.name}</button>))}</div>
+                <ExerciseTileGrid items={alts} onPick={a=>swapExercise(combo.id,ex.id,a)} onGuide={setGuideFor}
+                  empty="No alternatives found for this muscle group yet."/>
               </div>);
             })()}
             {moveOpenFor===ex.id&&(<div style={{marginTop:6,background:C.card,border:`1px solid ${C.orange}40`,borderRadius:7,padding:"7px 9px"}}>
@@ -4996,16 +5289,12 @@ function GymTemplateEditor({weekday, template, setTemplate, gymExerciseLibrary, 
         {pickerOpen===combo.id ? (
           <div style={{background:C.bg,border:`1px dashed ${C.border}`,borderRadius:8,padding:"8px 10px",marginTop:6}}>
             <input value={pickerSearch} onChange={e=>setPickerSearch(e.target.value)} placeholder="Search or type new exercise…" autoFocus style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 9px",color:C.text,fontSize:12,outline:"none",marginBottom:7}}/>
-            <div style={{display:"flex",flexDirection:"column",gap:4,maxHeight:160,overflowY:"auto",marginBottom:7}}>
-              {/* Row = add-button + a separate guide button. They have to be siblings rather than
-                  a nested button (invalid HTML, and the inner tap would also fire the outer add). */}
-              {filteredLib.map(libEx=>(<div key={libEx.id} className="hit-tight" style={{display:"flex",alignItems:"stretch",gap:5}}>
-                <button onClick={()=>addExerciseFromLib(combo.id,libEx)} style={{flex:1,minWidth:0,padding:"6px 9px",borderRadius:6,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:7,justifyContent:"space-between"}}>
-                  <span style={{display:"flex",alignItems:"center",gap:7,minWidth:0}}><MuscleIcon muscleGroup={libEx.muscleGroup} size={18}/><span style={{fontSize:11.5,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{libEx.name}</span></span><span style={{fontSize:9.5,color:C.muted,flexShrink:0}}>{libEx.muscleGroup}</span>
-                </button>
-                <GuideButton name={libEx.name} onOpen={setGuideFor} compact/>
-              </div>))}
-              {filteredLib.length===0&&<div style={{fontSize:10.5,color:C.muted,padding:"3px 0"}}>No matches — add it as new below.</div>}
+            {/* Picture-first: body figure with the worked muscle marked + an equipment glyph,
+                name underneath. Reading 20 near-identical names to find "the cable one" was the
+                slow part of building a plan. */}
+            <div style={{maxHeight:280,overflowY:"auto",marginBottom:7}}>
+              <ExerciseTileGrid items={filteredLib} onPick={libEx=>addExerciseFromLib(combo.id,libEx)}
+                onGuide={setGuideFor} empty="No matches — add it as new below."/>
             </div>
             {pickerSearch.trim()&&!filteredLib.some(e=>normExName(e.name)===normExName(pickerSearch))&&(<div style={{borderTop:`1px dashed ${C.border}`,paddingTop:8}}>
               <div style={{fontSize:10,color:C.muted,marginBottom:6}}>+ Add "{pickerSearch.trim()}" as a new exercise:</div>
@@ -5042,6 +5331,9 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
   const [swapOpenFor, setSwapOpenFor] = useState(null); // exercise id showing swap alternatives
   const [moveOpenFor, setMoveOpenFor] = useState(null); // exercise id showing the "move to combo" picker
   const [guideForName, setGuideFor] = useState(null); // exercise name whose technique guide is open
+  // Which body regions this session trains — drives the warm-up/cool-down suggestions so both
+  // routines follow the day's own muscles rather than a fixed generic list.
+  const trainedRegions = sessionRegions(session.combos, gymExerciseLibrary);
   const [undoStack, setUndoStack] = useState([]); // snapshots of session before each discrete action
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [showJumpCombo, setShowJumpCombo] = useState(false);
@@ -5270,7 +5562,8 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
         <TimedRoutineList
           items={session.warmup.items||[]}
           setItems={upd=>update(s=>({...s,warmup:{...s.warmup,items:typeof upd==="function"?upd(s.warmup.items||[]):upd}}))}
-          accent={C.orange} presets={WARMUP_PRESETS} addPlaceholder="e.g. Band pull-aparts"/>
+          accent={C.orange} presets={routinePresetsFor("warmup",trainedRegions)} addPlaceholder="e.g. Band pull-aparts"
+          onSuggest={()=>update(s=>({...s,warmup:{...s.warmup,items:buildRoutineItems("warmup",trainedRegions)}}))}/>
       </div>
       <textarea value={session.warmup.notes||""} onChange={e=>update(s=>({...s,warmup:{...s.warmup,notes:e.target.value}}))} placeholder="Notes (optional)…" rows={2} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:T.body,outline:"none",resize:"none",fontFamily:"inherit",marginBottom:9}}/>
       <button onClick={()=>updateAction(s=>({...s,warmup:{...s.warmup,done:true}}))} style={{width:"100%",padding:"11px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:T.body}}>✓ Finish Warmup</button>
@@ -5299,7 +5592,8 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
         <TimedRoutineList
           items={session.cooldown.items||[]}
           setItems={upd=>update(s=>({...s,cooldown:{...s.cooldown,items:typeof upd==="function"?upd(s.cooldown.items||[]):upd}}))}
-          accent={C.blue} presets={COOLDOWN_PRESETS} addPlaceholder="e.g. Hamstring stretch"/>
+          accent={C.blue} presets={routinePresetsFor("cooldown",trainedRegions)} addPlaceholder="e.g. Hamstring stretch"
+          onSuggest={()=>update(s=>({...s,cooldown:{...s.cooldown,items:buildRoutineItems("cooldown",trainedRegions)}}))}/>
       </div>
 
       {machine.fields.length>0&&(<div style={{display:"grid",gridTemplateColumns:machine.fields.length===3?"1fr 1fr 1fr":"1fr 1fr",gap:8,marginBottom:9}}>
@@ -5502,13 +5796,16 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
             const alts = findAlternatives(lib.muscleGroup, gymExerciseLibrary, ex.name);
             return(<div style={{marginBottom:8,background:C.card,border:`1px solid ${C.blue}40`,borderRadius:7,padding:"7px 9px"}}>
               <div style={{fontSize:9.5,color:C.muted,marginBottom:5}}>Same muscle group ({lib.muscleGroup}) — equipment occupied?</div>
-              {alts.length===0&&<div style={{fontSize:10.5,color:C.muted}}>No alternatives found.</div>}
-              <div style={{display:"flex",flexWrap:"wrap",gap:5}}>{alts.map(a=>{
-                const altLast=getLastPerformance(a.name,gymSessions);
-                // Writes to `ci`, the row's own combo — rows are no longer guaranteed to be in
-                // the currently-active combo now that the whole plan is on screen.
-                return(<button key={a.name} onClick={()=>{updateAction(s=>{const cc={...s.combos[ci]};cc.exercises=cc.exercises.map(x=>x.id===ex.id?{...x,name:a.name,weight:altLast?String(altLast.weight):""}:x);const combos=[...s.combos];combos[ci]=cc;return{...s,combos};});setSwapOpenFor(null);}} style={{padding:"5px 10px",borderRadius:10,background:C.bg,border:`1px solid ${C.border}`,color:C.text,fontSize:11}}>{a.name}</button>);
-              })}</div>
+              {/* Swapping mid-session is usually driven by "that machine is taken", so the
+                  equipment glyph on each tile is the thing being scanned for — not the name. */}
+              <ExerciseTileGrid items={alts} onGuide={setGuideFor} empty="No alternatives found."
+                onPick={a=>{
+                  const altLast=getLastPerformance(a.name,gymSessions);
+                  // Writes to `ci`, the row's own combo — rows are no longer guaranteed to be in
+                  // the currently-active combo now that the whole plan is on screen.
+                  updateAction(s=>{const cc={...s.combos[ci]};cc.exercises=cc.exercises.map(x=>x.id===ex.id?{...x,name:a.name,weight:altLast?String(altLast.weight):""}:x);const combos=[...s.combos];combos[ci]=cc;return{...s,combos};});
+                  setSwapOpenFor(null);
+                }}/>
             </div>);
           })()}
           {/* Logged sets. Each chip is tappable to correct it — a mistyped rep count used to be
@@ -5642,8 +5939,34 @@ function CancelConfirmBox({onSaveFinish, onDiscard, onKeepGoing}){
 // ── Gym Setup Sheet ─────────────────────────────────────────────────────────
 // Pick default gym weekdays, set the overall training method, and jump into each
 // scheduled day's template editor.
-function GymSetupSheet({gymSchedule,setGymSchedule,gymSettings,setGymSettings,gymTemplates,setGymTemplates,gymExerciseLibrary,onEditTemplate,onClose}){
-  const toggle=wd=>setGymSchedule(prev=>(prev||[]).includes(wd)?(prev||[]).filter(x=>x!==wd):[...(prev||[]),wd]);
+function GymSetupSheet({gymSchedule,setGymSchedule,gymSettings,setGymSettings,gymTemplates,setGymTemplates,gymDayAssign,setGymDayAssign,gymExerciseLibrary,onEditTemplate,onClose}){
+  const dayIds = gymDayIds(gymTemplates);
+  // Assigning a weekday cycles it through: rest → Day 1 → Day 2 → … → rest. One tap moves a
+  // session from Thursday to Friday; the plan is untouched, which is the whole point of the
+  // split. (Two weekdays may point at the same plan — training the same day twice a week.)
+  const cycleWeekday = wd => setGymDayAssign(prev => {
+    const cur = prev?.[wd] || null;
+    const order = [null, ...dayIds];
+    const nextIdx = (order.indexOf(cur) + 1) % order.length;
+    const next = order[nextIdx];
+    const out = {...(prev||{})};
+    if (next) out[wd] = next; else delete out[wd];
+    return out;
+  });
+  const addDay = () => {
+    const id = nextGymDayId(gymTemplates);
+    setGymTemplates(prev => ({...(prev||{}), [id]: {name:`Day ${id.slice(1)}`, warmup:null, cooldown:null, combos:[]}}));
+    return id;
+  };
+  const deleteDay = id => {
+    if (!confirm(`Delete ${gymDayLabel(gymTemplates,id)}? Any weekday using it becomes a rest day.`)) return;
+    setGymTemplates(prev => { const n = {...(prev||{})}; delete n[id]; return n; });
+    setGymDayAssign(prev => {
+      const n = {...(prev||{})};
+      for (const wd of Object.keys(n)) if (n[wd] === id) delete n[wd];
+      return n;
+    });
+  };
   const method=gymSettings?.trainingMethod||"maintain";
   const setMethod=m=>setGymSettings(p=>({...(p||{}),trainingMethod:m}));
   const setNote=n=>setGymSettings(p=>({...(p||{}),customNote:n}));
@@ -5653,23 +5976,74 @@ function GymSetupSheet({gymSchedule,setGymSchedule,gymSettings,setGymSettings,gy
   // Auto-builder: pick which weekdays to generate for (defaults to the days already marked as
   // gym days that don't have a plan yet) and it fills them in using the preference above.
   const [autoOpen,setAutoOpen]=useState(false);
-  const [autoDays,setAutoDays]=useState(()=>(gymSchedule||[]).filter(wd=>!gymTemplates?.[wd]?.combos?.length));
+  const [autoDays,setAutoDays]=useState(()=>(gymSchedule||[]).length?(gymSchedule||[]):[1,3,5]);
   const [autoPreview,setAutoPreview]=useState(null); // {templates, dayTypeLabels} once generated, shown before applying
   const toggleAutoDay=wd=>setAutoDays(prev=>prev.includes(wd)?prev.filter(x=>x!==wd):[...prev,wd].sort((a,b)=>WEEKDAY_ORDER.indexOf(a)-WEEKDAY_ORDER.indexOf(b)));
   const generate=()=>{
     if(!autoDays.length)return;
     setAutoPreview(autoBuildGymPlan(autoDays,preference,gymExerciseLibrary));
   };
+  // The builder still thinks in weekdays (that is how a split is chosen — 3 days/week means
+  // push/pull/legs), but what it produces is numbered training days plus the assignment that
+  // puts them on those weekdays.
   const applyAutoPlan=()=>{
     if(!autoPreview)return;
-    setGymSchedule(prev=>[...new Set([...(prev||[]),...autoDays])]);
-    setGymTemplates(prev=>({...(prev||{}),...autoPreview.templates}));
+    const templates={}, assign={};
+    autoDays.forEach((wd,i)=>{
+      const id=`d${i+1}`;
+      templates[id]={...autoPreview.templates[wd], name:autoPreview.dayTypeLabels[wd]||`Day ${i+1}`};
+      assign[wd]=id;
+    });
+    setGymTemplates(prev=>({...(prev||{}),...templates}));
+    setGymDayAssign(assign);
     setAutoPreview(null);setAutoOpen(false);
   };
 
   return(<Sheet onClose={onClose} title="Gym Settings">
-    <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Default gym days</div>
-    <div style={{display:"flex",gap:5,marginBottom:16}}>{WEEKDAY_ORDER.map(id=>{const wd=WEEKDAYS[id];const on=(gymSchedule||[]).includes(wd.id);return(<button key={wd.id} onClick={()=>toggle(wd.id)} style={{flex:1,padding:"9px 0",borderRadius:9,border:`1px solid ${on?C.orange:C.border}`,background:on?`${C.orange}18`:C.bg,color:on?C.orange:C.muted,fontWeight:on?700:400,cursor:"pointer",fontSize:11}}>{wd.label}</button>);})}</div>
+    {/* ── Weekly schedule ──
+        Plans are numbered training days; this grid only says WHICH DAY runs WHEN. Tap a weekday
+        to cycle it through the available plans and back to rest. Moving Thursday's session to
+        Friday is two taps and never touches the plan itself. */}
+    <div style={{...eyebrow(),marginBottom:8}}>Your week</div>
+    <div className="hit-tight" style={{display:"flex",gap:4,marginBottom:6}}>{WEEKDAY_ORDER.map(id=>{
+      const wd=WEEKDAYS[id];
+      const assigned=(gymDayAssign||{})[id]||null;
+      return(<button key={wd.id} onClick={()=>cycleWeekday(wd.id)} disabled={!dayIds.length}
+        style={{flex:1,minWidth:0,padding:"8px 2px",borderRadius:R.sm,border:`1px solid ${assigned?C.orange:C.border}`,
+          background:assigned?`${C.orange}18`:C.bg,color:assigned?C.orange:C.muted2,textAlign:"center"}}>
+        <div style={{fontSize:T.label,fontWeight:700}}>{wd.label}</div>
+        <div style={{fontSize:9.5,marginTop:3,lineHeight:1.15,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+          {assigned?gymDayLabel(gymTemplates,assigned):"rest"}
+        </div>
+      </button>);
+    })}</div>
+    <div style={{fontSize:T.label,color:C.muted,marginBottom:16,lineHeight:1.45}}>
+      {dayIds.length?"Tap a weekday to cycle which training day runs on it.":"Add a training day below first, then assign it to weekdays."}
+    </div>
+
+    {/* ── The plans themselves ── */}
+    <div style={{...eyebrow(),marginBottom:8}}>Training days</div>
+    <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:8}}>{dayIds.map(id=>{
+      const t=gymTemplates[id];
+      const comboCount=t?.combos?.length||0;
+      const on=Object.keys(gymDayAssign||{}).filter(wd=>gymDayAssign[wd]===id).map(Number)
+        .sort((a,b)=>WEEKDAY_ORDER.indexOf(a)-WEEKDAY_ORDER.indexOf(b));
+      return(<div key={id} className="hit-tight" style={{display:"flex",alignItems:"stretch",gap:5}}>
+        <button onClick={()=>onEditTemplate(id)} style={{flex:1,minWidth:0,padding:"11px 13px",borderRadius:R.md,border:`1px solid ${C.border}`,background:C.bg,textAlign:"left"}}>
+          <div style={{fontSize:T.body,fontWeight:600,color:C.text}}>{gymDayLabel(gymTemplates,id)}</div>
+          <div style={{fontSize:T.label,color:C.muted,marginTop:2}}>
+            {comboCount>0?`${comboCount} combo${comboCount!==1?"s":""}`:"No exercises yet — tap to set up"}
+            {on.length?` · ${on.map(w=>WEEKDAYS[w].label).join(", ")}`:" · not scheduled"}
+          </div>
+        </button>
+        <button onClick={()=>deleteDay(id)} aria-label={`Delete ${gymDayLabel(gymTemplates,id)}`}
+          style={{flexShrink:0,padding:"0 11px",borderRadius:R.md,background:"none",border:`1px solid ${C.border}`,color:C.faint,fontSize:16}}>×</button>
+      </div>);
+    })}</div>
+    <button onClick={()=>{const id=addDay();onEditTemplate(id);}}
+      style={{width:"100%",padding:"10px 0",borderRadius:R.md,background:"none",border:`1px dashed ${C.lime}60`,color:C.lime,fontSize:T.sm,fontWeight:600,marginBottom:16}}>
+      + Add training day
+    </button>
 
     <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Training method</div>
     <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:16}}>{TRAINING_METHODS.map(m=>(
@@ -5725,17 +6099,6 @@ function GymSetupSheet({gymSchedule,setGymSchedule,gymSettings,setGymSettings,gy
       </div>)}
     </div>
 
-    {(gymSchedule||[]).length>0&&<>
-      <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Day plans</div>
-      <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:6}}>{(gymSchedule||[]).slice().sort((a,b)=>WEEKDAY_ORDER.indexOf(a)-WEEKDAY_ORDER.indexOf(b)).map(wd=>{
-        const t=gymTemplates?.[wd];
-        const comboCount=t?.combos?.length||0;
-        return(<button key={wd} onClick={()=>onEditTemplate(wd)} style={{padding:"11px 13px",borderRadius:10,border:`1px solid ${C.border}`,background:C.bg,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-          <div><div style={{fontSize:T.body,fontWeight:600,color:C.text}}>{WEEKDAYS[wd].full}</div><div style={{fontSize:10,color:C.muted,marginTop:1}}>{comboCount>0?`${comboCount} combo${comboCount!==1?"s":""}${t.warmup?" · warmup":""}`:"No plan yet — tap to set up"}</div></div>
-          <span style={{color:C.muted,fontSize:T.body}}>✎</span>
-        </button>);
-      })}</div>
-    </>}
     <button onClick={onClose} style={{width:"100%",padding:"11px 0",borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer",marginTop:10}}>Done</button>
   </Sheet>);
 }
@@ -5840,16 +6203,12 @@ function GymManualLogSheet({gymExerciseLibrary, setGymExerciseLibrary, onSave, o
         {pickerOpen===combo.id ? (
           <div style={{background:C.bg,border:`1px dashed ${C.border}`,borderRadius:8,padding:"8px 10px"}}>
             <input value={pickerSearch} onChange={e=>setPickerSearch(e.target.value)} placeholder="Search or type new exercise…" autoFocus style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 9px",color:C.text,fontSize:12,outline:"none",marginBottom:7}}/>
-            <div style={{display:"flex",flexDirection:"column",gap:4,maxHeight:160,overflowY:"auto",marginBottom:7}}>
-              {/* Row = add-button + a separate guide button. They have to be siblings rather than
-                  a nested button (invalid HTML, and the inner tap would also fire the outer add). */}
-              {filteredLib.map(libEx=>(<div key={libEx.id} className="hit-tight" style={{display:"flex",alignItems:"stretch",gap:5}}>
-                <button onClick={()=>addExerciseFromLib(combo.id,libEx)} style={{flex:1,minWidth:0,padding:"6px 9px",borderRadius:6,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:7,justifyContent:"space-between"}}>
-                  <span style={{display:"flex",alignItems:"center",gap:7,minWidth:0}}><MuscleIcon muscleGroup={libEx.muscleGroup} size={18}/><span style={{fontSize:11.5,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{libEx.name}</span></span><span style={{fontSize:9.5,color:C.muted,flexShrink:0}}>{libEx.muscleGroup}</span>
-                </button>
-                <GuideButton name={libEx.name} onOpen={setGuideFor} compact/>
-              </div>))}
-              {filteredLib.length===0&&<div style={{fontSize:10.5,color:C.muted,padding:"3px 0"}}>No matches — add it as new below.</div>}
+            {/* Picture-first: body figure with the worked muscle marked + an equipment glyph,
+                name underneath. Reading 20 near-identical names to find "the cable one" was the
+                slow part of building a plan. */}
+            <div style={{maxHeight:280,overflowY:"auto",marginBottom:7}}>
+              <ExerciseTileGrid items={filteredLib} onPick={libEx=>addExerciseFromLib(combo.id,libEx)}
+                onGuide={setGuideFor} empty="No matches — add it as new below."/>
             </div>
             {pickerSearch.trim()&&!filteredLib.some(e=>normExName(e.name)===normExName(pickerSearch))&&(<div style={{borderTop:`1px dashed ${C.border}`,paddingTop:8}}>
               <div style={{fontSize:10,color:C.muted,marginBottom:6}}>+ Add "{pickerSearch.trim()}" as a new exercise:</div>
@@ -6012,22 +6371,25 @@ function GymHistoryPanel({gymSessions,setGymSessions,gymExerciseLibrary,setGymEx
   </Sheet>);
 }
 
-function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases,setWeightPhases,gymSchedule,setGymSchedule,gymTemplates,setGymTemplates,gymSessions,setGymSessions,gymSettings,setGymSettings,gymActiveSession,setGymActiveSession,gymExerciseLibrary,setGymExerciseLibrary}){
+function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases,setWeightPhases,gymSchedule,setGymSchedule,gymTemplates,setGymTemplates,gymDayAssign,setGymDayAssign,gymSessions,setGymSessions,gymSettings,setGymSettings,gymActiveSession,setGymActiveSession,gymExerciseLibrary,setGymExerciseLibrary}){
   const [modal,setModal]=useState(false);const [view,setView]=useState("today");const [histDates,setHistDates]=useState([]);const [histLogs,setHistLogs]=useState({});const [histLoaded,setHistLoaded]=useState(false);
   const activities=dayData.activities||[];const totalBurned=activities.reduce((s,a)=>s+a.kcal,0)+(dayData.burnedExtra||0);
 
   // ── Gym tracking ──────────────────────────────────────────────────────────
   const [gymSetupOpen,setGymSetupOpen]=useState(false);
-  const [editingWeekday,setEditingWeekday]=useState(null); // weekday id being edited in template editor, or null
+  const [editingDayId,setEditingDayId]=useState(null); // plan day id being edited, or null
   const [showGymHistory,setShowGymHistory]=useState(false);
   const [promptDismissed,setPromptDismissed]=useState(false);
   const todayWeekday=new Date().getDay();
-  const isScheduledGymDay=(gymSchedule||[]).includes(todayWeekday);
-  const todayTemplate=(gymTemplates||{})[todayWeekday]||null;
+  // Today's plan is resolved weekday → dayId → template, so which plan runs today is a
+  // one-line assignment change rather than a rebuild of the plan.
+  const todayDayId=(gymDayAssign||{})[todayWeekday]||null;
+  const isScheduledGymDay=!!todayDayId||(gymSchedule||[]).includes(todayWeekday);
+  const todayTemplate=todayDayId?((gymTemplates||{})[todayDayId]||null):null;
   const latestWeightForGym=weights[0]?.weight;
   const todaysCompletedSession=(gymSessions||[]).find(s=>s.date===TODAY())||null;
 
-  const buildSessionFromTemplate=(weekday,template)=>{
+  const buildSessionFromTemplate=(weekday,template,dayId)=>{
     const t=template||{warmup:null,cooldown:null,combos:[{id:Date.now(),exercises:[]}]};
     const combos=(t.combos?.length?t.combos:[{id:Date.now(),exercises:[]}]).map(c=>({
       id:c.id,
@@ -6036,14 +6398,23 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
         return {id:ex.id,name:ex.name,type:ex.type||"weighted",weight:last?String(last.weight):"",unit:"kg",sets:[]};
       }),
     }));
+    // Warm-up and cool-down are pre-filled with movements chosen for what THIS session trains,
+    // so both steps open with a working set of timers instead of an empty list, and a leg day
+    // never opens on shoulder mobility. A template that carries its own saved items keeps them.
+    const regions = sessionRegions(combos, gymExerciseLibrary);
     return {
-      date:TODAY(), weekday,
+      // `dayId` is what the finished session syncs its reordered plan back into. Without it the
+      // sync would have to guess from the weekday again, which is the coupling being removed.
+      date:TODAY(), weekday, dayId: dayId||null,
       startedAt:Date.now(),
-      warmup:t.warmup?{...t.warmup,done:false}:null,
+      warmup:t.warmup
+        ? {...t.warmup, done:false, items:(t.warmup.items?.length ? t.warmup.items.map(i=>({...i,done:false})) : buildRoutineItems("warmup", regions))}
+        : null,
       // Cooldown is ALWAYS available, regardless of whether the template configured one —
       // finishing the last combo should always offer the choice to stretch/cool down first,
       // not just when pre-planned. Falls back to a free-text "other" cooldown if unconfigured.
-      cooldown:{type:t.cooldown?.type||"other", fields:t.cooldown?.fields||{}, notes:t.cooldown?.notes||"", done:false},
+      cooldown:{type:t.cooldown?.type||"other", fields:t.cooldown?.fields||{}, notes:t.cooldown?.notes||"", done:false,
+        items:(t.cooldown?.items?.length ? t.cooldown.items.map(i=>({...i,done:false})) : buildRoutineItems("cooldown", regions))},
       cooldownStarted:false,
       combos: combos.length?combos:[{id:Date.now(),exercises:[]}],
       currentComboIdx:0, currentExInRound:0,
@@ -6051,31 +6422,37 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
     };
   };
 
-  const startGymSession=(weekday,template)=>{
-    setGymActiveSession(buildSessionFromTemplate(weekday,template));
+  const startGymSession=(weekday,template,dayId)=>{
+    setGymActiveSession(buildSessionFromTemplate(weekday,template,dayId));
   };
   const cancelGymSession=()=>setGymActiveSession(null);
   const finishGymSession=({durationSec,kcal,method})=>{
     const sess=gymActiveSession;
     if(!sess)return;
     const sessionId=Date.now();
-    const record={id:sessionId,date:sess.date,weekday:sess.weekday,durationSec,warmup:sess.warmup,cooldown:sess.cooldown,combos:sess.combos,kcalBurned:kcal,kcalMethod:method};
+    const record={id:sessionId,date:sess.date,weekday:sess.weekday,dayId:sess.dayId||null,durationSec,warmup:sess.warmup,cooldown:sess.cooldown,combos:sess.combos,kcalBurned:kcal,kcalMethod:method};
     setGymSessions(prev=>[record,...(prev||[])]);
     const durMin=Math.round(durationSec/60);
     // sessionId links the day-log activity back to the full gym record, so activity lists can
     // show the exercise breakdown inline. Older activities predate this field and are matched
     // by date instead (see findSessionFor).
-    setDayData(p=>({...p,activities:[...(p.activities||[]),{id:sessionId,sessionId,type:"gym",label:`Gym — ${WEEKDAYS[sess.weekday].full}`,kcal,durationMin:durMin,time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}]}));
+    setDayData(p=>({...p,activities:[...(p.activities||[]),{id:sessionId,sessionId,type:"gym",label:`Gym — ${gymDayLabel(gymTemplates,sess.dayId)}`,kcal,durationMin:durMin,time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}]}));
     // The live session's combo/exercise order reflects however it was ACTUALLY done — reordered
     // mid-workout (equipment busy, jumped ahead, moved into a different combo), not necessarily
-    // the order the template started with. Writing that final order back into the template means
-    // next week's session for this weekday starts pre-arranged the way it was last actually
-    // performed, instead of always reverting to whatever the template originally said. Only the
-    // combo/exercise structure is synced — warmup/cooldown config stays whatever was configured.
-    setGymTemplates(prev=>({
+    // the order the template started with. Writing that final order back into the plan means the
+    // next run of THIS DAY starts pre-arranged the way it was last actually performed, instead of
+    // reverting to whatever the plan originally said. Only the combo/exercise structure is
+    // synced — warmup/cooldown config stays whatever was configured.
+    //
+    // Keyed on the session's own dayId, so a session started before a weekday re-assignment
+    // still writes back into the plan it was actually built from. A session that predates the
+    // day-plan split (or an ad-hoc one) has no dayId, so it falls back to whatever plan that
+    // weekday currently runs — otherwise upgrading mid-workout would silently lose the sync.
+    const syncDayId = sess.dayId || (gymDayAssign||{})[sess.weekday] || null;
+    if(syncDayId) setGymTemplates(prev=>({
       ...(prev||{}),
-      [sess.weekday]: {
-        ...(prev?.[sess.weekday]||{}),
+      [syncDayId]: {
+        ...(prev?.[syncDayId]||{}),
         combos: (sess.combos||[])
           .filter(c=>(c.exercises||[]).length>0)
           .map(c=>({id:c.id, exercises:(c.exercises||[]).map(ex=>({id:ex.id, name:ex.name, type:ex.type||"weighted"}))})),
@@ -6235,33 +6612,35 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
       {todaysCompletedSession ? (
         <div style={{background:C.card,border:`1px solid ${C.lime}60`,borderRadius:12,padding:"12px 16px",marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
           <div><div style={{fontSize:T.body,fontWeight:600,color:C.lime}}>✓ Session already completed today</div><div style={{fontSize:T.sm,color:C.muted,marginTop:2}}>{Math.round((todaysCompletedSession.durationSec||0)/60)}min · +{Math.round(todaysCompletedSession.kcalBurned||0)}kcal</div></div>
-          <button onClick={()=>startGymSession(todayWeekday,todayTemplate)} style={{padding:"7px 14px",borderRadius:8,background:C.card,border:`1px solid ${C.lime}`,color:C.lime,fontWeight:700,cursor:"pointer",fontSize:12,flexShrink:0}}>+ Log another</button>
+          <button onClick={()=>startGymSession(todayWeekday,todayTemplate,todayDayId)} style={{padding:"7px 14px",borderRadius:8,background:C.card,border:`1px solid ${C.lime}`,color:C.lime,fontWeight:700,cursor:"pointer",fontSize:12,flexShrink:0}}>+ Log another</button>
         </div>
       ) : isScheduledGymDay && !promptDismissed ? (
         <div style={{background:C.card,border:`1px solid ${C.orange}60`,borderRadius:12,padding:"12px 16px",marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
-          <div><div style={{fontSize:T.body,fontWeight:600,color:C.text}}>🏋️ At the gym already?</div><div style={{fontSize:10,color:C.muted,marginTop:2}}>{WEEKDAYS[todayWeekday].full} is a scheduled gym day</div></div>
+          <div><div style={{fontSize:T.body,fontWeight:600,color:C.text}}>🏋️ At the gym already?</div><div style={{fontSize:10,color:C.muted,marginTop:2}}>{WEEKDAYS[todayWeekday].full} · {todayDayId?gymDayLabel(gymTemplates,todayDayId):"scheduled gym day"}</div></div>
           <div style={{display:"flex",gap:6,flexShrink:0}}>
             <button onClick={()=>setPromptDismissed(true)} style={{padding:"7px 10px",borderRadius:8,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Not yet</button>
-            <button onClick={()=>startGymSession(todayWeekday,todayTemplate)} style={{padding:"7px 14px",borderRadius:8,background:C.orange,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Start Session</button>
+            <button onClick={()=>startGymSession(todayWeekday,todayTemplate,todayDayId)} style={{padding:"7px 14px",borderRadius:8,background:C.orange,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Start Session</button>
           </div>
         </div>
       ) : (
-        <button onClick={()=>startGymSession(todayWeekday,todayTemplate)} style={{width:"100%",padding:"9px 0",borderRadius:10,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12,marginBottom:12}}>🏋️ + Start ad-hoc gym session</button>
+        <button onClick={()=>startGymSession(todayWeekday,todayTemplate,todayDayId)} style={{width:"100%",padding:"9px 0",borderRadius:10,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12,marginBottom:12}}>🏋️ + Start ad-hoc gym session</button>
       )}
       {gymSetupOpen&&<GymSetupSheet
         gymSchedule={gymSchedule||[]} setGymSchedule={setGymSchedule}
         gymSettings={gymSettings} setGymSettings={setGymSettings}
         gymTemplates={gymTemplates||{}} setGymTemplates={setGymTemplates}
+        gymDayAssign={gymDayAssign||{}} setGymDayAssign={setGymDayAssign}
         gymExerciseLibrary={gymExerciseLibrary||[]} setGymExerciseLibrary={setGymExerciseLibrary}
-        onEditTemplate={wd=>{setGymSetupOpen(false);setEditingWeekday(wd);}}
+        onEditTemplate={id=>{setGymSetupOpen(false);setEditingDayId(id);}}
         onClose={()=>setGymSetupOpen(false)}
       />}
-      {editingWeekday!==null&&<GymTemplateEditor
-        weekday={editingWeekday}
-        template={(gymTemplates||{})[editingWeekday]}
-        setTemplate={t=>setGymTemplates(prev=>({...(prev||{}),[editingWeekday]:t}))}
+      {editingDayId!==null&&<GymTemplateEditor
+        dayId={editingDayId}
+        template={(gymTemplates||{})[editingDayId]}
+        assignedWeekdays={Object.keys(gymDayAssign||{}).filter(wd=>gymDayAssign[wd]===editingDayId).map(Number)}
+        setTemplate={t=>setGymTemplates(prev=>({...(prev||{}),[editingDayId]:t}))}
         gymExerciseLibrary={gymExerciseLibrary||[]} setGymExerciseLibrary={setGymExerciseLibrary}
-        onClose={()=>setEditingWeekday(null)}
+        onClose={()=>setEditingDayId(null)}
       />}
       {showGymHistory&&<GymHistoryPanel gymSessions={gymSessions||[]} setGymSessions={setGymSessions} gymExerciseLibrary={gymExerciseLibrary||[]} setGymExerciseLibrary={setGymExerciseLibrary} onClose={()=>setShowGymHistory(false)}/>}
 
@@ -7045,7 +7424,13 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
         <button onClick={()=>setShowProd(p=>!p)} style={{flex:1,minWidth:0,padding:"12px 16px",borderRadius:12,background:C.card,border:`1px solid ${showProd?C.lime:C.border}`,color:showProd?C.lime:C.text,fontWeight:600,cursor:"pointer",fontSize:T.body,display:"flex",justifyContent:"space-between",alignItems:"center"}}><span>Product Labels ({products.length})</span><span style={{fontSize:11}}>{showProd?"▲":"▼"}</span></button>
         <button onClick={()=>{setShowProd(true);setShowAdd(true);setEditPIdx(null);setPForm(EMPTY_PFORM);setScanImgs([]);}} aria-label="Add product label" style={{flexShrink:0,padding:"12px 18px",minHeight:44,borderRadius:12,background:C.lime,border:"none",color:"#000",fontWeight:800,cursor:"pointer",fontSize:T.body,boxShadow:`0 0 14px ${C.lime}45`}}>+ Add</button>
       </div>
-      {showProd&&<div><input placeholder="Search products…" value={search} onChange={e=>setSearch(e.target.value)} style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"9px 14px",color:C.text,fontSize:T.body,outline:"none",marginBottom:8}}/>
+      {showProd&&<div><div style={{position:"relative",marginBottom:8}}>
+        <input placeholder="Search products…" value={search} onChange={e=>setSearch(e.target.value)} style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"9px 14px",paddingRight:search?42:14,color:C.text,fontSize:T.body,outline:"none"}}/>
+        {/* Same one-tap clear as the label pickers — holding backspace through a long product
+            name is not a reasonable way to reset a search. */}
+        {search&&<button type="button" onClick={()=>setSearch("")} aria-label="Clear search" className="no-hit"
+          style={{position:"absolute",right:5,top:"50%",transform:"translateY(-50%)",width:32,height:32,borderRadius:"50%",background:"none",border:"none",color:C.muted,fontSize:18,lineHeight:1,display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>}
+      </div>
       <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,overflowX:"auto",paddingBottom:2}}>
         <span style={{fontSize:10,color:C.muted,flexShrink:0,fontFamily:"monospace",textTransform:"uppercase"}}>Sort</span>
         {PRODUCT_SORTS.map(s=>{const on=prodSort===s.id;return(<button key={s.id} type="button" onClick={()=>setProdSort(s.id)} style={{flexShrink:0,padding:"4px 10px",borderRadius:12,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:10.5,fontWeight:on?700:400,whiteSpace:"nowrap"}}>{s.label}</button>);})}
@@ -7935,7 +8320,7 @@ function SettingsTab({profile,setProfile,weights,setWeights,weightPhases,setWeig
   const AGE=calcAge(profile.birthday);
   const saveProfile=()=>{setProfile({...pf,heightCm:parseFloat(pf.heightCm)||null,apiKey:pf.apiKey||""});setEditProf(false);};
   const exportData=async()=>{
-    const keys=["fit_dates","fit_weights","fit_products","fit_mealpreps","fit_profile","fit_photos","fit_weight_phases","fit_seeded_presets","fit_gym_schedule","fit_gym_templates","fit_gym_sessions","fit_gym_settings","fit_gym_exercise_library","fit_recipes","fit_medications","fit_med_log","fit_day_types"];
+    const keys=["fit_dates","fit_weights","fit_products","fit_mealpreps","fit_profile","fit_photos","fit_weight_phases","fit_seeded_presets","fit_gym_schedule","fit_gym_templates","fit_gym_day_assign","fit_gym_sessions","fit_gym_settings","fit_gym_exercise_library","fit_recipes","fit_medications","fit_med_log","fit_day_types"];
     const out={};for(const k of keys){out[k]=await store.get(k,null);}
     const dates=out.fit_dates||[];for(const d of dates){out["fit_day_"+d]=await store.get("fit_day_"+d,null);}
     const blob=new Blob([JSON.stringify(out,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="fitness-data-"+TODAY()+".json";a.click();URL.revokeObjectURL(url);setExportMsg("Exported!");setTimeout(()=>setExportMsg(""),2000);
@@ -8287,6 +8672,9 @@ function App(){
   // persisted continuously so it survives an app reload mid-workout).
   const [gymSchedule,setGymSchedule_]=useState([]);
   const [gymTemplates,setGymTemplates_]=useState({});
+  // {weekday: dayId} — which numbered plan runs on which weekday. Separate from gymTemplates so
+  // moving a session between weekdays never touches the plan itself.
+  const [gymDayAssign,setGymDayAssign_]=useState({});
   const [gymSessions,setGymSessions_]=useState([]);
   const [gymSettings,setGymSettings_]=useState({trainingMethod:"maintain",customNote:""});
   const [gymActiveSession,setGymActiveSession_]=useState(null);
@@ -8482,7 +8870,18 @@ function App(){
     const wts=await store.get("fit_weights",[]);const preps=await store.get("fit_mealpreps",[]);
     const prof=await store.get("fit_profile",null)||DEFAULT_PROFILE;const photos=await store.get("fit_photos",[]);
     const phases=await store.get("fit_weight_phases",[]);
-    const gTemplates=await store.get("fit_gym_templates",{});
+    let gTemplates=await store.get("fit_gym_templates",{});
+    let gAssign=await store.get("fit_gym_day_assign",{});
+    // Upgrade weekday-keyed plans to numbered day plans + an assignment map. Runs once; after
+    // it, `gymTemplates` only ever contains "d1", "d2"... keys.
+    const migrated=migrateGymPlans(gTemplates,gSchedule);
+    if(migrated){
+      gTemplates=migrated.templates;
+      gAssign={...migrated.assign,...gAssign};
+      await store.set("fit_gym_templates",gTemplates);
+      await store.set("fit_gym_day_assign",gAssign);
+      console.log("[update] Gym plans moved from weekdays to numbered training days");
+    }
     const gSessions=await store.get("fit_gym_sessions",[]);
     const gSettings=await store.get("fit_gym_settings",{trainingMethod:"maintain",customNote:""});
     const gActive=await store.get("fit_gym_active_session",null);
@@ -8529,7 +8928,11 @@ function App(){
     const dTypes=(Array.isArray(storedDayTypes)&&storedDayTypes.length)?storedDayTypes:DEFAULT_DAY_TYPES;
     setDayTypeRegistry(dTypes);
     setProducts_(sortProducts(prods));setDayData_(day);setWeights_(wts);setMealPreps_(preps);setProfile_(prof);setProgressPhotos_(photos);setWeightPhases_(Array.isArray(phases)?phases:[]);
-    setGymSchedule_(Array.isArray(gSchedule)?gSchedule:[]);setGymTemplates_(gTemplates||{});setGymSessions_(Array.isArray(gSessions)?gSessions:[]);setGymSettings_(gSettings||{trainingMethod:"maintain",customNote:""});setGymActiveSession_(normalizeGymSession(gActive));setGymExerciseLibrary_(gLibrary);setRecipes_(Array.isArray(rRecipes)?rRecipes:[]);
+    // The assign map is indexed by weekday number, so a non-object here (a stale string from a
+    // bad import, say) would silently index into a string and yield a garbage day id rather than
+    // failing loudly. This app has been bricked by an unexpected storage shape before — cheap guard.
+    const safeAssign = (gAssign && typeof gAssign==="object" && !Array.isArray(gAssign)) ? gAssign : {};
+    setGymSchedule_(Array.isArray(gSchedule)?gSchedule:[]);setGymTemplates_(gTemplates||{});setGymDayAssign_(safeAssign);setGymSessions_(Array.isArray(gSessions)?gSessions:[]);setGymSettings_(gSettings||{trainingMethod:"maintain",customNote:""});setGymActiveSession_(normalizeGymSession(gActive));setGymExerciseLibrary_(gLibrary);setRecipes_(Array.isArray(rRecipes)?rRecipes:[]);
     setMedications_(Array.isArray(meds)?meds:[]);setMedLog_(Array.isArray(mLog)?mLog:[]);setDayTypes_(dTypes);
     // Recent history for streaks. Read after the main state is set so the first paint is not
     // delayed by it — streaks appearing a moment later is fine, a slower cold start is not.
@@ -8571,6 +8974,16 @@ function App(){
   const setWeightPhases=useCallback(upd=>{setWeightPhases_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_weight_phases",n);return n;});},[]);
   const setGymSchedule=useCallback(upd=>{setGymSchedule_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_schedule",n);return n;});},[]);
   const setGymTemplates=useCallback(upd=>{setGymTemplates_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_templates",n);return n;});},[]);
+  // Writing the assignment also rewrites gymSchedule from it, so "which weekdays do I train"
+  // has exactly one source of truth. Everything downstream (targets, streaks, planned burn)
+  // keeps reading gymSchedule as the plain weekday array it always was.
+  const setGymDayAssign=useCallback(upd=>{setGymDayAssign_(p=>{
+    const n=typeof upd==="function"?upd(p):upd;
+    store.set("fit_gym_day_assign",n);
+    const days=Object.keys(n).filter(k=>n[k]).map(Number).sort((a,b)=>WEEKDAY_ORDER.indexOf(a)-WEEKDAY_ORDER.indexOf(b));
+    setGymSchedule_(days); store.set("fit_gym_schedule",days);
+    return n;
+  });},[]);
   const setGymSessions=useCallback(upd=>{setGymSessions_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_sessions",n);return n;});},[]);
   const setGymSettings=useCallback(upd=>{setGymSettings_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_settings",n);return n;});},[]);
   // Normalised on every write as well as on load: a reducer that produced a malformed combo
@@ -8673,7 +9086,7 @@ function App(){
     </div>}
     <div style={{flex:1,overflow:"hidden"}}>
       {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} setProfile={setProfile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence} progress={progress} gymSessions={gymSessions}/>}
-      {viewTab==="activity"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary}/>}
+      {viewTab==="activity"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymDayAssign={gymDayAssign} setGymDayAssign={setGymDayAssign} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary}/>}
       {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes} onLogMeal={meal=>setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}))} gymSessions={gymSessions}/>}
       {viewTab==="history"&&<HistoryTab weights={weights} products={products} profile={profile} medications={medications} medLog={medLog} progress={progress} onLogMed={logMedFor} onUnlogMed={unlogMed}/>}
       {viewTab==="settings"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight} medications={medications} setMedications={setMedications} dayTypes={dayTypes} setDayTypes={setDayTypes}/>}

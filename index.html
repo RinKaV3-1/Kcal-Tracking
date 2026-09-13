@@ -1678,6 +1678,11 @@ const DEFAULT_PROFILE = {
   activityLevel:"light", goal:"cut", targetWeightKg:null, goalNote:"",
   apiKey:"",
 };
+// AI & Privacy toggles. Read with `?? true` everywhere rather than requiring a migration, so an
+// existing profile that predates this setting (aiPrefs undefined) keeps behaving exactly as it
+// always did — every toggle defaults ON — instead of silently losing AI features on upgrade.
+const DEFAULT_AI_PREFS = { mealAnalysis:true, coach:true, includeWeightHistory:true, includeMealHistory:true, includeWorkoutHistory:true };
+const aiPref = (profile, key) => profile?.aiPrefs?.[key] ?? true;
 
 // ── TDEE helpers ──────────────────────────────────────────────────────────────
 // Age in whole years. Returns null only when there is no birthday at all — 0 is a real value
@@ -2234,6 +2239,47 @@ function monthTrend(weights) {
 }
 function gCol(goal){return goal==="cut"?C.orange:goal==="bulk"?C.blue:C.lime;}
 const gLabel = goal => goal==="cut"?"Cutting":goal==="bulk"?"Bulking":"Maintaining";
+// One day's actual-vs-target kcal/protein, using the SAME goal-locking and weight-fallback
+// rules as the History day-row status dot (see HistoryTab) — kept as a standalone function
+// (rather than shared with that row) so the Progress Overview aggregate can't be broken by an
+// edit to the row's own rendering, and vice versa.
+function dayAdherence(log, date, weights, profile) {
+  const actKcal = (log.activities||[]).reduce((s,a)=>s+a.kcal,0) + (log.burnedExtra||0);
+  const totals = (log.meals||[]).reduce((a,m)=>({kcal:a.kcal+m.kcal,protein:a.protein+(m.protein||0)}),{kcal:0,protein:0});
+  const dayWeight = weights.find(w=>w.date===date)?.weight;
+  const wForDay = dayWeight || weights[0]?.weight || profile?.targetWeightKg || 70;
+  const historicalGoal = log.goalMode || profile?.goal || "cut";
+  const histProfile = {...(profile||{}), goal: historicalGoal, goalSubmode: log.goalSubmode || historicalGoal};
+  const dayTarget = getDT(histProfile, log.dayType||"rest", wForDay, actKcal, (log.activities||[]).length>0, log.dailySteps||0);
+  return {kcal:totals.kcal, protein:totals.protein, targetKcal:dayTarget?.kcal||0, targetProtein:dayTarget?.protein||0, hasLog:(log.meals||[]).length>0};
+}
+// Aggregates dayAdherence() over the most recent N days that actually have a log, for the
+// Progress Overview/Trends cards. Days with nothing logged are excluded from the averages
+// (an unlogged day isn't "0 kcal", it's missing data) but counted in `loggedDays`/`totalDays`
+// so "5/7 days on target" style copy still reads correctly against the real window size.
+function adherenceWindow(dates, logs, weights, profile, days) {
+  const window = dates.slice(0, days);
+  const rows = window.map(d => logs[d] ? dayAdherence(logs[d], d, weights, profile) : null).filter(r => r && r.hasLog);
+  const n = rows.length;
+  const onTarget = rows.filter(r => r.targetKcal>0 && r.kcal<=r.targetKcal+150).length;
+  return {
+    totalDays: window.length, loggedDays: n, onTarget,
+    avgKcal: n ? rows.reduce((s,r)=>s+r.kcal,0)/n : null,
+    avgTargetKcal: n ? rows.reduce((s,r)=>s+r.targetKcal,0)/n : null,
+    avgProtein: n ? rows.reduce((s,r)=>s+r.protein,0)/n : null,
+    avgTargetProtein: n ? rows.reduce((s,r)=>s+r.targetProtein,0)/n : null,
+  };
+}
+// Weeks-to-target from the current weight trend. Returns null when there's no target, no
+// trend, or the trend is heading the WRONG way (e.g. cutting but trending up) — a negative or
+// infinite ETA is not a projection worth showing, it's a sign to look at adherence instead.
+function weeksToTarget(latestWeight, targetWeightKg, trendKgPerWeek) {
+  if (latestWeight==null || targetWeightKg==null || !trendKgPerWeek) return null;
+  const remaining = targetWeightKg - latestWeight; // +ve = need to gain, -ve = need to lose
+  if (Math.sign(remaining) !== Math.sign(trendKgPerWeek)) return null; // trend points away from target
+  const weeks = remaining / trendKgPerWeek;
+  return weeks>0 && Number.isFinite(weeks) ? Math.round(weeks) : null;
+}
 // The goal badge used to be a bare word ("Cut") in a tinted pill — easy to miss, and it read
 // as a category tag rather than the mode the whole screen's numbers are computed in. This gives
 // it a direction glyph (down / up / level), the eyebrow "GOAL" so its role is explicit, and a
@@ -2736,6 +2782,45 @@ async function aLabel(imgs, apiKey) {
       + '{"name":"","kcal":0,"p":0,"c":0,"f":0,"subtitle":"","packSizeG":null,"servingG":null}' },
     ...iBlks(c),
   ], apiKey, VISION_MODEL, 600);
+}
+// Barcode lookup via Open Food Facts — free, no API key, CORS-enabled, called directly from the
+// browser (same pattern this app already uses for the AI calls, just a different provider).
+// Returns null when the barcode isn't in their database rather than throwing, since "not found"
+// is a completely normal, expected outcome here and the caller should fall back to manual entry
+// rather than show it as an error.
+async function lookupBarcode(code) {
+  const digits = String(code||"").replace(/\D/g,"");
+  if (!digits) return null;
+  const res = await fetch(`https://world.openfoodfacts.org/api/v2/product/${digits}.json?fields=product_name,brands,nutriments,quantity,serving_size`);
+  if (!res.ok) throw new Error(`Lookup failed (${res.status})`);
+  const data = await res.json();
+  if (data.status !== 1 || !data.product) return null;
+  const p = data.product;
+  const n = p.nutriments || {};
+  // Prefer the explicit per-100g fields; Open Food Facts occasionally omits kcal but has the kJ
+  // figure, so fall back to converting that rather than reporting a false "not found".
+  const kcal = n["energy-kcal_100g"] ?? (n["energy_100g"] != null ? Math.round(n["energy_100g"]/4.184) : null);
+  if (kcal == null) return null; // no usable macro data — treat like "not found"
+  const name = [p.brands, p.product_name].filter(Boolean).join(" ").trim() || p.product_name || "Unknown product";
+  // "quantity" is a free-text field ("250 g", "1 L", "6x33cl") — only trust it when it resolves
+  // cleanly to a single gram figure; anything else is left for the user to fill in.
+  const qm = /^([\d.,]+)\s*(g|ml|kg|l)\b/i.exec((p.quantity||"").trim());
+  let packSizeG = null;
+  if (qm) {
+    const val = parseFloat(qm[1].replace(",","."));
+    const unit = qm[2].toLowerCase();
+    packSizeG = unit==="kg"||unit==="l" ? val*1000 : val;
+  }
+  const sm = /^([\d.,]+)\s*g/i.exec((p.serving_size||"").trim());
+  const servingG = sm ? parseFloat(sm[1].replace(",",".")) : null;
+  return {
+    name, barcode: digits,
+    kcal: Math.round(kcal),
+    p: Math.round((n.proteins_100g||0)*10)/10,
+    c: Math.round((n.carbohydrates_100g||0)*10)/10,
+    f: Math.round((n.fat_100g||0)*10)/10,
+    packSizeG, servingG,
+  };
 }
 
 // Parse a pasted recipe text and/or photo(s) of a recipe (cookbook page, screenshot, note)
@@ -4247,8 +4332,48 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
   </div>);
 }
 
-function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,initialMode}){
-  const [mode,setMode]=useState(initialMode||"photos");const [mt,setMt]=useState("home");const [desc,setDesc]=useState("");const [imgs,setImgs]=useState([]);const [result,setResult]=useState(null);const [loading,setLoading]=useState(false);const [err,setErr]=useState(null);const [form,setForm]=useState({name:"",kcal:"",protein:"",carbs:"",fat:"",notes:""});const [mealType,setMealType]=useState(mealTypeByTime());const [mealTypeTouched,setMealTypeTouched]=useState(false);const [gramsEaten,setGramsEaten]=useState("");const [per100,setPer100]=useState(null);const [aiNotes,setAiNotes]=useState("");
+function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,initialMode,aiPrefs,mealFavorites,setMealFavorites}){
+  const mealAnalysisOn = aiPrefs?.mealAnalysis ?? true;
+  // "quick" (Recent + Favourites) is the default landing screen for an unspecified open — the
+  // advanced tools (Photos/Barcode/Labels/Manual/Prep) are one tap away rather than the first
+  // thing shown, since most days the thing being logged was already logged recently.
+  const initial = initialMode || "quick";
+  const [mode,setMode]=useState(initial==="photos"&&!mealAnalysisOn?"manual":initial);const [mt,setMt]=useState("home");const [desc,setDesc]=useState("");const [imgs,setImgs]=useState([]);const [result,setResult]=useState(null);const [loading,setLoading]=useState(false);const [err,setErr]=useState(null);const [form,setForm]=useState({name:"",kcal:"",protein:"",carbs:"",fat:"",notes:""});const [mealType,setMealType]=useState(mealTypeByTime());const [mealTypeTouched,setMealTypeTouched]=useState(false);const [gramsEaten,setGramsEaten]=useState("");const [per100,setPer100]=useState(null);const [aiNotes,setAiNotes]=useState("");
+  // Recent — derived from the last 14 days of logs (loaded once on mount), grouped by
+  // normalized meal name to the most recent occurrence. Not persisted state: it's a read of
+  // history, same idea as the Coach's own recent-logs fetch.
+  const [recentMeals,setRecentMeals]=useState(null); // null = still loading
+  useEffect(()=>{
+    if(mode!=="quick"||recentMeals!==null)return;
+    (async()=>{
+      const ds=await store.get("fit_dates",[]);
+      const byName=new Map();
+      for(const d of ds.slice(0,14)){
+        const log=await store.get(`fit_day_${d}`,null);
+        for(const m of (log?.meals||[])){
+          const key=normExName(m.name);
+          if(!key)continue;
+          const cur=byName.get(key);
+          if(!cur||d>cur.date) byName.set(key,{name:m.name,date:d,time:m.time,kcal:m.kcal,protein:m.protein,carbs:m.carbs,fat:m.fat,mealType:m.mealType,count:(cur?.count||0)+1});
+          else cur.count+=1;
+        }
+      }
+      setRecentMeals([...byName.values()].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,8));
+    })();
+  },[mode,recentMeals]);
+  const relativeDay=d=>{
+    if(d===TODAY())return"today";
+    const y=new Date(TODAY()+"T12:00:00");y.setDate(y.getDate()-1);
+    if(d===y.toISOString().split("T")[0])return"yesterday";
+    return new Date(d+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"});
+  };
+  const logQuickItem=item=>{
+    onAdd({id:Date.now(),mealType:item.mealType||mealTypeByTime(),name:item.name,kcal:item.kcal,protein:item.protein,carbs:item.carbs,fat:item.fat,notes:item.notes,ingredients:item.ingredients,time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})});
+  };
+  const saveAsFavorite=item=>{
+    if(!setMealFavorites)return;
+    setMealFavorites(p=>p.some(f=>normExName(f.name)===normExName(item.name))?p:[...p,{id:Date.now()+Math.random(),name:item.name,kcal:item.kcal,protein:item.protein,carbs:item.carbs,fat:item.fat,mealType:item.mealType}]);
+  };
   // Manual-mode label picker state: build a meal from one or more label entries
   const [manualLabels,setManualLabels]=useState([]); // [{id, name, weightG, kcal, protein, carbs, fat}]
   const [mPickOpen,setMPickOpen]=useState(false);
@@ -4298,7 +4423,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
         })));
       }
     }
-  }catch(e){setErr(String(e.message||e));}setLoading(false);};
+  }catch(e){setErr({friendly:"Meal analysis failed. Try again.", detail:String(e.message||e)});}setLoading(false);};
   // Recalculate totals from confirmed ingredient list
   const recalcFromIngredients=()=>{
     if(!ingredients)return;
@@ -4342,12 +4467,59 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
   // already tolerates zero photos (the prompt conditionally includes photo-reading instructions
   // only when photos exist); the gate here was the only thing stopping a description-only log.
   const canAnalyze=!loading&&(imgs.length>0||desc.trim().length>5);
+  // Barcode is a stacked sheet rather than a `mode` value — it's a self-contained scan → lookup
+  // → log flow (same component the global Quick Log FAB uses) that either logs directly or is
+  // backed out of, never a multi-step form living inside this one's own mode machinery.
+  const [showBarcode,setShowBarcode]=useState(false);
   return(<Sheet onClose={onClose} title="Log Meal">
-    <div style={{display:"flex",gap:5,marginBottom:10,flexWrap:"wrap"}}>{[["📸 Photos","photos"],["🏷️ Labels","labels"],["✏️ Manual","manual"],["🍱 Prep","mealprep"]].map(([lbl,m])=>(<button key={m} onClick={()=>{setMode(m);setResult(null);}} style={{flex:1,minWidth:60,padding:"8px 4px",borderRadius:10,border:`1px solid ${mode===m?C.lime:C.border}`,background:mode===m?`${C.lime}20`:C.card,color:mode===m?C.lime:C.muted,fontWeight:mode===m?700:500,cursor:"pointer",fontSize:11}}>{lbl}</button>))}</div>
-    <div style={{marginBottom:14}}>
+    <div style={{display:"flex",gap:5,marginBottom:10,flexWrap:"wrap"}}>{[["📸 Photos","photos"],["📷 Barcode","barcode"],["🏷️ Labels","labels"],["✏️ Manual","manual"],["🍱 Prep","mealprep"]].map(([lbl,m])=>{
+      const disabled = m==="photos" && !mealAnalysisOn;
+      return(<button key={m} onClick={()=>{if(disabled)return;if(m==="barcode"){setShowBarcode(true);return;}setMode(m);setResult(null);}} disabled={disabled} title={disabled?"AI meal analysis is off — enable in Settings → AI & Privacy":undefined}
+        style={{flex:1,minWidth:60,padding:"8px 4px",borderRadius:10,border:`1px solid ${mode===m?C.lime:C.border}`,background:mode===m?`${C.lime}20`:C.card,color:mode===m?C.lime:disabled?C.muted2:C.muted,fontWeight:mode===m?700:500,cursor:disabled?"default":"pointer",fontSize:11,opacity:disabled?0.5:1}}>{lbl}</button>);
+    })}</div>
+    {mode!=="quick"&&<button onClick={()=>setMode("quick")} style={{background:"none",border:"none",color:C.muted,fontSize:T.sm,textDecoration:"underline",cursor:"pointer",padding:0,marginBottom:12}}>← Recent &amp; Favourites</button>}
+    {showBarcode&&<BarcodeScanSheet onAdd={onAdd} onClose={()=>setShowBarcode(false)}/>}
+    {/* ── Quick pick: Recent + Favourites ── the landing screen for a bare "Log meal" open.
+        Frequently-eaten items are one tap to log again instead of re-running Photos/Labels for
+        the same chicken-and-rice bowl for the third time this week. */}
+    {mode==="quick"&&(<div style={{marginBottom:14}}>
+      <div style={{...eyebrow(),marginBottom:8}}>Favourites</div>
+      {(mealFavorites||[]).length===0
+        ?<div style={{fontSize:T.sm,color:C.muted,marginBottom:14}}>None saved yet — tap ☆ on a recent item below to save it.</div>
+        :<div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:16}}>
+          {mealFavorites.map(f=>(
+            <div key={f.id} style={{display:"flex",alignItems:"center",gap:8,background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"9px 11px"}}>
+              <button onClick={()=>logQuickItem(f)} style={{flex:1,minWidth:0,background:"none",border:"none",textAlign:"left",cursor:"pointer"}}>
+                <div style={{fontSize:T.body,color:C.text,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>⭐ {f.name}</div>
+                <div style={{fontSize:T.sm,color:C.muted,fontFamily:"monospace",marginTop:1}}>{Math.round(f.kcal)} kcal · {Math.round(f.protein)}P · {Math.round(f.carbs)}C · {Math.round(f.fat)}F</div>
+              </button>
+              <button onClick={()=>setMealFavorites(p=>p.filter(x=>x.id!==f.id))} aria-label={`Remove ${f.name} from favourites`} style={{flexShrink:0,background:"none",border:"none",color:C.faint,fontSize:16,padding:"0 2px"}}>×</button>
+            </div>
+          ))}
+        </div>}
+
+      <div style={{...eyebrow(),marginBottom:8}}>Recent</div>
+      {recentMeals===null
+        ?<div style={{fontSize:T.sm,color:C.muted}}>Loading…</div>
+        :recentMeals.length===0
+        ?<div style={{fontSize:T.sm,color:C.muted,marginBottom:10}}>Nothing logged in the last two weeks yet.</div>
+        :<div style={{display:"flex",flexDirection:"column",gap:6}}>
+          {recentMeals.map(m=>(
+            <div key={m.name+m.date} style={{display:"flex",alignItems:"center",gap:8,background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"9px 11px"}}>
+              <button onClick={()=>logQuickItem(m)} style={{flex:1,minWidth:0,background:"none",border:"none",textAlign:"left",cursor:"pointer"}}>
+                <div style={{fontSize:T.body,color:C.text,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.name}</div>
+                <div style={{fontSize:T.sm,color:C.muted,marginTop:1}}>{relativeDay(m.date)}{m.count>1?` · ${m.count}× this window`:""} · <span style={{fontFamily:"monospace"}}>{Math.round(m.kcal)} kcal</span></div>
+              </button>
+              <button onClick={()=>saveAsFavorite(m)} aria-label={`Save ${m.name} as a favourite`} style={{flexShrink:0,background:"none",border:"none",color:C.yellow,fontSize:18,padding:"0 4px"}}>☆</button>
+            </div>
+          ))}
+        </div>}
+      <div style={{fontSize:T.sm,color:C.muted,marginTop:14,textAlign:"center"}}>Or use Photos, Barcode, Labels, Manual or Prep above.</div>
+    </div>)}
+    {mode!=="quick"&&<div style={{marginBottom:14}}>
       <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Meal type</div>
       <div style={{display:"flex",gap:5}}>{[["🌅","breakfast","Breakfast"],["☀️","lunch","Lunch"],["🌙","dinner","Dinner"],["🍎","snack","Snack"],["🥤","drink","Drink"]].map(([ic,id,lbl])=>{const active=mealType===id;return(<button key={id} onClick={()=>{setMealType(id);setMealTypeTouched(true);}} style={{flex:1,padding:"6px 2px",borderRadius:8,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,fontWeight:active?700:400,cursor:"pointer",fontSize:9,lineHeight:1.5,textAlign:"center"}}><div style={{fontSize:T.body}}>{ic}</div><div>{lbl}</div></button>);})}</div>
-    </div>
+    </div>}
     {/* ── Labels mode (issue 2) ── */}
     {mode==="labels"&&(<div>
       {lblItems.length>0&&<div style={{display:"flex",flexDirection:"column",gap:5,marginBottom:10}}>
@@ -4397,14 +4569,22 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
         <button onClick={()=>{const tot=lblItems.reduce((a,b)=>({kcal:a.kcal+b.kcal,protein:a.protein+b.protein,carbs:a.carbs+b.carbs,fat:a.fat+b.fat}),{kcal:0,protein:0,carbs:0,fat:0});const name=lblItems.length===1?lblItems[0].name:lblItems.map(l=>l.name.split(" ")[0]).join(" + ");const ings=lblItems.map(l=>({name:l.name,weightG:String(Math.round(l.weightG)),kcal:l.kcal/l.weightG*100,protein:l.protein/l.weightG*100,carbs:l.carbs/l.weightG*100,fat:l.fat/l.weightG*100}));onAdd({id:Date.now(),mealType,name,kcal:Math.round(tot.kcal),protein:Math.round(tot.protein*10)/10,carbs:Math.round(tot.carbs*10)/10,fat:Math.round(tot.fat*10)/10,ingredients:ings,notes:lblItems.map(l=>l.name+" "+Math.round(l.weightG)+"g").join(", "),time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})});}} style={{width:"100%",padding:"12px 0",borderRadius:10,background:C.lime,color:"#000",fontWeight:800,border:"none",cursor:"pointer",fontSize:15}}>Log Meal ({lblItems.length} item{lblItems.length!==1?"s":""})</button>
       </div>);})()}
     </div>)}
-    {mode==="photos"&&!result&&(<>
+    {mode==="photos"&&!mealAnalysisOn&&(
+      <div style={{background:C.bg,border:`1px dashed ${C.border}`,borderRadius:10,padding:"16px",textAlign:"center"}}>
+        <div style={{fontSize:12,color:C.muted,lineHeight:1.6}}>AI meal analysis is turned off in Settings → AI &amp; Privacy. Use Labels, Manual or Prep instead, or turn it back on.</div>
+      </div>
+    )}
+    {mode==="photos"&&mealAnalysisOn&&!result&&(<>
       <div style={{display:"flex",gap:6,marginBottom:10}}>{[["Home cooked","home"],["Eating Out","canteen"]].map(([lbl,t])=>(<button key={t} onClick={()=>setMt(t)} style={{flex:1,padding:"8px 6px",borderRadius:8,border:`1px solid ${mt===t?C.lime:C.border}`,background:mt===t?`${C.lime}12`:C.bg,color:mt===t?C.lime:C.muted,fontWeight:mt===t?600:400,cursor:"pointer",fontSize:11}}>{lbl}</button>))}</div>
       <div style={{marginBottom:10}}>
         <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>{mt==="canteen"?"Describe the meal (or attach a photo)":"Meal name / description (or attach a photo)"}</div>
         <textarea value={desc} onChange={e=>setDesc(e.target.value)} rows={2} placeholder={mt==="canteen"?"e.g. Grilled chicken ~150g, buckwheat, salad, butter sauce on side":"e.g. Overnight oats with banana and peanut butter"} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:T.body,outline:"none",resize:"none",fontFamily:"inherit"}}/>
       </div>
       <ImgZone imgs={imgs} setImgs={setImgs} maxPhotos={15}/>
-      {err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ff8080",margin:"8px 0",wordBreak:"break-word"}}>{err}</div>}
+      {err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ff8080",margin:"8px 0",wordBreak:"break-word"}}>
+        {err.friendly||String(err)}
+        {err.detail&&<details style={{marginTop:4}}><summary style={{cursor:"pointer",color:"#ff8080cc",fontSize:10}}>Details</summary><div style={{marginTop:3,fontFamily:"monospace",fontSize:10,opacity:0.85}}>{err.detail}</div></details>}
+      </div>}
       <button onClick={analyze} disabled={!canAnalyze} style={{width:"100%",padding:"12px 0",borderRadius:10,background:canAnalyze?C.lime:C.faint,color:"#000",fontWeight:700,border:"none",cursor:canAnalyze?"pointer":"default",fontSize:15,marginTop:10}}>
         {loading?"Analyzing…":imgs.length>0?`Analyze ${imgs.length} photo${imgs.length!==1?"s":""}${desc.trim()?" + description":""}`:"Estimate from description"}
       </button>
@@ -4529,6 +4709,125 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
   </Sheet>);
 }
 
+// Barcode scan → Open Food Facts lookup → portion → log. Camera scanning is a progressive
+// enhancement (BarcodeDetector isn't universal — notably weaker Safari support), so manual
+// digit entry is always available and is the reliable path on any device. A successful lookup
+// that gets logged also lands in `newProduct` on the returned entry, so it joins the pantry the
+// same way an AI-scanned label does — no separate "save to labels" step needed.
+function BarcodeScanSheet({onAdd,onClose}){
+  const [manualCode,setManualCode]=useState("");
+  const [scanning,setScanning]=useState(false);
+  const [scanErr,setScanErr]=useState(null);
+  const [looking,setLooking]=useState(false);
+  const [lookupErr,setLookupErr]=useState(null);
+  const [found,setFound]=useState(null); // result of lookupBarcode()
+  const [notFoundCode,setNotFoundCode]=useState(null);
+  const [grams,setGrams]=useState("100");
+  const [mealType,setMealType]=useState(mealTypeByTime());
+  const videoRef=useRef(null);
+  const streamRef=useRef(null);
+  const cameraSupported = typeof window!=="undefined" && "BarcodeDetector" in window;
+
+  const doLookup = async (code) => {
+    setLooking(true); setLookupErr(null); setFound(null); setNotFoundCode(null);
+    try {
+      const res = await lookupBarcode(code);
+      if (res) { setFound(res); setGrams(res.servingG?String(res.servingG):"100"); }
+      else setNotFoundCode(code.replace(/\D/g,""));
+    } catch(e) {
+      setLookupErr({friendly:"Couldn't look that up. Check your connection and try again.", detail:String(e.message||e)});
+    }
+    setLooking(false);
+  };
+
+  const stopCamera = () => {
+    setScanning(false);
+    if (streamRef.current) { streamRef.current.getTracks().forEach(t=>t.stop()); streamRef.current=null; }
+  };
+  const startCamera = async () => {
+    setScanErr(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}});
+      streamRef.current = stream;
+      setScanning(true);
+      if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play(); }
+      const detector = new window.BarcodeDetector({formats:["ean_13","ean_8","upc_a","upc_e","code_128"]});
+      const tick = async () => {
+        if (!streamRef.current || !videoRef.current) return;
+        try {
+          const codes = await detector.detect(videoRef.current);
+          if (codes.length) { stopCamera(); doLookup(codes[0].rawValue); return; }
+        } catch {}
+        if (streamRef.current) requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    } catch(e) {
+      setScanErr("Camera unavailable — " + (e.name==="NotAllowedError"?"permission denied.":"enter the barcode below instead."));
+      setScanning(false);
+    }
+  };
+  useEffect(() => stopCamera, []); // stop the camera stream if the sheet closes mid-scan
+
+  const macrosFor = g => {
+    const s = (parseFloat(g)||0)/100;
+    return {kcal:Math.round(found.kcal*s), protein:Math.round(found.p*s*10)/10, carbs:Math.round(found.c*s*10)/10, fat:Math.round(found.f*s*10)/10};
+  };
+
+  const logIt = () => {
+    const g = parseFloat(grams)||0; if (g<=0) return;
+    const m = macrosFor(g);
+    onAdd({
+      id:Date.now(), mealType, name:found.name, kcal:m.kcal, protein:m.protein, carbs:m.carbs, fat:m.fat,
+      notes:`${Math.round(g)}g · scanned barcode`, time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"}),
+      newProduct:{name:found.name, kcal:found.kcal, p:found.p, c:found.c, f:found.f, packSizeG:found.packSizeG, servingG:found.servingG, barcode:found.barcode, categories:[], addedAt:Date.now()},
+    });
+  };
+
+  return(<Sheet onClose={onClose} title="Scan Barcode">
+    {!found&&!notFoundCode&&(<>
+      {cameraSupported?(<div style={{marginBottom:14}}>
+        {scanning?(<div style={{position:"relative",borderRadius:12,overflow:"hidden",background:"#000"}}>
+          <video ref={videoRef} playsInline muted style={{width:"100%",display:"block"}}/>
+          <div style={{position:"absolute",inset:0,border:`2px solid ${C.lime}80`,borderRadius:12,pointerEvents:"none"}}/>
+          <button onClick={stopCamera} style={{position:"absolute",bottom:10,left:"50%",transform:"translateX(-50%)",padding:"8px 16px",borderRadius:20,background:"rgba(0,0,0,.6)",border:"none",color:"#fff",fontSize:T.sm}}>Cancel scan</button>
+        </div>):(
+          <button onClick={startCamera} style={{width:"100%",padding:"14px 0",borderRadius:10,background:C.lime,border:"none",color:"#000",fontWeight:700,fontSize:T.body}}>📷 Scan with camera</button>
+        )}
+        {scanErr&&<div style={{fontSize:T.sm,color:C.red,marginTop:8}}>{scanErr}</div>}
+      </div>):(
+        <div style={{fontSize:T.sm,color:C.muted,marginBottom:14,lineHeight:1.5}}>Camera barcode scanning isn't supported in this browser — enter the barcode number instead (it's printed under the barcode lines on the pack).</div>
+      )}
+      <div style={{display:"flex",gap:8}}>
+        <input type="text" inputMode="numeric" pattern="[0-9]*" placeholder="Barcode number" value={manualCode} onChange={e=>setManualCode(e.target.value.replace(/\D/g,""))} style={{flex:1,minHeight:44,background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.text,fontFamily:"monospace",fontSize:16,outline:"none"}}/>
+        <button onClick={()=>doLookup(manualCode)} disabled={!manualCode.trim()||looking} style={{padding:"0 18px",minHeight:44,borderRadius:R.sm,background:manualCode.trim()&&!looking?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,fontSize:T.body}}>{looking?"…":"Look up"}</button>
+      </div>
+      {lookupErr&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ff8080",marginTop:10}}>{lookupErr.friendly}<details style={{marginTop:4}}><summary style={{cursor:"pointer",color:"#ff8080cc",fontSize:10}}>Details</summary><div style={{marginTop:3,fontFamily:"monospace",fontSize:10,opacity:0.85}}>{lookupErr.detail}</div></details></div>}
+    </>)}
+
+    {notFoundCode&&(<div style={{textAlign:"center",padding:"14px 4px"}}>
+      <div style={{fontSize:T.body,color:C.text,marginBottom:6}}>No match for barcode <span style={{fontFamily:"monospace"}}>{notFoundCode}</span></div>
+      <div style={{fontSize:T.sm,color:C.muted,marginBottom:14}}>Not every product is in the Open Food Facts database yet — you can still add it by photo or manually.</div>
+      <button onClick={()=>{setNotFoundCode(null);setManualCode("");}} style={{padding:"9px 18px",minHeight:44,borderRadius:8,background:"none",border:`1px solid ${C.border}`,color:C.text,fontSize:T.body}}>← Try another code</button>
+    </div>)}
+
+    {found&&(<div>
+      <div style={{fontSize:T.h3,fontWeight:700,color:C.lime,marginBottom:3}}>{found.name}</div>
+      <div style={{fontSize:T.sm,color:C.muted,marginBottom:10,fontFamily:"monospace"}}>{found.kcal} kcal · {found.p}g P · {found.c}g C · {found.f}g F per 100g</div>
+      <div style={{display:"flex",gap:4,marginBottom:12}}>{[["🌅","breakfast"],["☀️","lunch"],["🌙","dinner"],["🍎","snack"],["🥤","drink"]].map(([ic,id])=>{const a=mealType===id;return(<button key={id} onClick={()=>setMealType(id)} style={{flex:1,padding:"6px 0",borderRadius:8,border:`1px solid ${a?C.lime:C.border}`,background:a?`${C.lime}18`:C.bg,fontSize:15}}>{ic}</button>);})}</div>
+      <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:6}}>
+        <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" value={grams} onChange={e=>setGrams(e.target.value.replace(",","."))} autoFocus style={{width:90,minHeight:44,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.lime,fontFamily:"monospace",fontWeight:700,fontSize:16,outline:"none"}}/>
+        <span style={{color:C.muted,fontSize:T.body}}>g</span>
+        {found.servingG&&<button onClick={()=>setGrams(String(found.servingG))} style={{fontSize:T.sm,color:C.lime,background:"none",border:`1px solid ${C.border}`,borderRadius:6,padding:"4px 8px"}}>serving {found.servingG}g</button>}
+        {found.packSizeG&&<button onClick={()=>setGrams(String(found.packSizeG))} style={{fontSize:T.sm,color:C.orange,background:"none",border:`1px solid ${C.border}`,borderRadius:6,padding:"4px 8px"}}>📦 whole pack {found.packSizeG}g</button>}
+      </div>
+      {parseFloat(grams)>0&&(()=>{const m=macrosFor(grams);return(<div style={{display:"flex",gap:10,marginBottom:14}}><Chip val={m.kcal} label="kcal" color={C.lime}/><Chip val={m.protein} label="P" color={C.blue}/><Chip val={m.carbs} label="C" color={C.orange}/><Chip val={m.fat} label="F" color={C.purple}/></div>);})()}
+      <div style={{display:"flex",gap:8}}>
+        <button onClick={()=>{setFound(null);setManualCode("");}} style={{flex:1,padding:"11px 0",minHeight:44,borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,fontSize:T.body}}>← Back</button>
+        <button onClick={logIt} disabled={!(parseFloat(grams)>0)} style={{flex:2,padding:"11px 0",minHeight:44,borderRadius:10,background:parseFloat(grams)>0?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,fontSize:T.body}}>Log it</button>
+      </div>
+    </div>)}
+  </Sheet>);
+}
 function AddActSheet({onAdd,onClose,apiKey,weightKg}){
   const [type,setType]=useState("run");const [dist,setDist]=useState("");const [dur,setDur]=useState("");const [kcal,setKcal]=useState("");const [imgs,setImgs]=useState([]);const [loading,setLoading]=useState(false);const [err,setErr]=useState(null);
   const est=distanceKcal(type,parseFloat(dist)||0,weightKg);const finalKcal=parseFloat(kcal)||est;
@@ -4696,6 +4995,34 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
 // A titled card. Roughly forty hand-rolled copies of this exact container existed, each with
 // its own padding and radius, which is where the "every block looks equally important" feeling
 // came from. One component means one visual weight, and changing it changes all of them.
+// ── Undo ──────────────────────────────────────────────────────────────────────
+// Shared 5-second "Undo" toast for reversible deletes (meal, activity, weight). Previously only
+// weight-delete had this — meals and activities on Today deleted immediately with a native
+// confirm() or nothing at all, which is a jarring inconsistency and no safety net for a
+// fat-fingered tap. The hook only owns the toast/timer; each caller still does its own
+// remove/restore since every list has its own shape and sort rule (weights re-sort by date,
+// meals/activities restore at their original index).
+function useUndoToast() {
+  const [pending, setPending] = useState(null); // {label, onUndo, timeout}
+  const show = (label, onUndo) => {
+    setPending(prev => { if (prev?.timeout) clearTimeout(prev.timeout); return null; });
+    const t = setTimeout(() => setPending(null), 5000);
+    setPending({label, onUndo, timeout: t});
+  };
+  // Clear the timer on unmount (e.g. navigating away mid-toast) so it can't fire setState on a
+  // gone component.
+  useEffect(() => () => { setPending(prev => { if (prev?.timeout) clearTimeout(prev.timeout); return prev; }); }, []);
+  const undo = () => { if (!pending) return; clearTimeout(pending.timeout); pending.onUndo(); setPending(null); };
+  const dismiss = () => { if (!pending) return; clearTimeout(pending.timeout); setPending(null); };
+  return { pending, show, undo, dismiss };
+}
+function UndoToast({pending, onUndo, bottom=80}) {
+  if (!pending) return null;
+  return (<div role="status" style={{position:"absolute",bottom,left:16,right:16,background:C.card,border:`1px solid ${C.lime}`,borderRadius:R.md,padding:`${SP.sm}px ${SP.md}px ${SP.sm}px ${SP.lg}px`,display:"flex",alignItems:"center",justifyContent:"space-between",gap:SP.md,zIndex:20,boxShadow:"0 4px 16px rgba(0,0,0,0.4)",animation:`toastIn .2s ${EASE.out}`}}>
+    <div style={{fontSize:T.sm,color:C.text,fontWeight:600,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{pending.label}</div>
+    <button onClick={onUndo} style={{flexShrink:0,padding:"6px 14px",minHeight:36,borderRadius:7,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:T.sm}}>↶ Undo</button>
+  </div>);
+}
 function Card({title, right, children, accent, style}){
   return(<section style={{background:C.card,border:`1px solid ${accent?accent+"55":C.border}`,borderRadius:R.md,padding:`${SP.md}px ${SP.lg}px`,marginBottom:SP.md,...style}}>
     {(title||right)&&<header style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:SP.md,gap:SP.sm}}>
@@ -4909,7 +5236,7 @@ function XpDetailSheet({xp, profile, setProfile, onClose}){
     </div>
   </Sheet>);
 }
-function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProducts,profile,setProfile,latestWeight,weights,setWeights,onGoToSettings,medications,medLog,onMarkMed,gymSessions,progress,gymDayAssign}){
+function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProducts,profile,setProfile,latestWeight,weights,setWeights,onGoToSettings,medications,medLog,onMarkMed,gymSessions,progress,gymDayAssign,mealFavorites,setMealFavorites}){
   // Which specific numbered training plan (if any) is assigned to today's weekday — lets the
   // burn model use history from the SAME plan rather than pooling every gym day together.
   const todayDayId=(gymDayAssign||{})[new Date().getDay()]||null;
@@ -4991,7 +5318,17 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
     setModal(null);
   };
   const updateMeal=updated=>{setDayData(p=>({...p,meals:p.meals.map(m=>m.id===updated.id?updated:m)}));setEditingMealId(null);};
-  const deleteMeal=id=>{setDayData(p=>({...p,meals:p.meals.filter(m=>m.id!==id)}));setEditingMealId(null);setExpandedMealId(null);};
+  const mealUndo=useUndoToast();
+  const deleteMeal=id=>{
+    const idx=dayData.meals.findIndex(m=>m.id===id);
+    if(idx===-1)return;
+    const removed=dayData.meals[idx];
+    setDayData(p=>({...p,meals:p.meals.filter(m=>m.id!==id)}));
+    setEditingMealId(null);setExpandedMealId(null);
+    mealUndo.show(`Meal deleted — ${removed.name}`, ()=>{
+      setDayData(p=>({...p,meals:[...p.meals.slice(0,idx),removed,...p.meals.slice(idx)]}));
+    });
+  };
   const toggleTag=tagId=>{const tags=dayData.tags||[];setDayData(p=>({...p,tags:tags.includes(tagId)?tags.filter(t=>t!==tagId):[...tags,tagId]}));};
   return(<div style={{height:"100%",position:"relative"}}>
     <div style={{height:"100%",overflowY:"auto",padding:"0 16px 90px"}}>
@@ -5008,9 +5345,12 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
           number the screen is opened to check. */}
       {!dt.unavailable&&<BudgetHero tot={tot} dt={dt} remKcal={remKcal} remProt={remProt} goal={profile.goal}/>}
 
-      <LevelBar xp={progress?.xp} onOpen={()=>setShowXp(true)}/>
+      {/* Gamification is opt-out, not forced — Settings → Motivation. Someone who wants a plain
+          calorie tracker shouldn't have to scroll past a level bar and streak strip every time
+          they open the app to check how much they have left today. */}
+      {(profile?.motivationPrefs?.showXp??true)&&<LevelBar xp={progress?.xp} onOpen={()=>setShowXp(true)}/>}
 
-      <StreakStrip progress={progress} medsConfigured={(medications||[]).some(m=>m.active!==false)}/>
+      {(profile?.motivationPrefs?.showStreaks??true)&&<StreakStrip progress={progress} medsConfigured={(medications||[]).some(m=>m.active!==false)}/>}
 
       {/* Medication/supplement reminders — one compact section for every window that has opened
           today and hasn't been marked yet, instead of repeating "Morning reminder" etc. on every
@@ -5165,17 +5505,14 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
         </div>
       </div>
     </div>
-    {/* Primary action. Kept circular on purpose: a wider "Log meal" pill reads better but
-        parks itself over the macro rings, and obscuring the day's numbers costs more than
-        the label gains. aria-label carries the meaning instead — announced as just "plus"
-        before, which told a screen-reader user nothing about what it adds. */}
-    <button onClick={()=>setModal("meal")} aria-label="Log a meal"
-      style={{position:"absolute",bottom:18,right:16,width:56,height:56,borderRadius:"50%",background:C.lime,border:"none",fontSize:29,color:"#000",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 6px 22px ${C.lime}40, 0 2px 8px rgba(0,0,0,.45)`,zIndex:10}}>
-      <span aria-hidden="true" style={{marginTop:-3,fontWeight:400}}>+</span>
-    </button>
-    {(modal==="meal"||modal==="mealprep")&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleAdd} onClose={()=>setModal(null)} apiKey={profile.apiKey} initialMode={modal==="mealprep"?"mealprep":"photos"}/>}
+    {/* The floating "+" itself is now the global Quick Log FAB rendered once in App() (reachable
+        from every tab, not just Today) — this sheet mount stays for the empty-state "+ Log your
+        first meal" and the active-prep "+ Eat" buttons above, which still need their own route
+        into AddMealSheet. */}
+    {(modal==="meal"||modal==="mealprep")&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleAdd} onClose={()=>setModal(null)} apiKey={profile.apiKey} aiPrefs={profile.aiPrefs} initialMode={modal==="mealprep"?"mealprep":"quick"} mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
     {showXp&&progress?.xp&&<XpDetailSheet xp={progress.xp} profile={profile} setProfile={setProfile} onClose={()=>setShowXp(false)}/>}
     {levelUp&&<LevelUpToast info={levelUp} xp={progress?.xp} onClose={()=>setLevelUp(null)}/>}
+    <UndoToast pending={mealUndo.pending} onUndo={mealUndo.undo}/>
   </div>);
 }
 // The level-up moment. Full-screen and dismiss-on-tap on purpose: a toast in the corner would
@@ -6221,8 +6558,11 @@ function GymSetupSheet({gymSchedule,setGymSchedule,gymSettings,setGymSettings,gy
   const setPreference=pr=>setGymSettings(p=>({...(p||{}),comboPreference:pr}));
 
   // Auto-builder: pick which weekdays to generate for (defaults to the days already marked as
-  // gym days that don't have a plan yet) and it fills them in using the preference above.
-  const [autoOpen,setAutoOpen]=useState(false);
+  // gym days that don't have a plan yet) and it fills them in using the preference above. Open
+  // by default when there's no plan yet at all — that's "Simple Setup": choose days, get a
+  // standard split, done. Someone who already has a plan is past that stage and is here to
+  // adjust a specific day, so it stays collapsed and out of the way for them.
+  const [autoOpen,setAutoOpen]=useState(()=>gymDayIds(gymTemplates).length===0);
   const [autoDays,setAutoDays]=useState(()=>(gymSchedule||[]).length?(gymSchedule||[]):[1,3,5]);
   const [autoPreview,setAutoPreview]=useState(null); // {templates, dayTypeLabels} once generated, shown before applying
   const toggleAutoDay=wd=>setAutoDays(prev=>prev.includes(wd)?prev.filter(x=>x!==wd):[...prev,wd].sort((a,b)=>WEEKDAY_ORDER.indexOf(a)-WEEKDAY_ORDER.indexOf(b)));
@@ -6265,7 +6605,7 @@ function GymSetupSheet({gymSchedule,setGymSchedule,gymSettings,setGymSettings,gy
       </button>);
     })}</div>
     <div style={{fontSize:T.label,color:C.muted,marginBottom:16,lineHeight:1.45}}>
-      {dayIds.length?"Tap a weekday to cycle which training day runs on it.":"Add a training day below first, then assign it to weekdays."}
+      {dayIds.length?"Tap a weekday to cycle which training day runs on it.":<>Add a training day below, or jump to <b style={{color:C.lime}}>✨ Simple Setup</b> near the bottom to generate a full plan in a few taps.</>}
     </div>
 
     {/* ── The plans themselves ── */}
@@ -6317,12 +6657,14 @@ function GymSetupSheet({gymSchedule,setGymSchedule,gymSettings,setGymSettings,gy
       <span style={{fontSize:11,color:C.muted,flex:1,lineHeight:1.4}}>Optional — shows a heads-up once you've hit this many rounds on a combo, so you know it's about time to move on.</span>
     </div>
 
-    {/* Auto-builder: generates day plans instead of building them by hand, using the
+    {/* Simple Setup — generates day plans instead of building them by hand, using the
         combo/solo/mix preference above and a standard split (full body / upper-lower /
-        push-pull-legs) sized to however many days are picked. */}
+        push-pull-legs) sized to however many days are picked. Everything above and below this
+        card (weekday grid, per-day editing, warmups/cooldowns, substitutions) is the Advanced
+        path — still fully available, just not the thing a first-time setup has to go through. */}
     <div style={{background:C.card,border:`1px solid ${autoOpen?C.lime:C.border}`,borderRadius:12,padding:"12px 14px",marginBottom:16}}>
       <button onClick={()=>{setAutoOpen(p=>!p);setAutoPreview(null);}} style={{width:"100%",background:"none",border:"none",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",padding:0}}>
-        <span style={{fontSize:T.body,fontWeight:600,color:autoOpen?C.lime:C.text}}>🪄 Build my plan for me</span>
+        <span style={{fontSize:T.body,fontWeight:600,color:autoOpen?C.lime:C.text}}>✨ Simple Setup — build my plan for me</span>
         <span style={{fontSize:11,color:C.muted}}>{autoOpen?"▲":"▼"}</span>
       </button>
       {autoOpen&&(<div style={{marginTop:10}}>
@@ -6618,6 +6960,182 @@ function GymHistoryPanel({gymSessions,setGymSessions,gymExerciseLibrary,setGymEx
   </Sheet>);
 }
 
+// Weight log + graph + phase tracker. Previously duplicated three ways (a quick check-in on
+// Today, a full log+graph here, and ANOTHER full log in Settings) — this is now the one place
+// with the complete history, graph and phase tracker; Today keeps only its quick daily
+// check-in, and Settings' copy is gone.
+function WeightProgressCard({profile,weights,setWeights,weightPhases,setWeightPhases}){
+  const [wInput,setWInput]=useState("");const [editWIdx,setEditWIdx]=useState(null);const [editWVal,setEditWVal]=useState("");const [wDate,setWDate]=useState(TODAY());const [showAllW,setShowAllW]=useState(false);
+  const [weightLogOpen,setWeightLogOpen]=useState(true);
+  const weightUndo=useUndoToast();
+  const deleteWeight=(idx)=>{
+    const entry = weights[idx];
+    if (!entry) return;
+    setWeights(p=>p.filter((_,j)=>j!==idx));
+    weightUndo.show(`Weight deleted — ${entry.weight.toFixed(2)} kg`, ()=>{
+      setWeights(p => [entry, ...p.filter(x=>x.date!==entry.date)].sort((a,b)=>b.date.localeCompare(a.date)));
+    });
+  };
+  const latestW=weights[0];
+  const firstW=weights.length>=2?weights[weights.length-1]:null;
+  const overallDelta=firstW&&latestW?latestW.weight-firstW.weight:null;
+  const logWeight=()=>{const w=parseNum(wInput);if(!w)return;const date=wDate||TODAY();const e={date,weight:w};setWeights(p=>[e,...p.filter(x=>x.date!==date)].sort((a,b)=>b.date.localeCompare(a.date)));setWInput("");setWDate(TODAY());};
+  const saveEditW=i=>{const w=parseNum(editWVal);if(!w)return;setWeights(p=>{const n=[...p];n[i]={...n[i],weight:w};return n.sort((a,b)=>b.date.localeCompare(a.date));});setEditWIdx(null);};
+  const wSpark=[...weights].reverse().slice(-20);
+  const wVals=wSpark.map(w=>w.weight);
+  const wMin=wVals.length?Math.min(...wVals)-0.5:65;const wMax=wVals.length?Math.max(...wVals)+0.5:70;
+  const WW=310,WH=80;
+  const wpx=i=>wSpark.length>1?(i/(wSpark.length-1))*WW:WW/2;
+  const wpy=v=>WH-((v-wMin)/(wMax-wMin))*(WH-12)-6;
+  const wTrend=weeklyTrend(weights);
+
+  // ── Weight phases ──────────────────────────────────────────────────────────
+  const [showPhases,setShowPhases]=useState(false);
+  const [confirmDeletePhase,setConfirmDeletePhase]=useState(null); // phase id pending delete confirmation
+  const [newPhaseOpen,setNewPhaseOpen]=useState(false);
+  const [newPhaseLabel,setNewPhaseLabel]=useState("");
+  const [newPhaseGoal,setNewPhaseGoal]=useState(profile?.goal||"cut");
+  const wp=weightPhases||[];
+  const activePhase=wp.find(p=>!p.endDate)||null;
+  const closedPhases=wp.filter(p=>!!p.endDate).sort((a,b)=>b.startDate.localeCompare(a.startDate));
+
+  const phaseDuration=(startDate,endDate)=>{
+    const days=Math.round((new Date((endDate||TODAY())+"T12:00:00")-new Date(startDate+"T12:00:00"))/(86400000));
+    if(days<14)return days+"d";
+    if(days<60)return Math.round(days/7)+"wk";
+    return (days/30.44).toFixed(1)+"mo";
+  };
+  const phaseGoalColor=g=>g==="cut"?C.red:g==="bulk"?C.blue:C.lime;
+  const phaseGoalLabel=g=>g==="cut"?"Cut 🔻":g==="bulk"?"Bulk 📈":"Maintain ⚖";
+
+  const startNewPhase=()=>{
+    if(!newPhaseLabel.trim())return;
+    const today=TODAY();
+    const curW=latestW?.weight||null;
+    // Close the currently active phase if there is one
+    setWeightPhases(prev=>{
+      const closed=prev.map(p=>(!p.endDate?{...p,endDate:today,endWeight:curW}:p));
+      const newP={id:Date.now(),label:newPhaseLabel.trim(),goal:newPhaseGoal,startDate:today,startWeight:curW,endDate:null,endWeight:null};
+      return[...closed,newP];
+    });
+    setNewPhaseLabel("");setNewPhaseOpen(false);
+  };
+
+  const deletePhase=id=>setWeightPhases(p=>p.filter(x=>x.id!==id));
+
+  const PhaseCard=({phase})=>{
+    const isCurrent=!phase.endDate;
+    const curW=isCurrent?latestW?.weight:null;
+    const endW=phase.endWeight??curW;
+    const delta=endW!=null&&phase.startWeight!=null?endW-phase.startWeight:null;
+    const dur=phaseDuration(phase.startDate,phase.endDate);
+    const gc=phaseGoalColor(phase.goal);
+    return(<div style={{background:C.bg,border:`1px solid ${confirmDeletePhase===phase.id?"#5a1a1a":isCurrent?gc:C.border}`,borderRadius:10,padding:"10px 14px",marginBottom:6}}>
+      {confirmDeletePhase===phase.id&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 11px",marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+        <span style={{fontSize:11,color:"#ff8080",flex:1,minWidth:0}}>Delete <b>{phase.label}</b>? This can't be undone.</span>
+        <div style={{display:"flex",gap:6,flexShrink:0}}>
+          <button onClick={()=>setConfirmDeletePhase(null)} style={{padding:"4px 10px",borderRadius:6,background:C.card,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button>
+          <button onClick={()=>{deletePhase(phase.id);setConfirmDeletePhase(null);}} style={{padding:"4px 10px",borderRadius:6,background:"#3a0a0a",border:"1px solid #ff4040",color:"#ff6060",fontWeight:700,cursor:"pointer",fontSize:11}}>Delete</button>
+        </div>
+      </div>}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+            <span style={{fontSize:T.body,fontWeight:700,color:isCurrent?gc:C.text}}>{phase.label}</span>
+            <span style={{fontSize:10,background:gc+"20",color:gc,padding:"2px 8px",borderRadius:12,fontWeight:600}}>{phaseGoalLabel(phase.goal)}</span>
+            {isCurrent&&<span style={{fontSize:10,background:C.lime+"20",color:C.lime,padding:"2px 8px",borderRadius:12,fontWeight:600}}>● Active</span>}
+          </div>
+          <div style={{fontSize:11,color:C.muted,marginTop:3}}>
+            {new Date(phase.startDate+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}
+            {" → "}{isCurrent?"now":new Date(phase.endDate+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}
+            {" · "}<span style={{fontFamily:"monospace"}}>{dur}</span>
+          </div>
+          <div style={{display:"flex",gap:10,marginTop:5,flexWrap:"wrap"}}>
+            {phase.startWeight!=null&&<div style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>Start: <span style={{color:C.text,fontWeight:700}}>{phase.startWeight.toFixed(2)} kg</span></div>}
+            {endW!=null&&<div style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{isCurrent?"Now":"End"}: <span style={{color:C.text,fontWeight:700}}>{endW.toFixed(2)} kg</span></div>}
+            {delta!=null&&<div style={{fontFamily:"monospace",fontSize:12,fontWeight:800,color:delta<0?C.lime:C.red}}>{delta<0?"↓":"↑"}{Math.abs(delta).toFixed(2)} kg</div>}
+          </div>
+        </div>
+        <button onClick={()=>setConfirmDeletePhase(confirmDeletePhase===phase.id?null:phase.id)} style={{background:"none",border:"none",color:confirmDeletePhase===phase.id?"#ff4040":C.faint,fontSize:16,cursor:"pointer",padding:"0 2px",flexShrink:0,marginLeft:6}}>×</button>
+      </div>
+    </div>);
+  };
+
+  return(<>
+    {/* Weight section */}
+    <div style={{background:C.card,border:`1px solid ${weightLogOpen?C.lime:C.border}`,borderRadius:12,padding:"10px 14px",marginBottom:12}}>
+      <button onClick={()=>setWeightLogOpen(p=>!p)} style={{width:"100%",background:"none",border:"none",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",padding:0,marginBottom:weightLogOpen?6:0}}>
+        <span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Weight Log {weightLogOpen?"▲":"▼"}</span>
+        {latestW&&<div style={{display:"flex",alignItems:"baseline",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}><span style={{fontFamily:"monospace",fontSize:18,fontWeight:800,color:C.lime}}>{latestW.weight.toFixed(2)}</span><span style={{fontSize:12,color:C.muted}}>kg</span>{overallDelta!==null&&<span style={{fontFamily:"monospace",fontSize:11,color:overallDelta<0?C.lime:C.red}} title={"Total change since first log on "+firstW.date}>{overallDelta<0?"↓":"↑"}{Math.abs(overallDelta).toFixed(2)} since start</span>}</div>}
+      </button>
+      {weightLogOpen&&(<>
+      {wSpark.length>=4&&(<svg width={WW} height={WH} style={{display:"block",marginBottom:6,overflow:"visible"}}>
+        {wTrend!==null&&wSpark.length>=4&&(()=>{const startV=wSpark[0].weight;const endV=wSpark[wSpark.length-1].weight+(wTrend/7*(wSpark.length-1));return<line x1={0} y1={wpy(startV)} x2={WW} y2={wpy(Math.min(wMax-0.1,Math.max(wMin+0.1,endV)))} stroke={wTrend<0?C.lime+"60":C.red+"60"} strokeWidth={1} strokeDasharray="3 3"/>;})()}
+        <polyline points={wSpark.map((d,i)=>wpx(i)+","+wpy(d.weight)).join(" ")} fill="none" stroke={C.lime+"50"} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round"/>
+        <polyline points={wSpark.map((d,i)=>wpx(i)+","+wpy(d.weight)).join(" ")} fill="none" stroke={C.lime} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"/>
+        {wSpark.map((d,i)=>{const isFirst=i===0;const isLast=i===wSpark.length-1;const showLabel=isFirst||isLast||i%Math.ceil(wSpark.length/4)===0;return(<g key={i}><circle cx={wpx(i)} cy={wpy(d.weight)} r={isLast?4:2.5} fill={isLast?C.lime:C.lime+"80"}/>{showLabel&&<text x={wpx(i)} y={wpy(d.weight)-7} textAnchor={i===0?"start":i===wSpark.length-1?"end":"middle"} fontSize={8} fill={C.muted} fontFamily="monospace">{d.weight.toFixed(1)}</text>}</g>);})}
+      </svg>)}
+      {wSpark.length<4&&wSpark.length>0&&<div style={{fontSize:11,color:C.muted,marginBottom:6,fontFamily:"monospace"}}>Log {4-wSpark.length} more weight{4-wSpark.length!==1?"s":""} to see trend graph</div>}
+      <div style={{display:"flex",gap:6,marginBottom:6,flexWrap:"wrap"}}>
+        <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" step="0.05" placeholder="Weight kg" value={wInput} onChange={e=>setWInput(e.target.value.replace(",","."))} onKeyDown={e=>e.key==="Enter"&&logWeight()} style={{flex:"1 1 100px",minWidth:90,background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"7px 10px",color:C.text,fontSize:T.body,fontFamily:"monospace",outline:"none"}}/>
+        <input type="date" value={wDate} max={TODAY()} onChange={e=>setWDate(e.target.value)} style={{flex:"1 1 130px",background:C.bg,border:`1px solid ${wDate===TODAY()?C.border:C.lime}`,borderRadius:8,padding:"7px 10px",color:wDate===TODAY()?C.muted:C.lime,fontSize:T.body,fontFamily:"monospace",outline:"none"}}/>
+        <button onClick={logWeight} style={{padding:"7px 14px",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Log</button>
+      </div>
+      {wDate!==TODAY()&&<div style={{fontSize:10,color:C.lime,marginBottom:6,fontFamily:"monospace"}}>↳ logging for {new Date(wDate+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}{weights.find(w=>w.date===wDate)?" (will overwrite existing)":""}</div>}
+      <div style={{display:"flex",flexDirection:"column",gap:4,maxHeight:showAllW?420:200,overflowY:"auto"}}>
+        {weights.slice(0,showAllW?weights.length:14).map((e,i)=>(<div key={e.date}>{editWIdx===i
+          ?<div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:11,color:C.muted,flexShrink:0,minWidth:70}}>{new Date(e.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span><input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" step="0.05" value={editWVal} onChange={ev=>setEditWVal(ev.target.value.replace(",","."))} autoFocus style={{flex:1,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:6,padding:"4px 7px",color:C.text,fontSize:T.body,fontFamily:"monospace",outline:"none"}}/><button onClick={()=>saveEditW(i)} style={{padding:"4px 9px",borderRadius:5,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>✓</button><button onClick={()=>setEditWIdx(null)} style={{padding:"4px 7px",borderRadius:5,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>✕</button></div>
+          :<div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{fontSize:11,color:C.muted}}>{new Date(e.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span><div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontFamily:"monospace",fontSize:12,fontWeight:700,color:i===0?C.lime:C.text}}>{e.weight.toFixed(2)} kg</span><button onClick={()=>{setEditWIdx(i);setEditWVal(String(e.weight));}} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:10,cursor:"pointer",padding:"2px 5px",borderRadius:4}}>✎</button><button onClick={()=>deleteWeight(i)} style={{background:"none",border:"none",color:C.faint,fontSize:T.body,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div></div>
+        }</div>))}
+      </div>
+      {weights.length>14&&<button onClick={()=>setShowAllW(p=>!p)} style={{width:"100%",marginTop:6,padding:"6px 0",borderRadius:6,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>{showAllW?"▴ Show recent only":`▾ Show all ${weights.length} entries`}</button>}
+      </>)}
+    </div>
+
+    {/* Phase tracker */}
+    <div style={{background:C.card,border:`1px solid ${showPhases?C.blue:C.border}`,borderRadius:12,padding:"10px 14px",marginBottom:12}}>
+      <button onClick={()=>setShowPhases(p=>!p)} style={{width:"100%",background:"none",border:"none",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",padding:0}}>
+        <div>
+          <span style={{fontSize:11,color:C.blue,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Weight Phases</span>
+          {activePhase&&<span style={{fontSize:10,color:C.lime,marginLeft:8}}>● {activePhase.label} active</span>}
+        </div>
+        <span style={{fontSize:11,color:C.muted}}>{showPhases?"▲":"▼"} {wp.length} phase{wp.length!==1?"s":""}</span>
+      </button>
+      {showPhases&&<div style={{marginTop:12}}>
+        {/* Active phase */}
+        {activePhase&&<PhaseCard phase={activePhase}/>}
+        {!activePhase&&<div style={{fontSize:12,color:C.muted,marginBottom:10,fontStyle:"italic"}}>No active phase. Start one below to track progress across goals.</div>}
+
+        {/* Start new phase button / form */}
+        {!newPhaseOpen&&<button onClick={()=>setNewPhaseOpen(true)} style={{width:"100%",padding:"9px 0",borderRadius:8,background:`${C.blue}18`,border:`1px solid ${C.blue}60`,color:C.blue,fontWeight:700,cursor:"pointer",fontSize:T.body,marginBottom:closedPhases.length>0?10:0}}>
+          {activePhase?"⟳ Start New Phase (closes current)":"＋ Start New Phase"}
+        </button>}
+        {newPhaseOpen&&<div style={{background:C.bg,border:`1px solid ${C.blue}`,borderRadius:10,padding:"12px 14px",marginBottom:10}}>
+          <div style={{fontSize:11,color:C.blue,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>New Phase</div>
+          {activePhase&&<div style={{fontSize:11,color:C.yellow,marginBottom:8,lineHeight:1.4}}>⚠ This will close <b>{activePhase.label}</b> (started {phaseDuration(activePhase.startDate,null)} ago) and begin a fresh tracking period.</div>}
+          <Field label="Phase label" value={newPhaseLabel} onChange={setNewPhaseLabel} placeholder="e.g. Summer Cut, Bulk #2"/>
+          <div style={{display:"flex",gap:5,marginTop:8,marginBottom:10}}>
+            {[["cut","Cut 🔻",C.red],["maintain","Maintain ⚖",C.lime],["bulk","Bulk 📈",C.blue]].map(([id,lbl,col])=>(
+              <button key={id} onClick={()=>setNewPhaseGoal(id)} style={{flex:1,padding:"7px 4px",borderRadius:8,border:`1px solid ${newPhaseGoal===id?col:C.border}`,background:newPhaseGoal===id?col+"20":C.card,color:newPhaseGoal===id?col:C.muted,fontWeight:newPhaseGoal===id?700:400,cursor:"pointer",fontSize:11}}>{lbl}</button>
+            ))}
+          </div>
+          {latestW&&<div style={{fontSize:11,color:C.muted,marginBottom:8}}>Starting weight: <span style={{fontFamily:"monospace",color:C.text,fontWeight:700}}>{latestW.weight.toFixed(2)} kg</span></div>}
+          <div style={{display:"flex",gap:7}}>
+            <button onClick={()=>{setNewPhaseOpen(false);setNewPhaseLabel("");}} style={{flex:1,padding:"8px 0",borderRadius:8,background:C.card,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12}}>Cancel</button>
+            <button onClick={startNewPhase} disabled={!newPhaseLabel.trim()} style={{flex:2,padding:"8px 0",borderRadius:8,background:newPhaseLabel.trim()?C.blue:C.faint,border:"none",color:"#000",fontWeight:700,cursor:newPhaseLabel.trim()?"pointer":"default",fontSize:T.body}}>Start Phase</button>
+          </div>
+        </div>}
+
+        {/* Closed phase history */}
+        {closedPhases.length>0&&<div>
+          <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>History</div>
+          {closedPhases.map(p=><PhaseCard key={p.id} phase={p}/>)}
+        </div>}
+      </div>}
+    </div>
+    <UndoToast pending={weightUndo.pending} onUndo={weightUndo.undo}/>
+  </>);
+}
 function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases,setWeightPhases,gymSchedule,setGymSchedule,gymTemplates,setGymTemplates,gymDayAssign,setGymDayAssign,gymSessions,setGymSessions,gymSettings,setGymSettings,gymActiveSession,setGymActiveSession,gymExerciseLibrary,setGymExerciseLibrary}){
   const [modal,setModal]=useState(false);const [view,setView]=useState("today");const [histDates,setHistDates]=useState([]);const [histLogs,setHistLogs]=useState({});const [histLoaded,setHistLoaded]=useState(false);
   const activities=dayData.activities||[];const totalBurned=activities.reduce((s,a)=>s+a.kcal,0)+(dayData.burnedExtra||0);
@@ -6716,110 +7234,17 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
     return (act.sessionId&&all.find(s=>s.id===act.sessionId))||all.find(s=>s.date===date)||null;
   };
   const addActivity=act=>{setDayData(p=>({...p,activities:[...(p.activities||[]),act]}));setModal(false);};
-  const delActivity=id=>{setDayData(p=>({...p,activities:(p.activities||[]).filter(a=>a.id!==id)}));};
-  const [wInput,setWInput]=useState("");const [editWIdx,setEditWIdx]=useState(null);const [editWVal,setEditWVal]=useState("");const [wDate,setWDate]=useState(TODAY());const [showAllW,setShowAllW]=useState(false);
-  const [weightLogOpen,setWeightLogOpen]=useState(false);
-  const [undoEntry,setUndoEntry]=useState(null);
-  const deleteWeight=(idx)=>{
-    const entry = weights[idx];
-    if (!entry) return;
-    setWeights(p=>p.filter((_,j)=>j!==idx));
-    if (undoEntry?.timeout) clearTimeout(undoEntry.timeout);
-    const t = setTimeout(()=>setUndoEntry(null), 5000);
-    setUndoEntry({entry, timeout: t});
-  };
-  const undoDelete=()=>{
-    if (!undoEntry) return;
-    clearTimeout(undoEntry.timeout);
-    const e = undoEntry.entry;
-    setWeights(p => [e, ...p.filter(x=>x.date!==e.date)].sort((a,b)=>b.date.localeCompare(a.date)));
-    setUndoEntry(null);
-  };
-  const latestW=weights[0];
-  const firstW=weights.length>=2?weights[weights.length-1]:null;
-  const overallDelta=firstW&&latestW?latestW.weight-firstW.weight:null;
-  const logWeight=()=>{const w=parseNum(wInput);if(!w)return;const date=wDate||TODAY();const e={date,weight:w};setWeights(p=>[e,...p.filter(x=>x.date!==date)].sort((a,b)=>b.date.localeCompare(a.date)));setWInput("");setWDate(TODAY());};
-  const saveEditW=i=>{const w=parseNum(editWVal);if(!w)return;setWeights(p=>{const n=[...p];n[i]={...n[i],weight:w};return n.sort((a,b)=>b.date.localeCompare(a.date));});setEditWIdx(null);};
-  const wSpark=[...weights].reverse().slice(-20);
-  const wVals=wSpark.map(w=>w.weight);
-  const wMin=wVals.length?Math.min(...wVals)-0.5:65;const wMax=wVals.length?Math.max(...wVals)+0.5:70;
-  const WW=310,WH=80;
-  const wpx=i=>wSpark.length>1?(i/(wSpark.length-1))*WW:WW/2;
-  const wpy=v=>WH-((v-wMin)/(wMax-wMin))*(WH-12)-6;
-  const wTrend=weeklyTrend(weights);
-
-  // ── Weight phases ──────────────────────────────────────────────────────────
-  const [showPhases,setShowPhases]=useState(false);
-  const [confirmDeletePhase,setConfirmDeletePhase]=useState(null); // phase id pending delete confirmation
-  const [newPhaseOpen,setNewPhaseOpen]=useState(false);
-  const [newPhaseLabel,setNewPhaseLabel]=useState("");
-  const [newPhaseGoal,setNewPhaseGoal]=useState(profile?.goal||"cut");
-  const wp=weightPhases||[];
-  const activePhase=wp.find(p=>!p.endDate)||null;
-  const closedPhases=wp.filter(p=>!!p.endDate).sort((a,b)=>b.startDate.localeCompare(a.startDate));
-
-  const phaseDuration=(startDate,endDate)=>{
-    const days=Math.round((new Date((endDate||TODAY())+"T12:00:00")-new Date(startDate+"T12:00:00"))/(86400000));
-    if(days<14)return days+"d";
-    if(days<60)return Math.round(days/7)+"wk";
-    return (days/30.44).toFixed(1)+"mo";
-  };
-  const phaseGoalColor=g=>g==="cut"?C.red:g==="bulk"?C.blue:C.lime;
-  const phaseGoalLabel=g=>g==="cut"?"Cut 🔻":g==="bulk"?"Bulk 📈":"Maintain ⚖";
-
-  const startNewPhase=()=>{
-    if(!newPhaseLabel.trim())return;
-    const today=TODAY();
-    const curW=latestW?.weight||null;
-    // Close the currently active phase if there is one
-    setWeightPhases(prev=>{
-      const closed=prev.map(p=>(!p.endDate?{...p,endDate:today,endWeight:curW}:p));
-      const newP={id:Date.now(),label:newPhaseLabel.trim(),goal:newPhaseGoal,startDate:today,startWeight:curW,endDate:null,endWeight:null};
-      return[...closed,newP];
+  const actUndo=useUndoToast();
+  const delActivity=id=>{
+    const list=dayData.activities||[];
+    const idx=list.findIndex(a=>a.id===id);
+    if(idx===-1)return;
+    const removed=list[idx];
+    setDayData(p=>({...p,activities:(p.activities||[]).filter(a=>a.id!==id)}));
+    actUndo.show(`Activity deleted — ${removed.label}`, ()=>{
+      setDayData(p=>{const cur=p.activities||[];return {...p,activities:[...cur.slice(0,idx),removed,...cur.slice(idx)]};});
     });
-    setNewPhaseLabel("");setNewPhaseOpen(false);
   };
-
-  const deletePhase=id=>setWeightPhases(p=>p.filter(x=>x.id!==id));
-
-  const PhaseCard=({phase})=>{
-    const isCurrent=!phase.endDate;
-    const curW=isCurrent?latestW?.weight:null;
-    const endW=phase.endWeight??curW;
-    const delta=endW!=null&&phase.startWeight!=null?endW-phase.startWeight:null;
-    const dur=phaseDuration(phase.startDate,phase.endDate);
-    const gc=phaseGoalColor(phase.goal);
-    return(<div style={{background:C.bg,border:`1px solid ${confirmDeletePhase===phase.id?"#5a1a1a":isCurrent?gc:C.border}`,borderRadius:10,padding:"10px 14px",marginBottom:6}}>
-      {confirmDeletePhase===phase.id&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 11px",marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
-        <span style={{fontSize:11,color:"#ff8080",flex:1,minWidth:0}}>Delete <b>{phase.label}</b>? This can't be undone.</span>
-        <div style={{display:"flex",gap:6,flexShrink:0}}>
-          <button onClick={()=>setConfirmDeletePhase(null)} style={{padding:"4px 10px",borderRadius:6,background:C.card,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button>
-          <button onClick={()=>{deletePhase(phase.id);setConfirmDeletePhase(null);}} style={{padding:"4px 10px",borderRadius:6,background:"#3a0a0a",border:"1px solid #ff4040",color:"#ff6060",fontWeight:700,cursor:"pointer",fontSize:11}}>Delete</button>
-        </div>
-      </div>}
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
-        <div style={{flex:1,minWidth:0}}>
-          <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
-            <span style={{fontSize:T.body,fontWeight:700,color:isCurrent?gc:C.text}}>{phase.label}</span>
-            <span style={{fontSize:10,background:gc+"20",color:gc,padding:"2px 8px",borderRadius:12,fontWeight:600}}>{phaseGoalLabel(phase.goal)}</span>
-            {isCurrent&&<span style={{fontSize:10,background:C.lime+"20",color:C.lime,padding:"2px 8px",borderRadius:12,fontWeight:600}}>● Active</span>}
-          </div>
-          <div style={{fontSize:11,color:C.muted,marginTop:3}}>
-            {new Date(phase.startDate+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}
-            {" → "}{isCurrent?"now":new Date(phase.endDate+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}
-            {" · "}<span style={{fontFamily:"monospace"}}>{dur}</span>
-          </div>
-          <div style={{display:"flex",gap:10,marginTop:5,flexWrap:"wrap"}}>
-            {phase.startWeight!=null&&<div style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>Start: <span style={{color:C.text,fontWeight:700}}>{phase.startWeight.toFixed(2)} kg</span></div>}
-            {endW!=null&&<div style={{fontFamily:"monospace",fontSize:11,color:C.muted}}>{isCurrent?"Now":"End"}: <span style={{color:C.text,fontWeight:700}}>{endW.toFixed(2)} kg</span></div>}
-            {delta!=null&&<div style={{fontFamily:"monospace",fontSize:12,fontWeight:800,color:delta<0?C.lime:C.red}}>{delta<0?"↓":"↑"}{Math.abs(delta).toFixed(2)} kg</div>}
-          </div>
-        </div>
-        <button onClick={()=>setConfirmDeletePhase(confirmDeletePhase===phase.id?null:phase.id)} style={{background:"none",border:"none",color:confirmDeletePhase===phase.id?"#ff4040":C.faint,fontSize:16,cursor:"pointer",padding:"0 2px",flexShrink:0,marginLeft:6}}>×</button>
-      </div>
-    </div>);
-  };
-
   // ── Gym focus mode ──
   // While a session is live the tab renders ONLY the session. Everything else on this tab —
   // current weight, weight history graph, phase deltas, coach chat — is personal, and a phone
@@ -6847,10 +7272,10 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
   return(<div style={{height:"100%",position:"relative"}}>
     <div data-scroll style={{height:"100%",overflowY:"auto",padding:"0 16px 90px"}}>
       <div style={{padding:"18px 0 8px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-        <div style={{fontSize:T.h1,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>Activity</div>
+        <div style={{fontSize:T.h1,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>Training</div>
         <div style={{display:"flex",gap:6}}>
           <button onClick={()=>setShowGymHistory(true)} style={{background:"none",border:`1px solid ${C.border}`,borderRadius:8,padding:"6px 10px",color:C.muted,cursor:"pointer",fontSize:11}}>🏋️ Gym Log</button>
-          <button onClick={()=>setGymSetupOpen(true)} style={{background:"none",border:`1px solid ${C.border}`,borderRadius:8,padding:"6px 10px",color:C.muted,cursor:"pointer",fontSize:11}}>⚙️</button>
+          <button onClick={()=>setGymSetupOpen(true)} aria-label="Gym settings" style={{background:"none",border:`1px solid ${C.border}`,borderRadius:8,padding:"6px 10px",color:C.muted,cursor:"pointer",fontSize:11}}>⚙️</button>
         </div>
       </div>
 
@@ -6891,80 +7316,10 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
       />}
       {showGymHistory&&<GymHistoryPanel gymSessions={gymSessions||[]} setGymSessions={setGymSessions} gymExerciseLibrary={gymExerciseLibrary||[]} setGymExerciseLibrary={setGymExerciseLibrary} onClose={()=>setShowGymHistory(false)}/>}
 
-      {/* Weight section */}
-      <div style={{background:C.card,border:`1px solid ${weightLogOpen?C.lime:C.border}`,borderRadius:12,padding:"10px 14px",marginBottom:12}}>
-        <button onClick={()=>setWeightLogOpen(p=>!p)} style={{width:"100%",background:"none",border:"none",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",padding:0,marginBottom:weightLogOpen?6:0}}>
-          <span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Weight Log {weightLogOpen?"▲":"▼"}</span>
-          {latestW&&<div style={{display:"flex",alignItems:"baseline",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}><span style={{fontFamily:"monospace",fontSize:18,fontWeight:800,color:C.lime}}>{latestW.weight.toFixed(2)}</span><span style={{fontSize:12,color:C.muted}}>kg</span>{overallDelta!==null&&<span style={{fontFamily:"monospace",fontSize:11,color:overallDelta<0?C.lime:C.red}} title={"Total change since first log on "+firstW.date}>{overallDelta<0?"↓":"↑"}{Math.abs(overallDelta).toFixed(2)} since start</span>}</div>}
-        </button>
-        {weightLogOpen&&(<>
-        {wSpark.length>=4&&(<svg width={WW} height={WH} style={{display:"block",marginBottom:6,overflow:"visible"}}>
-          {wTrend!==null&&wSpark.length>=4&&(()=>{const startV=wSpark[0].weight;const endV=wSpark[wSpark.length-1].weight+(wTrend/7*(wSpark.length-1));return<line x1={0} y1={wpy(startV)} x2={WW} y2={wpy(Math.min(wMax-0.1,Math.max(wMin+0.1,endV)))} stroke={wTrend<0?C.lime+"60":C.red+"60"} strokeWidth={1} strokeDasharray="3 3"/>;})()}
-          <polyline points={wSpark.map((d,i)=>wpx(i)+","+wpy(d.weight)).join(" ")} fill="none" stroke={C.lime+"50"} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round"/>
-          <polyline points={wSpark.map((d,i)=>wpx(i)+","+wpy(d.weight)).join(" ")} fill="none" stroke={C.lime} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"/>
-          {wSpark.map((d,i)=>{const isFirst=i===0;const isLast=i===wSpark.length-1;const showLabel=isFirst||isLast||i%Math.ceil(wSpark.length/4)===0;return(<g key={i}><circle cx={wpx(i)} cy={wpy(d.weight)} r={isLast?4:2.5} fill={isLast?C.lime:C.lime+"80"}/>{showLabel&&<text x={wpx(i)} y={wpy(d.weight)-7} textAnchor={i===0?"start":i===wSpark.length-1?"end":"middle"} fontSize={8} fill={C.muted} fontFamily="monospace">{d.weight.toFixed(1)}</text>}</g>);})}
-        </svg>)}
-        {wSpark.length<4&&wSpark.length>0&&<div style={{fontSize:11,color:C.muted,marginBottom:6,fontFamily:"monospace"}}>Log {4-wSpark.length} more weight{4-wSpark.length!==1?"s":""} to see trend graph</div>}
-        <div style={{display:"flex",gap:6,marginBottom:6,flexWrap:"wrap"}}>
-          <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" step="0.05" placeholder="Weight kg" value={wInput} onChange={e=>setWInput(e.target.value.replace(",","."))} onKeyDown={e=>e.key==="Enter"&&logWeight()} style={{flex:"1 1 100px",minWidth:90,background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"7px 10px",color:C.text,fontSize:T.body,fontFamily:"monospace",outline:"none"}}/>
-          <input type="date" value={wDate} max={TODAY()} onChange={e=>setWDate(e.target.value)} style={{flex:"1 1 130px",background:C.bg,border:`1px solid ${wDate===TODAY()?C.border:C.lime}`,borderRadius:8,padding:"7px 10px",color:wDate===TODAY()?C.muted:C.lime,fontSize:T.body,fontFamily:"monospace",outline:"none"}}/>
-          <button onClick={logWeight} style={{padding:"7px 14px",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Log</button>
-        </div>
-        {wDate!==TODAY()&&<div style={{fontSize:10,color:C.lime,marginBottom:6,fontFamily:"monospace"}}>↳ logging for {new Date(wDate+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}{weights.find(w=>w.date===wDate)?" (will overwrite existing)":""}</div>}
-        <div style={{display:"flex",flexDirection:"column",gap:4,maxHeight:showAllW?420:200,overflowY:"auto"}}>
-          {weights.slice(0,showAllW?weights.length:14).map((e,i)=>(<div key={e.date}>{editWIdx===i
-            ?<div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:11,color:C.muted,flexShrink:0,minWidth:70}}>{new Date(e.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span><input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" step="0.05" value={editWVal} onChange={ev=>setEditWVal(ev.target.value.replace(",","."))} autoFocus style={{flex:1,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:6,padding:"4px 7px",color:C.text,fontSize:T.body,fontFamily:"monospace",outline:"none"}}/><button onClick={()=>saveEditW(i)} style={{padding:"4px 9px",borderRadius:5,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>✓</button><button onClick={()=>setEditWIdx(null)} style={{padding:"4px 7px",borderRadius:5,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>✕</button></div>
-            :<div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{fontSize:11,color:C.muted}}>{new Date(e.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span><div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontFamily:"monospace",fontSize:12,fontWeight:700,color:i===0?C.lime:C.text}}>{e.weight.toFixed(2)} kg</span><button onClick={()=>{setEditWIdx(i);setEditWVal(String(e.weight));}} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:10,cursor:"pointer",padding:"2px 5px",borderRadius:4}}>✎</button><button onClick={()=>deleteWeight(i)} style={{background:"none",border:"none",color:C.faint,fontSize:T.body,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div></div>
-          }</div>))}
-        </div>
-        {weights.length>14&&<button onClick={()=>setShowAllW(p=>!p)} style={{width:"100%",marginTop:6,padding:"6px 0",borderRadius:6,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>{showAllW?"▴ Show recent only":`▾ Show all ${weights.length} entries`}</button>}
-        </>)}
-      </div>
 
       {/* Sports Coach */}
       <CoachPanel profile={profile} weights={weights} products={[]} mealPreps={[]} weightPhases={weightPhases} gymSessions={gymSessions} gymSchedule={gymSchedule} gymSettings={gymSettings} mode="sports"/>
 
-      {/* Phase tracker */}
-      <div style={{background:C.card,border:`1px solid ${showPhases?C.blue:C.border}`,borderRadius:12,padding:"10px 14px",marginBottom:12}}>
-        <button onClick={()=>setShowPhases(p=>!p)} style={{width:"100%",background:"none",border:"none",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",padding:0}}>
-          <div>
-            <span style={{fontSize:11,color:C.blue,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Weight Phases</span>
-            {activePhase&&<span style={{fontSize:10,color:C.lime,marginLeft:8}}>● {activePhase.label} active</span>}
-          </div>
-          <span style={{fontSize:11,color:C.muted}}>{showPhases?"▲":"▼"} {wp.length} phase{wp.length!==1?"s":""}</span>
-        </button>
-        {showPhases&&<div style={{marginTop:12}}>
-          {/* Active phase */}
-          {activePhase&&<PhaseCard phase={activePhase}/>}
-          {!activePhase&&<div style={{fontSize:12,color:C.muted,marginBottom:10,fontStyle:"italic"}}>No active phase. Start one below to track progress across goals.</div>}
-
-          {/* Start new phase button / form */}
-          {!newPhaseOpen&&<button onClick={()=>setNewPhaseOpen(true)} style={{width:"100%",padding:"9px 0",borderRadius:8,background:`${C.blue}18`,border:`1px solid ${C.blue}60`,color:C.blue,fontWeight:700,cursor:"pointer",fontSize:T.body,marginBottom:closedPhases.length>0?10:0}}>
-            {activePhase?"⟳ Start New Phase (closes current)":"＋ Start New Phase"}
-          </button>}
-          {newPhaseOpen&&<div style={{background:C.bg,border:`1px solid ${C.blue}`,borderRadius:10,padding:"12px 14px",marginBottom:10}}>
-            <div style={{fontSize:11,color:C.blue,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>New Phase</div>
-            {activePhase&&<div style={{fontSize:11,color:C.yellow,marginBottom:8,lineHeight:1.4}}>⚠ This will close <b>{activePhase.label}</b> (started {phaseDuration(activePhase.startDate,null)} ago) and begin a fresh tracking period.</div>}
-            <Field label="Phase label" value={newPhaseLabel} onChange={setNewPhaseLabel} placeholder="e.g. Summer Cut, Bulk #2"/>
-            <div style={{display:"flex",gap:5,marginTop:8,marginBottom:10}}>
-              {[["cut","Cut 🔻",C.red],["maintain","Maintain ⚖",C.lime],["bulk","Bulk 📈",C.blue]].map(([id,lbl,col])=>(
-                <button key={id} onClick={()=>setNewPhaseGoal(id)} style={{flex:1,padding:"7px 4px",borderRadius:8,border:`1px solid ${newPhaseGoal===id?col:C.border}`,background:newPhaseGoal===id?col+"20":C.card,color:newPhaseGoal===id?col:C.muted,fontWeight:newPhaseGoal===id?700:400,cursor:"pointer",fontSize:11}}>{lbl}</button>
-              ))}
-            </div>
-            {latestW&&<div style={{fontSize:11,color:C.muted,marginBottom:8}}>Starting weight: <span style={{fontFamily:"monospace",color:C.text,fontWeight:700}}>{latestW.weight.toFixed(2)} kg</span></div>}
-            <div style={{display:"flex",gap:7}}>
-              <button onClick={()=>{setNewPhaseOpen(false);setNewPhaseLabel("");}} style={{flex:1,padding:"8px 0",borderRadius:8,background:C.card,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12}}>Cancel</button>
-              <button onClick={startNewPhase} disabled={!newPhaseLabel.trim()} style={{flex:2,padding:"8px 0",borderRadius:8,background:newPhaseLabel.trim()?C.blue:C.faint,border:"none",color:"#000",fontWeight:700,cursor:newPhaseLabel.trim()?"pointer":"default",fontSize:T.body}}>Start Phase</button>
-            </div>
-          </div>}
-
-          {/* Closed phase history */}
-          {closedPhases.length>0&&<div>
-            <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>History</div>
-            {closedPhases.map(p=><PhaseCard key={p.id} phase={p}/>)}
-          </div>}
-        </div>}
-      </div>
 
       <div style={{display:"flex",gap:6,marginBottom:14}}>{[["Today","today"],["Past Activity","history"]].map(([lbl,v])=>(<button key={v} onClick={()=>setView(v)} style={{flex:1,padding:"9px 0",borderRadius:10,border:`1px solid ${view===v?C.orange:C.border}`,background:view===v?`${C.orange}20`:C.card,color:view===v?C.orange:C.muted,fontWeight:view===v?700:500,cursor:"pointer",fontSize:12}}>{lbl}</button>))}</div>
       {view==="today"&&(<>{totalBurned>0&&<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:14,padding:"14px 18px",marginBottom:14}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Total burn bonus today</div><div style={{fontSize:40,fontWeight:900,fontFamily:"monospace",color:C.orange,lineHeight:1.1,marginTop:4}}>+{Math.round(totalBurned)}</div><div style={{fontSize:12,color:C.muted,marginTop:2}}>kcal added to daily target</div></div>}<div style={{display:"flex",flexDirection:"column",gap:7}}>
@@ -7024,7 +7379,7 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
     </div>
     {view==="today"&&<button onClick={()=>setModal(true)} style={{position:"absolute",bottom:16,right:16,width:54,height:54,borderRadius:"50%",background:C.orange,border:"none",cursor:"pointer",fontSize:28,color:"#000",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 0 20px ${C.orange}55`,zIndex:10}}>+</button>}
     {modal&&<AddActSheet onAdd={addActivity} onClose={()=>setModal(false)} apiKey={profile.apiKey} weightKg={latestWeightForGym}/>}
-    {undoEntry&&<div style={{position:"absolute",bottom:80,left:16,right:16,background:C.card,border:`1px solid ${C.lime}`,borderRadius:10,padding:"10px 14px",display:"flex",alignItems:"center",justifyContent:"space-between",zIndex:20,boxShadow:`0 4px 16px rgba(0,0,0,0.4)`}}><div><div style={{fontSize:12,color:C.text,fontWeight:600}}>Deleted {undoEntry.entry.weight.toFixed(2)} kg</div><div style={{fontSize:10,color:C.muted}}>{new Date(undoEntry.entry.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</div></div><button onClick={undoDelete} style={{padding:"6px 12px",borderRadius:7,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>↶ Undo</button></div>}
+    <UndoToast pending={actUndo.pending} onUndo={actUndo.undo}/>
   </div>);
 }
 
@@ -7837,6 +8192,11 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases, gymSes
 
   // Build the context string the coach sees with every question.
   const buildContext = () => {
+    // AI & Privacy toggles (Settings) — each gate below drops one whole category of personal
+    // history from what actually gets sent, rather than just being a label that claims to.
+    const wantWeight = aiPref(profile, "includeWeightHistory");
+    const wantMeals = aiPref(profile, "includeMealHistory");
+    const wantWorkouts = aiPref(profile, "includeWorkoutHistory");
     const latest = weights[0]?.weight;
     const tWeek = shortTrend(weights);   // 7-day linear regression
     const tMonth = monthTrend(weights);  // 30-day linear regression
@@ -7846,40 +8206,44 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases, gymSes
     const tdee = latest ? getTDEE(profile, latest) : null;
     const age = calcAge(profile?.birthday) || 27;
     let ctx = "";
-    ctx += "User: " + age + "yo " + (profile?.sex||"male") + ", " + (profile?.heightCm||178) + "cm, latest weight " + (latest?latest.toFixed(2)+"kg":"unknown") + ".\n";
+    ctx += "User: " + age + "yo " + (profile?.sex||"male") + ", " + (profile?.heightCm||178) + "cm" + (wantWeight ? ", latest weight " + (latest?latest.toFixed(2)+"kg":"unknown") : "") + ".\n";
     ctx += "Goal mode: " + (profile?.goal||"cut") + (profile?.goalNote?" — \""+profile.goalNote+"\"":"") + ".\n";
     if (profile?.targetWeightKg) ctx += "Target weight: " + profile.targetWeightKg + "kg.\n";
     if (tdee) ctx += "Estimated TDEE: " + tdee + " kcal/day.\n";
-    ctx += "WEIGHT TREND (use the window that matches the user's question — don't blend them):\n";
-    ctx += "  • Last 7 days (WEEK): " + (tWeek!==null ? (tWeek<0?"-":"+") + Math.abs(tWeek).toFixed(2) + "kg/week (" + (tWeek<0?"losing":tWeek>0?"gaining":"flat") + ")" : "not enough recent data") + "\n";
-    ctx += "  • Last 30 days (MONTH): " + (tMonth!==null ? (tMonth<0?"-":"+") + Math.abs(tMonth).toFixed(2) + "kg/week (" + (tMonth<0?"losing":tMonth>0?"gaining":"flat") + ")" : "not enough data") + "\n";
-    if (tWeek===null && tMonth===null && tMed!==null) {
-      ctx += "  • Best available (~3wk): " + (tMed<0?"-":"+") + Math.abs(tMed).toFixed(2) + "kg/week (" + (tMed<0?"losing":"gaining") + ")\n";
-    }
-    if (tWeek!==null && tMonth!==null && Math.sign(tWeek)!==Math.sign(tMonth) && tWeek!==0 && tMonth!==0) {
-      ctx += "  NOTE: week and month trends point in OPPOSITE directions (e.g. lost this week but net gained over the month, or vice versa) — when answering, be explicit about which window you're citing.\n";
+    if (wantWeight) {
+      ctx += "WEIGHT TREND (use the window that matches the user's question — don't blend them):\n";
+      ctx += "  • Last 7 days (WEEK): " + (tWeek!==null ? (tWeek<0?"-":"+") + Math.abs(tWeek).toFixed(2) + "kg/week (" + (tWeek<0?"losing":tWeek>0?"gaining":"flat") + ")" : "not enough recent data") + "\n";
+      ctx += "  • Last 30 days (MONTH): " + (tMonth!==null ? (tMonth<0?"-":"+") + Math.abs(tMonth).toFixed(2) + "kg/week (" + (tMonth<0?"losing":tMonth>0?"gaining":"flat") + ")" : "not enough data") + "\n";
+      if (tWeek===null && tMonth===null && tMed!==null) {
+        ctx += "  • Best available (~3wk): " + (tMed<0?"-":"+") + Math.abs(tMed).toFixed(2) + "kg/week (" + (tMed<0?"losing":"gaining") + ")\n";
+      }
+      if (tWeek!==null && tMonth!==null && Math.sign(tWeek)!==Math.sign(tMonth) && tWeek!==0 && tMonth!==0) {
+        ctx += "  NOTE: week and month trends point in OPPOSITE directions (e.g. lost this week but net gained over the month, or vice versa) — when answering, be explicit about which window you're citing.\n";
+      }
     }
     ctx += "Day-type targets (kcal): ";
     ctx += Object.entries(DAY_TYPES).map(([k,v]) => v.label + " " + getDT(profile,k,latest,0,false,0,gymSessions).kcal).join(", ") + ".\n";
-    if (todayLog) {
+    if (wantMeals && todayLog) {
       const tot = (todayLog.meals||[]).reduce((a,m)=>({k:a.k+m.kcal,p:a.p+m.protein,c:a.c+m.carbs,f:a.f+m.fat}),{k:0,p:0,c:0,f:0});
       const burn = (todayLog.activities||[]).reduce((s,a)=>s+a.kcal,0)+(todayLog.burnedExtra||0);
       ctx += "TODAY ("+today+", " + (DAY_TYPES[todayLog.dayType]?.label||"Rest") + " day): consumed " + Math.round(tot.k) + " kcal / " + Math.round(tot.p) + "g P / " + Math.round(tot.c) + "g C / " + Math.round(tot.f) + "g F across " + (todayLog.meals||[]).length + " meals; activity burn " + Math.round(burn) + " kcal.\n";
       if ((todayLog.tags||[]).length) ctx += "Tags today: " + todayLog.tags.join(", ") + ".\n";
     }
-    const lastWeekDates = Object.keys(recentLogs).sort((a,b)=>b.localeCompare(a)).slice(0,7);
-    if (lastWeekDates.length > 1) {
-      ctx += "\nLAST " + lastWeekDates.length + " DAYS:\n";
-      for (const d of lastWeekDates) {
-        const l = recentLogs[d];
-        if (!l) continue;
-        const tot = (l.meals||[]).reduce((a,m)=>({k:a.k+m.kcal,p:a.p+m.protein}),{k:0,p:0});
-        const burn = (l.activities||[]).reduce((s,a)=>s+a.kcal,0)+(l.burnedExtra||0);
-        const acts = (l.activities||[]).map(a=>a.label).join(", ") || "no recorded activity";
-        ctx += "  " + d + " (" + (DAY_TYPES[l.dayType]?.label||"rest") + "): " + Math.round(tot.k) + " kcal, " + Math.round(tot.p) + "g P, burned " + Math.round(burn) + " · " + acts + "\n";
+    if (wantMeals) {
+      const lastWeekDates = Object.keys(recentLogs).sort((a,b)=>b.localeCompare(a)).slice(0,7);
+      if (lastWeekDates.length > 1) {
+        ctx += "\nLAST " + lastWeekDates.length + " DAYS:\n";
+        for (const d of lastWeekDates) {
+          const l = recentLogs[d];
+          if (!l) continue;
+          const tot = (l.meals||[]).reduce((a,m)=>({k:a.k+m.kcal,p:a.p+m.protein}),{k:0,p:0});
+          const burn = (l.activities||[]).reduce((s,a)=>s+a.kcal,0)+(l.burnedExtra||0);
+          const acts = (l.activities||[]).map(a=>a.label).join(", ") || "no recorded activity";
+          ctx += "  " + d + " (" + (DAY_TYPES[l.dayType]?.label||"rest") + "): " + Math.round(tot.k) + " kcal, " + Math.round(tot.p) + "g P, burned " + Math.round(burn) + " · " + acts + "\n";
+        }
       }
     }
-    if ((weightPhases||[]).length) {
+    if (wantWeight && (weightPhases||[]).length) {
       ctx += "\nWEIGHT PHASES:\n";
       const sorted = [...weightPhases].sort((a,b) => b.startDate.localeCompare(a.startDate)).slice(0,5);
       for (const p of sorted) {
@@ -7892,7 +8256,7 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases, gymSes
         ctx += "  " + (isCurrent?"[ACTIVE] ":"") + p.label + " (" + p.goal + "): " + p.startDate + " → " + (p.endDate||"now") + " (" + dur + "), " + (p.startWeight||"?") + "kg → " + (endW||"?") + "kg = " + (parseFloat(delta)>0?"+":"") + delta + "kg\n";
       }
     }
-    if (mode === "sports") {
+    if (mode === "sports" && wantWorkouts) {
       ctx += "\nTRAINING METHOD: " + (TRAINING_METHODS.find(m=>m.id===(gymSettings?.trainingMethod))?.label || "Maintain") + (gymSettings?.customNote?" — \""+gymSettings.customNote+"\"":"") + ".\n";
       if ((gymSchedule||[]).length) ctx += "Scheduled gym days: " + gymSchedule.map(d=>WEEKDAYS[d].full).join(", ") + ".\n";
       const recentSessions = (gymSessions||[]).slice(0,6);
@@ -7905,7 +8269,10 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases, gymSes
       } else {
         ctx += "\nNo gym sessions logged yet.\n";
       }
-    } else {
+    } else if (mode === "sports") {
+      ctx += "\nWorkout history is excluded per the user's AI & Privacy settings.\n";
+    }
+    if (mode !== "sports") {
       const active = (mealPreps||[]).filter(p => (p.remainingWeightG||p.totalWeightG||0) > 0);
       if (active.length) {
         ctx += "\nACTIVE MEAL PREPS (available right now):\n";
@@ -7942,7 +8309,10 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases, gymSes
       const reply = await aCoach({ question: q, context: ctx, history: history }, apiKey);
       setHistory(h => [...h, { role: "assistant", content: reply }]);
     } catch (e) {
-      setErr(String(e.message || e));
+      // A raw "fetch failed" / JSON-parse / API error message means nothing to someone who
+      // isn't debugging the request — show a plain-language line, keep the real one behind
+      // "Details" for anyone who does want it.
+      setErr({friendly:"Coach couldn't answer that. Try again.", detail:String(e.message||e)});
       // Roll back the user message so they can retry
       setHistory(h => h.slice(0, -1));
       setQuestion(q);
@@ -7994,16 +8364,23 @@ function CoachPanel({profile, weights, products, mealPreps, weightPhases, gymSes
       ))}
       {loading&&<div style={{alignSelf:"flex-start",fontSize:12,color:C.muted,padding:"6px 10px"}}>Thinking…</div>}
     </div>}
-    {history.length===0&&<div style={{display:"flex",flexDirection:"column",gap:5,marginBottom:10}}>
-      {suggestions.map((s,i)=>(
-        <button key={i} onClick={()=>ask(s)} disabled={loading} style={{textAlign:"left",fontSize:12,color:C.muted,background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"7px 10px",cursor:loading?"default":"pointer"}}>{s}</button>
-      ))}
-    </div>}
-    {err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"7px 10px",fontSize:11,color:"#ff8080",marginBottom:8,wordBreak:"break-word"}}>{err}</div>}
-    <div style={{display:"flex",gap:6}}>
-      <textarea ref={inputRef} value={question} onChange={e=>setQuestion(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();ask(question);}}} placeholder="Ask anything…" rows={1} style={{flex:1,boxSizing:"border-box",minHeight:44,background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.text,outline:"none",resize:"none",fontFamily:"inherit",lineHeight:1.4}}/>
-      <button onClick={()=>ask(question)} disabled={!question.trim()||loading} style={{padding:"0 16px",borderRadius:8,background:question.trim()&&!loading?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,cursor:question.trim()&&!loading?"pointer":"default",fontSize:T.body}}>{loading?"…":"Ask"}</button>
-    </div>
+    {!aiPref(profile,"coach")?(
+      <div style={{background:C.bg,border:`1px dashed ${C.border}`,borderRadius:8,padding:"10px 12px",fontSize:12,color:C.muted,lineHeight:1.5}}>AI Coach is turned off in Settings → AI &amp; Privacy.</div>
+    ):(<>
+      {history.length===0&&<div style={{display:"flex",flexDirection:"column",gap:5,marginBottom:10}}>
+        {suggestions.map((s,i)=>(
+          <button key={i} onClick={()=>ask(s)} disabled={loading} style={{textAlign:"left",fontSize:12,color:C.muted,background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"7px 10px",cursor:loading?"default":"pointer"}}>{s}</button>
+        ))}
+      </div>}
+      {err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"7px 10px",fontSize:11,color:"#ff8080",marginBottom:8,wordBreak:"break-word"}}>
+        {err.friendly||String(err)}
+        {err.detail&&<details style={{marginTop:4}}><summary style={{cursor:"pointer",color:"#ff8080cc",fontSize:10}}>Details</summary><div style={{marginTop:3,fontFamily:"monospace",fontSize:10,opacity:0.85}}>{err.detail}</div></details>}
+      </div>}
+      <div style={{display:"flex",gap:6}}>
+        <textarea ref={inputRef} value={question} onChange={e=>setQuestion(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();ask(question);}}} placeholder="Ask anything…" rows={1} style={{flex:1,boxSizing:"border-box",minHeight:44,background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.text,outline:"none",resize:"none",fontFamily:"inherit",lineHeight:1.4}}/>
+        <button onClick={()=>ask(question)} disabled={!question.trim()||loading} style={{padding:"0 16px",borderRadius:8,background:question.trim()&&!loading?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,cursor:question.trim()&&!loading?"pointer":"default",fontSize:T.body}}>{loading?"…":"Ask"}</button>
+      </div>
+    </>)}
   </div>);
 }
 
@@ -8074,7 +8451,13 @@ function ProgressCard({progress}){
     </div>
   </div>);
 }
-function HistoryTab({weights,products,profile,medications,medLog,progress,onLogMed,onUnlogMed}){
+function HistoryTab({weights,setWeights,weightPhases,setWeightPhases,products,profile,medications,medLog,progress,onLogMed,onUnlogMed}){
+  // Overview | Trends | Days | Achievements — History used to do two unrelated jobs at once
+  // (gamification progress AND a chronological day archive) with no way to just see "am I
+  // actually progressing". This segments them: the day-by-day list is now one view among four
+  // rather than the whole tab, and Overview/Trends answer the "progressing?" question directly
+  // instead of making the user infer it from a list of individual days.
+  const [progView,setProgView]=useState("overview");
   const [dates,setDates]=useState([]);const [logs,setLogs]=useState({});const [expanded,setExpanded]=useState(null);const [loading,setLoading]=useState(true);
   const [editMeal,setEditMeal]=useState(null);const [editAct,setEditAct]=useState(null);const [addMealDate,setAddMealDate]=useState(null);const [addActDate,setAddActDate]=useState(null);
   const [newDayPicker,setNewDayPicker]=useState(false);const [newDayDate,setNewDayDate]=useState("");
@@ -8100,9 +8483,76 @@ function HistoryTab({weights,products,profile,medications,medLog,progress,onLogM
   const addMeal=(date,meal)=>{const log=logs[date];updateLog(date,{...log,meals:[...log.meals,meal]});setAddMealDate(null);};
   const addAct=(date,act)=>{const log=logs[date];updateLog(date,{...log,activities:[...(log.activities||[]),act]});setAddActDate(null);};
   const toggleTag=(date,tagId)=>{const log=logs[date];const tags=log.tags||[];updateLog(date,{...log,tags:tags.includes(tagId)?tags.filter(t=>t!==tagId):[...tags,tagId]});};
+  // 7-day and 30-day adherence, computed once here and reused by both Overview and Trends so
+  // the two views can never show different numbers for the same window.
+  const adh7 = adherenceWindow(dates, logs, weights, profile, 7);
+  const adh30 = adherenceWindow(dates, logs, weights, profile, 30);
+  const latestWeightVal = weights[0]?.weight ?? null;
+  const wTrendWeek = shortTrend(weights);
+  const wTrendMonth = monthTrend(weights);
+  const eta = weeksToTarget(latestWeightVal, profile?.targetWeightKg, wTrendWeek ?? wTrendMonth);
+
   return(<div style={{height:"100%",overflowY:"auto",padding:"0 16px 20px"}}>
-    <div style={{padding:"18px 0 12px",display:"flex",justifyContent:"space-between",alignItems:"flex-end"}}><div><div style={{fontSize:T.h1,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>History</div><div style={{fontSize:12,color:C.muted}}>{dates.length} days logged</div></div><button onClick={()=>setNewDayPicker(p=>!p)} style={{padding:"8px 14px",borderRadius:8,background:newDayPicker?`${C.lime}20`:C.card,border:`1px solid ${newDayPicker?C.lime:C.border}`,color:newDayPicker?C.lime:C.muted,fontWeight:600,cursor:"pointer",fontSize:12}}>+ Past day</button></div>
-    <ProgressCard progress={progress}/>
+    <div style={{padding:"18px 0 12px"}}><div style={{fontSize:T.h1,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>Progress</div></div>
+    <div style={{display:"flex",gap:5,marginBottom:14,flexWrap:"wrap"}}>{[["overview","Overview"],["trends","Trends"],["days","Days"],["achievements","Achievements"]].map(([id,lbl])=>{
+      const active=progView===id;
+      return(<button key={id} onClick={()=>setProgView(id)} style={{flex:1,minWidth:70,padding:"9px 4px",borderRadius:10,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.card,color:active?C.lime:C.muted,fontWeight:active?700:500,cursor:"pointer",fontSize:T.sm}}>{lbl}</button>);
+    })}</div>
+
+    {progView==="overview"&&(<>
+      <WeightProgressCard profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases} setWeightPhases={setWeightPhases}/>
+      <Card title="Calories — last 7 days">
+        {adh7.loggedDays>0?(<>
+          <div style={{display:"flex",gap:SP.lg,marginBottom:SP.sm}}>
+            <div><div style={{fontSize:T.label,color:C.muted}}>Average</div><div style={{fontSize:T.h2,fontWeight:800,fontFamily:"monospace",color:C.text}}>{Math.round(adh7.avgKcal)}</div></div>
+            <div><div style={{fontSize:T.label,color:C.muted}}>Target average</div><div style={{fontSize:T.h2,fontWeight:800,fontFamily:"monospace",color:C.muted}}>{Math.round(adh7.avgTargetKcal)}</div></div>
+          </div>
+          <div style={{fontSize:T.sm,color:C.text}}>{adh7.onTarget}/{adh7.loggedDays} days on target{adh7.loggedDays<adh7.totalDays?` (${adh7.totalDays-adh7.loggedDays} not logged)`:""}</div>
+        </>):<div style={{fontSize:T.sm,color:C.muted}}>Log a few days to see this.</div>}
+      </Card>
+      <Card title="Protein — last 7 days">
+        {adh7.loggedDays>0?(<>
+          <div style={{fontSize:T.h2,fontWeight:800,fontFamily:"monospace",color:C.text}}>{Math.round(adh7.avgProtein)}g<span style={{fontSize:T.sm,color:C.muted,fontWeight:400}}> / {Math.round(adh7.avgTargetProtein)}g target</span></div>
+          <div style={{fontSize:T.sm,color:C.muted,marginTop:2}}>{adh7.avgTargetProtein>0?Math.round(adh7.avgProtein/adh7.avgTargetProtein*100):0}% of target on average</div>
+        </>):<div style={{fontSize:T.sm,color:C.muted}}>Log a few days to see this.</div>}
+      </Card>
+      <Card title="Training this week">
+        <div style={{fontFamily:"monospace",fontSize:T.h2,fontWeight:800,color:C.purple}}>{progress?.week?.trained ?? 0}{progress?.week?.scheduled>0?`/${progress.week.scheduled}`:""}<span style={{fontSize:T.sm,color:C.muted,fontWeight:400}}> sessions</span></div>
+      </Card>
+      <Card title="Goal projection">
+        {latestWeightVal==null?<div style={{fontSize:T.sm,color:C.muted}}>Log your weight to see a projection.</div>
+          :!profile?.targetWeightKg?<div style={{fontSize:T.sm,color:C.muted}}>Set a target weight in Settings to see a projection.</div>
+          :eta==null?<div style={{fontSize:T.sm,color:C.muted}}>Not enough of a trend yet in the direction of your target.</div>
+          :<div style={{fontSize:T.body,color:C.text,lineHeight:1.5}}>At your current weight trend, about <b style={{fontFamily:"monospace"}}>{eta} week{eta!==1?"s":""}</b> to {profile.targetWeightKg}kg.</div>}
+      </Card>
+    </>)}
+
+    {progView==="trends"&&(<>
+      <Card title="Calories">
+        <div style={{display:"flex",gap:SP.xl,marginBottom:SP.sm}}>
+          <div><div style={{...eyebrow(),marginBottom:2}}>7-day avg</div><div style={{fontSize:T.h2,fontWeight:800,fontFamily:"monospace",color:C.text}}>{adh7.loggedDays?Math.round(adh7.avgKcal):"—"}</div></div>
+          <div><div style={{...eyebrow(),marginBottom:2}}>30-day avg</div><div style={{fontSize:T.h2,fontWeight:800,fontFamily:"monospace",color:C.text}}>{adh30.loggedDays?Math.round(adh30.avgKcal):"—"}</div></div>
+        </div>
+        <div style={{fontSize:T.sm,color:C.muted}}>{adh7.onTarget}/{adh7.loggedDays||0} on target this week · {adh30.onTarget}/{adh30.loggedDays||0} over 30 days</div>
+      </Card>
+      <Card title="Protein">
+        <div style={{display:"flex",gap:SP.xl}}>
+          <div><div style={{...eyebrow(),marginBottom:2}}>7-day avg</div><div style={{fontSize:T.h2,fontWeight:800,fontFamily:"monospace",color:C.text}}>{adh7.loggedDays?Math.round(adh7.avgProtein):"—"}g</div></div>
+          <div><div style={{...eyebrow(),marginBottom:2}}>30-day avg</div><div style={{fontSize:T.h2,fontWeight:800,fontFamily:"monospace",color:C.text}}>{adh30.loggedDays?Math.round(adh30.avgProtein):"—"}g</div></div>
+        </div>
+      </Card>
+      <Card title="Weight trend">
+        <div style={{display:"flex",gap:SP.xl}}>
+          <div><div style={{...eyebrow(),marginBottom:2}}>Last 7 days</div><div style={{fontSize:T.h3,fontWeight:800,fontFamily:"monospace",color:wTrendWeek==null?C.muted:wTrendWeek<0?C.lime:C.red}}>{wTrendWeek==null?"—":`${wTrendWeek<0?"↓":"↑"}${Math.abs(wTrendWeek).toFixed(2)}kg/wk`}</div></div>
+          <div><div style={{...eyebrow(),marginBottom:2}}>Last 30 days</div><div style={{fontSize:T.h3,fontWeight:800,fontFamily:"monospace",color:wTrendMonth==null?C.muted:wTrendMonth<0?C.lime:C.red}}>{wTrendMonth==null?"—":`${wTrendMonth<0?"↓":"↑"}${Math.abs(wTrendMonth).toFixed(2)}kg/wk`}</div></div>
+        </div>
+      </Card>
+    </>)}
+
+    {progView==="achievements"&&<ProgressCard progress={progress}/>}
+
+    {progView==="days"&&(<>
+    <div style={{display:"flex",justifyContent:"flex-end",marginBottom:12}}><button onClick={()=>setNewDayPicker(p=>!p)} style={{padding:"8px 14px",borderRadius:8,background:newDayPicker?`${C.lime}20`:C.card,border:`1px solid ${newDayPicker?C.lime:C.border}`,color:newDayPicker?C.lime:C.muted,fontWeight:600,cursor:"pointer",fontSize:12}}>+ Past day</button></div>
     {newDayPicker&&<div style={{background:C.card,border:`1px solid ${C.lime}`,borderRadius:12,padding:"12px 14px",marginBottom:12,display:"flex",gap:8,alignItems:"center"}}>
       <input type="date" value={newDayDate} onChange={e=>setNewDayDate(e.target.value)} max={TODAY()} style={{flex:1,background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:T.body,outline:"none"}}/>
       <button onClick={()=>createDay(newDayDate)} disabled={!newDayDate} style={{padding:"9px 14px",borderRadius:8,background:newDayDate?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,cursor:newDayDate?"pointer":"default",fontSize:T.body}}>Add</button>
@@ -8238,6 +8688,7 @@ function HistoryTab({weights,products,profile,medications,medLog,progress,onLogM
       })}
     </div>
     {dates.length>visibleCount&&<button onClick={loadMore} style={{width:"100%",marginTop:10,padding:"10px 0",borderRadius:8,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12}}>▾ Load {Math.min(60,dates.length-visibleCount)} more · {dates.length-visibleCount} older days</button>}
+    </>)}
   </div>);
 }
 
@@ -8566,14 +9017,91 @@ function DayTypesSettingsCard({dayTypes,setDayTypes,latestWeight}){
     </div>}
   </div>);
 }
-function SettingsTab({profile,setProfile,weights,setWeights,weightPhases,setWeightPhases,latestWeight,medications,setMedications,dayTypes,setDayTypes}){
+// What each AI feature actually reads before it sends anything — named plainly rather than
+// leaving the user to guess from a toggle label. Kept next to the card so the copy can't drift
+// from what buildContext()/AddMealSheet actually gate.
+const AI_DATA_SENT = [
+  {key:"mealAnalysis", label:"AI meal analysis", desc:"Sends the photo(s) and/or description you provide for that one meal. Nothing else from your log is attached."},
+  {key:"coach", label:"AI Coach", desc:"Sends your question, plus whichever history categories below are turned on."},
+  {key:"includeWeightHistory", label:"Weight history", desc:"Recent weight trend, weight phases, and your latest logged weight.", indent:true},
+  {key:"includeMealHistory", label:"Meal history", desc:"Today's and the last 7 days' meal totals, active meal preps.", indent:true},
+  {key:"includeWorkoutHistory", label:"Workout history", desc:"Recent gym sessions, training method, scheduled training days.", indent:true},
+];
+// Show XP / Show streaks — both default ON (unchanged look for anyone who hasn't touched this),
+// but someone who wants a plain calorie tracker can turn either off without losing the
+// underlying tracking: XP, levels, streaks and badges keep accumulating in the background and
+// stay visible under Progress → Achievements either way — this only controls whether the level
+// bar and streak strip take up space on Today.
+function MotivationCard({profile,setProfile}){
+  const set = (key,val) => setProfile(p=>({...p, motivationPrefs:{showXp:true,showStreaks:true, ...(p.motivationPrefs||{}), [key]:val}}));
+  const rows = [
+    {key:"showXp", label:"Show XP & level on Today"},
+    {key:"showStreaks", label:"Show streaks on Today"},
+  ];
+  return(<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:12}}>
+    <div style={{fontSize:T.body,fontWeight:600,color:C.text,marginBottom:4}}>Motivation</div>
+    <div style={{fontSize:11,color:C.muted,marginBottom:12,lineHeight:1.6}}>Turn off what you don't want cluttering Today — your XP, level and streaks keep counting either way, and stay available under Progress → Achievements.</div>
+    <div style={{display:"flex",flexDirection:"column",gap:2}}>
+      {rows.map(row=>{
+        const on = profile?.motivationPrefs?.[row.key] ?? true;
+        return(<button key={row.key} onClick={()=>set(row.key,!on)} style={{display:"flex",alignItems:"center",gap:10,padding:`${SP.sm}px 0`,background:"none",border:"none",textAlign:"left"}}>
+          <span style={{flex:1,fontSize:T.sm,fontWeight:600,color:C.text}}>{row.label}</span>
+          <span aria-hidden="true" style={{flexShrink:0,width:40,height:24,borderRadius:12,background:on?C.lime:C.dim,position:"relative",transition:`background .15s ${EASE.out}`}}>
+            <span style={{position:"absolute",top:2,left:on?18:2,width:20,height:20,borderRadius:"50%",background:"#fff",transition:`left .15s ${EASE.out}`}}/>
+          </span>
+        </button>);
+      })}
+    </div>
+  </div>);
+}
+function AiPrivacyCard({profile,setProfile}){
+  const [showDetail,setShowDetail]=useState(false);
+  const set = (key,val) => setProfile(p=>({...p, aiPrefs:{...DEFAULT_AI_PREFS, ...(p.aiPrefs||{}), [key]:val}}));
+  const clearConversations = () => {
+    // Matches CoachPanel's own storageKey literals exactly (it already includes "fit_" in the
+    // key it hands to store.get/set, same double-prefix convention as every other storage key).
+    store.set("fit_coach_history_sports", []);
+    store.set("fit_coach_history_food", []);
+    // Both CoachPanel instances read their history from storage on mount only, so a live one
+    // on screen right now won't clear itself without a reload — same tradeoff Export/Import
+    // already makes elsewhere in Settings, so a reload isn't a surprise pattern here.
+    window.location.reload();
+  };
+  return(<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:12}}>
+    <div style={{fontSize:T.body,fontWeight:600,color:C.text,marginBottom:4}}>AI &amp; Privacy</div>
+    <div style={{fontSize:11,color:C.muted,marginBottom:12,lineHeight:1.6}}>Your profile and logs are stored locally. Turning a feature on here lets it send the data described below to the configured AI service only when you actively use that feature — nothing is sent in the background.</div>
+    <div style={{display:"flex",flexDirection:"column",gap:2}}>
+      {AI_DATA_SENT.map(row=>{
+        const on = aiPref(profile,row.key);
+        // The three history toggles are meaningless once the Coach itself is off — grey them
+        // out rather than hide them, so turning Coach back on doesn't silently reset them.
+        const disabled = row.indent && !aiPref(profile,"coach");
+        return(<button key={row.key} onClick={()=>!disabled&&set(row.key,!on)} disabled={disabled}
+          style={{display:"flex",alignItems:"center",gap:10,padding:`${SP.sm}px ${row.indent?SP.md:0}px`,marginLeft:row.indent?SP.md:0,background:"none",border:"none",textAlign:"left",opacity:disabled?0.4:1,borderLeft:row.indent?`2px solid ${C.border}`:"none"}}>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:T.sm,fontWeight:600,color:C.text}}>{row.label}</div>
+            {showDetail&&<div style={{fontSize:T.label,color:C.muted,marginTop:2,lineHeight:1.4}}>{row.desc}</div>}
+          </div>
+          <span aria-hidden="true" style={{flexShrink:0,width:40,height:24,borderRadius:12,background:on?C.lime:C.dim,position:"relative",transition:`background .15s ${EASE.out}`}}>
+            <span style={{position:"absolute",top:2,left:on?18:2,width:20,height:20,borderRadius:"50%",background:"#fff",transition:`left .15s ${EASE.out}`}}/>
+          </span>
+        </button>);
+      })}
+    </div>
+    <button onClick={()=>setShowDetail(v=>!v)} style={{marginTop:8,background:"none",border:"none",color:C.blue,fontSize:T.label,cursor:"pointer",padding:0}}>{showDetail?"Hide details":"What data is sent?"}</button>
+    <div style={{display:"flex",gap:8,marginTop:12}}>
+      <button onClick={clearConversations} style={{flex:1,padding:"9px 0",minHeight:40,borderRadius:8,background:"none",border:`1px solid ${C.border}`,color:C.muted,fontWeight:600,cursor:"pointer",fontSize:T.sm}}>Clear AI conversations</button>
+    </div>
+  </div>);
+}
+function SettingsTab({profile,setProfile,weights,weightPhases,setWeightPhases,latestWeight,medications,setMedications,dayTypes,setDayTypes,onGoToProgress}){
   const [editProf,setEditProf]=useState(false);const [pf,setPf]=useState({...profile});
-  const [exportMsg,setExportMsg]=useState("");const [editWIdx,setEditWIdx]=useState(null);const [editWVal,setEditWVal]=useState("");const [showAllW,setShowAllW]=useState(false);
+  const [exportMsg,setExportMsg]=useState("");
   const [pendingGoal,setPendingGoal]=useState(null); // goal being transitioned to
   const AGE=calcAge(profile.birthday);
   const saveProfile=()=>{setProfile({...pf,heightCm:parseFloat(pf.heightCm)||null,apiKey:pf.apiKey||""});setEditProf(false);};
   const exportData=async()=>{
-    const keys=["fit_dates","fit_weights","fit_products","fit_mealpreps","fit_profile","fit_photos","fit_weight_phases","fit_seeded_presets","fit_gym_schedule","fit_gym_templates","fit_gym_day_assign","fit_gym_sessions","fit_gym_settings","fit_gym_exercise_library","fit_recipes","fit_medications","fit_med_log","fit_day_types"];
+    const keys=["fit_dates","fit_weights","fit_products","fit_mealpreps","fit_profile","fit_photos","fit_weight_phases","fit_seeded_presets","fit_gym_schedule","fit_gym_templates","fit_gym_day_assign","fit_gym_sessions","fit_gym_settings","fit_gym_exercise_library","fit_recipes","fit_medications","fit_med_log","fit_day_types","fit_meal_favorites"];
     const out={};for(const k of keys){out[k]=await store.get(k,null);}
     const dates=out.fit_dates||[];for(const d of dates){out["fit_day_"+d]=await store.get("fit_day_"+d,null);}
     const blob=new Blob([JSON.stringify(out,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="fitness-data-"+TODAY()+".json";a.click();URL.revokeObjectURL(url);setExportMsg("Exported!");setTimeout(()=>setExportMsg(""),2000);
@@ -8601,22 +9129,17 @@ function SettingsTab({profile,setProfile,weights,setWeights,weightPhases,setWeig
     }
   };
   const ref=useRef();
-  // Weight management  
-  const [wInput,setWInput]=useState("");
-  const logWeight=()=>{const w=parseNum(wInput);if(!w)return;const e={date:TODAY(),weight:w};setWeights(p=>[e,...p.filter(x=>x.date!==e.date)].sort((a,b)=>b.date.localeCompare(a.date)));setWInput("");};
-  const saveEditW=i=>{const w=parseNum(editWVal);if(!w)return;setWeights(p=>{const n=[...p];n[i]={...n[i],weight:w};return n.sort((a,b)=>b.date.localeCompare(a.date));});setEditWIdx(null);};
-  const trend=weeklyTrend(weights);const latest=weights[0];
-  const spark=[...weights].reverse().slice(-14);const W=270,H=44;const vals=spark.map(w=>w.weight);const sMin=vals.length?Math.min(...vals)-0.3:65;const sMax=vals.length?Math.max(...vals)+0.3:70;const px=i=>spark.length>1?(i/(spark.length-1))*W:W/2;const py=v=>H-((v-sMin)/(sMax-sMin))*H;
   return(<div style={{height:"100%",overflowY:"auto",padding:"0 16px 20px"}}>
-    <div style={{padding:"18px 0 14px"}}><div style={{fontSize:T.h1,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>Settings</div></div>
+    <div style={{padding:"18px 0 14px"}}><div style={{fontSize:T.h1,fontWeight:800,color:C.text,letterSpacing:"-0.03em"}}>More</div></div>
 
-    {/* Weight history */}
-    <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:12}}>
-      <div style={{fontSize:T.body,fontWeight:600,color:C.text,marginBottom:10}}>Weight Log</div>
-      {latest&&<div style={{marginBottom:10}}><div style={{display:"flex",alignItems:"baseline",gap:6}}><span style={{fontFamily:"monospace",fontSize:28,fontWeight:800,color:C.lime,lineHeight:1}}>{latest.weight.toFixed(2)}</span><span style={{fontSize:T.body,color:C.muted}}>kg</span>{trend!==null&&<span style={{fontFamily:"monospace",fontSize:12,color:trend<0?C.lime:C.red,marginLeft:4}}>{trend<0?"↓":"↑"}{Math.abs(trend).toFixed(2)}/wk</span>}</div>{spark.length>=3&&<svg width={W} height={H} style={{marginTop:8,display:"block",overflow:"visible"}}><polyline points={spark.map((d,i)=>px(i)+","+py(d.weight)).join(" ")} fill="none" stroke={C.lime+"55"} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round"/><polyline points={spark.map((d,i)=>px(i)+","+py(d.weight)).join(" ")} fill="none" stroke={C.lime} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"/><circle cx={px(spark.length-1)} cy={py(spark[spark.length-1].weight)} r={4} fill={C.lime}/></svg>}</div>}
-      <div style={{display:"flex",gap:8,marginBottom:10}}><input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" step="0.05" placeholder="Log weight (kg)" value={wInput} onChange={e=>setWInput(e.target.value.replace(",","."))} onKeyDown={e=>e.key==="Enter"&&logWeight()} style={{flex:1,minHeight:44,background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.text,fontFamily:"monospace",outline:"none"}}/><button onClick={logWeight} style={{padding:"8px 16px",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:T.body}}>Save</button></div>
-      <div style={{display:"flex",flexDirection:"column",gap:5}}>{weights.slice(0,showAllW?weights.length:10).map((e,i)=>(<div key={e.date}>{editWIdx===i?<div style={{background:C.bg,border:`1px solid ${C.lime}`,borderRadius:8,padding:"7px 10px",display:"flex",gap:8,alignItems:"center"}}><span style={{fontSize:11,color:C.muted,flexShrink:0}}>{new Date(e.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span><input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" step="0.05" value={editWVal} onChange={ev=>setEditWVal(ev.target.value.replace(",","."))} autoFocus style={{flex:1,background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"5px 8px",color:C.text,fontSize:T.body,fontFamily:"monospace",outline:"none"}}/><button onClick={()=>saveEditW(i)} style={{padding:"5px 10px",borderRadius:6,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>✓</button><button onClick={()=>setEditWIdx(null)} style={{padding:"5px 8px",borderRadius:6,background:C.card,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12}}>✕</button></div>:<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:C.bg,borderRadius:8,padding:"7px 10px"}}><span style={{fontSize:11,color:C.muted}}>{new Date(e.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span><div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontFamily:"monospace",fontSize:T.body,fontWeight:700,color:i===0?C.lime:C.text}}>{e.weight.toFixed(2)} kg</span><button onClick={()=>{setEditWIdx(i);setEditWVal(String(e.weight));}} aria-label="Edit this weight" style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:T.sm,padding:`${SP.xs}px ${SP.sm}px`,borderRadius:R.sm}}>✎</button><button onClick={()=>setWeights(p=>p.filter((_,j)=>j!==i))} style={{background:"none",border:"none",color:C.faint,fontSize:T.body,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div></div>}</div>))}{weights.length>10&&<button onClick={()=>setShowAllW(p=>!p)} style={{fontSize:11,color:C.muted,background:"none",border:`1px dashed ${C.border}`,borderRadius:6,padding:"5px 0",cursor:"pointer",marginTop:2}}>{showAllW?`▲ Show less`:`▾ Show all ${weights.length} entries`}</button>}</div>
-    </div>
+    {/* Weight log, its graph and phase tracking live in Progress now — this used to be a third
+        copy of the same UI (Today had a quick check-in, Training had the full log, and this was
+        a SECOND full log), which is exactly the kind of duplication that makes an app hard to
+        reason about ("wait, was weight in Training or Settings?"). */}
+    <button onClick={onGoToProgress} style={{width:"100%",marginBottom:12,background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"12px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}}>
+      <span style={{fontSize:T.body,color:C.text}}>Weight log, graph &amp; phases</span>
+      <span style={{color:C.muted,fontSize:T.body}}>Progress →</span>
+    </button>
 
     {/* Profile */}
     <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:12}}>
@@ -8675,6 +9198,10 @@ function SettingsTab({profile,setProfile,weights,setWeights,weightPhases,setWeig
       <TestAPIButton apiKey={profile.apiKey}/>
       <div style={{marginTop:10}}><div style={{fontSize:11,color:C.muted,marginBottom:4}}>API Key (standalone only — leave blank in Claude.ai)</div><Field label="" value={profile.apiKey||""} onChange={v=>setProfile(p=>({...p,apiKey:v}))} placeholder="sk-ant-api03-..." type="password"/></div>
     </div>
+
+    <MotivationCard profile={profile} setProfile={setProfile}/>
+
+    <AiPrivacyCard profile={profile} setProfile={setProfile}/>
 
     {/* Export / Import */}
     <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px"}}>
@@ -8759,7 +9286,7 @@ function OnboardingScreen({onDone}){
           <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Sex</div>
           <div style={{display:"flex",gap:8}}>{[["male","Male"],["female","Female"]].map(([val,lbl])=>(<button key={val} onClick={()=>setSex(val)} style={{flex:1,padding:"12px 0",borderRadius:10,border:`1px solid ${sex===val?C.lime:C.border}`,background:sex===val?`${C.lime}18`:C.bg,color:sex===val?C.lime:C.muted,fontWeight:sex===val?700:500,cursor:"pointer",fontSize:T.body}}>{lbl}</button>))}</div>
         </div>
-        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px"}}><div style={{fontSize:11,color:C.muted}}>Used only to calculate your BMR and personalized kcal targets. Not shared with anyone.</div></div>
+        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px"}}><div style={{fontSize:11,color:C.muted,lineHeight:1.6}}>Your profile is stored locally and used to calculate your BMR and calorie targets. AI-powered features (photo meal logging, the Coach) may send relevant profile and tracking information to the configured AI service when you use them — you can review and turn these off individually in Settings → AI &amp; Privacy.</div></div>
       </div>)}
 
       {step===2&&(<div style={{display:"flex",flexDirection:"column",gap:8}}>
@@ -8796,16 +9323,21 @@ const NavIcon = ({name, size=23}) => {
   const p = {fill:"none",stroke:"currentColor",strokeWidth:1.75,strokeLinecap:"round",strokeLinejoin:"round"};
   const paths = {
     today:    <><circle cx="12" cy="12" r="8.5" {...p}/><path d="M12 7.5v4.8l3 1.8" {...p}/></>,
-    activity: <path d="M3 12h3.5l2.5-7 4 14 2.5-7H21" {...p}/>,
+    training: <path d="M3 12h3.5l2.5-7 4 14 2.5-7H21" {...p}/>,
     food:     <><path d="M4 3.5v6a2.5 2.5 0 0 0 5 0v-6" {...p}/><path d="M6.5 9.5V20.5" {...p}/><path d="M17.5 3.5c-1.6 1.2-2.3 3-2.3 5.2 0 1.6.6 2.6 2.3 2.9V20.5" {...p}/></>,
-    history:  <><path d="M3.5 6.5h17M3.5 12h17M3.5 17.5h17" {...p}/></>,
-    settings: <><circle cx="12" cy="12" r="3.1" {...p}/><path d="M19.4 14.5a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1v.3a2 2 0 1 1-4 0v-.2a1.6 1.6 0 0 0-2.8-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7H3a2 2 0 1 1 0-4h.2a1.6 1.6 0 0 0 1.1-2.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3h.1a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.2a1.6 1.6 0 0 0 2.7 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8v.1a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.2a1.6 1.6 0 0 0-1.4 1z" {...p}/></>,
+    progress: <><path d="M4 20V11" {...p}/><path d="M11 20V4" {...p}/><path d="M18 20v-7" {...p}/></>,
+    more:     <><circle cx="12" cy="12" r="3.1" {...p}/><path d="M19.4 14.5a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1v.3a2 2 0 1 1-4 0v-.2a1.6 1.6 0 0 0-2.8-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7H3a2 2 0 1 1 0-4h.2a1.6 1.6 0 0 0 1.1-2.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3h.1a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.2a1.6 1.6 0 0 0 2.7 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8v.1a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.2a1.6 1.6 0 0 0-1.4 1z" {...p}/></>,
   };
   return <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" style={{display:"block",flexShrink:0}}>{paths[name]}</svg>;
 };
 
+// Today | Food | Training | Progress | More. Previously Today/Activity/Food/History/Settings —
+// the names didn't match what was actually inside them (Activity mixed gym planning with
+// weight logging, Food buried the primary "log something" action under a coach panel, History
+// did both gamification AND a chronological archive). This groups by what the user is trying to
+// do, not by what data model happened to hold it.
 function Nav({tab,setTab}){
-  const tabs=[["today","Today"],["activity","Activity"],["food","Food"],["history","History"],["settings","Settings"]];
+  const tabs=[["today","Today"],["food","Food"],["training","Training"],["progress","Progress"],["more","More"]];
   // Height is 58 + the iOS home-indicator inset. Previously a flat 52px with no inset, which
   // put the bottom of every tab button underneath the home indicator on notched iPhones.
   //
@@ -8918,6 +9450,73 @@ function ImportScreen({onImport,onSkip}){
   </div>);
 }
 
+// ── Universal Quick Log ────────────────────────────────────────────────────────
+// A single "+" reachable from every tab, instead of the old behaviour where the floating +
+// only ever meant "log a meal" and everything else (weight, an activity, supplements) lived
+// wherever its owning tab happened to be. Renders once at the App shell level so it's the same
+// button and the same six options no matter which tab is on screen.
+const QUICK_LOG_ACTIONS = [
+  {id:"meal", label:"Meal", emoji:"🍽️"},
+  {id:"barcode", label:"Product / Barcode", emoji:"📦"},
+  {id:"weight", label:"Weight", emoji:"⚖️"},
+  {id:"activity", label:"Activity", emoji:"🏃"},
+  {id:"steps", label:"Steps", emoji:"👣"},
+  {id:"supplement", label:"Supplement", emoji:"💊"},
+];
+function QuickLogPicker({onPick,onClose,dueCount}){
+  return(<Sheet onClose={onClose} title="Quick Log">
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:SP.sm}}>
+      {QUICK_LOG_ACTIONS.map(a=>(
+        <button key={a.id} onClick={()=>onPick(a.id)} aria-label={a.label} style={{position:"relative",padding:"18px 10px",borderRadius:R.md,background:C.card,border:`1px solid ${C.border}`,color:C.text,display:"flex",flexDirection:"column",alignItems:"center",gap:8,cursor:"pointer"}}>
+          <span style={{fontSize:26}} aria-hidden="true">{a.emoji}</span>
+          <span style={{fontSize:T.sm,fontWeight:600}}>{a.label}</span>
+          {a.id==="supplement"&&dueCount>0&&<span style={{position:"absolute",top:8,right:8,minWidth:18,height:18,borderRadius:9,background:C.orange,color:"#000",fontSize:10,fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 4px"}}>{dueCount}</span>}
+        </button>
+      ))}
+    </div>
+  </Sheet>);
+}
+function QuickWeightSheet({weights,setWeights,onClose}){
+  const [wInput,setWInput]=useState("");
+  const [err,setErr]=useState("");
+  const todayW=weights.find(w=>w.date===TODAY());
+  const log=()=>{
+    const w=parseNum(wInput);
+    if(!w||isNaN(w)){setErr("Enter a weight in kg.");return;}
+    if(w<25||w>400){setErr("Enter a weight between 25 and 400 kg.");return;}
+    setWeights(p=>[{date:TODAY(),weight:w},...p.filter(x=>x.date!==TODAY())].sort((a,b)=>b.date.localeCompare(a.date)));
+    onClose();
+  };
+  return(<Sheet onClose={onClose} title="Log Weight">
+    {todayW&&<div style={{fontSize:T.sm,color:C.muted,marginBottom:10}}>Already logged today: <b style={{color:C.text}}>{todayW.weight.toFixed(2)} kg</b> — saving again will overwrite it.</div>}
+    <div style={{display:"flex",gap:8}}>
+      <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" autoFocus placeholder="e.g. 75.00" value={wInput} onChange={e=>{setWInput(e.target.value.replace(",","."));if(err)setErr("");}} onKeyDown={e=>e.key==="Enter"&&log()} style={{flex:1,minHeight:44,background:C.bg,border:`1px solid ${err?C.red:C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.text,fontFamily:"monospace",fontSize:16,outline:"none"}}/>
+      <span style={{alignSelf:"center",color:C.muted,fontSize:T.body}}>kg</span>
+    </div>
+    {err&&<div role="alert" style={{fontSize:T.sm,color:C.red,marginTop:8}}>{err}</div>}
+    <button onClick={log} disabled={!wInput.trim()} style={{width:"100%",marginTop:14,padding:"12px 0",minHeight:44,borderRadius:10,background:wInput.trim()?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,fontSize:T.body}}>Save</button>
+  </Sheet>);
+}
+function QuickStepsSheet({dayData,setDayData,onClose}){
+  const [steps,setSteps]=useState(String(dayData.dailySteps||""));
+  const save=()=>{ setDayData(p=>({...p,dailySteps:parseInt(steps.replace(/\D/g,""))||0})); onClose(); };
+  return(<Sheet onClose={onClose} title="Log Steps">
+    <div style={{fontSize:T.sm,color:C.muted,marginBottom:10}}>Background movement only — errands, walking around. A deliberate walk belongs under Activity instead.</div>
+    <input type="text" inputMode="numeric" pattern="[0-9]*" autoFocus placeholder="0" value={steps} onChange={e=>setSteps(e.target.value.replace(/\D/g,""))} onKeyDown={e=>e.key==="Enter"&&save()} style={{width:"100%",boxSizing:"border-box",minHeight:44,background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.text,fontFamily:"monospace",fontWeight:700,fontSize:16,outline:"none"}}/>
+    <div style={{display:"flex",gap:6,marginTop:10}}>{[2000,5000,8000,10000].map(n=>(
+      <button key={n} onClick={()=>setSteps(String(n))} style={{flex:1,padding:"8px 0",minHeight:40,borderRadius:R.sm,border:`1px solid ${String(n)===steps?C.orange:C.border}`,background:String(n)===steps?`${C.orange}18`:C.bg,color:String(n)===steps?C.orange:C.muted,fontSize:T.sm,fontFamily:"monospace"}}>{n/1000}k</button>
+    ))}</div>
+    <button onClick={save} style={{width:"100%",marginTop:14,padding:"12px 0",minHeight:44,borderRadius:10,background:C.lime,border:"none",color:"#000",fontWeight:700,fontSize:T.body}}>Save</button>
+  </Sheet>);
+}
+function QuickSupplementSheet({medications,medLog,onMark,onClose}){
+  const due=dueMedReminders(medications,medLog);
+  return(<Sheet onClose={onClose} title="Supplements">
+    {due.length===0
+      ?<div style={{fontSize:T.body,color:C.muted,textAlign:"center",padding:"20px 10px"}}>Nothing due right now. Set up medications and supplements in More → Medications.</div>
+      :<div className="hit-tight" style={{display:"flex",flexDirection:"column",gap:SP.sm}}>{due.map(med=><MedReminderRow key={med.id} med={med} onMark={(m,status)=>{onMark(m,status);}}/>)}</div>}
+  </Sheet>);
+}
 function App(){
   const [tab,setTab]=useState("today");const [dayData,setDayData_]=useState(null);const [weights,setWeights_]=useState([]);const [products,setProducts_]=useState([]);const [mealPreps,setMealPreps_]=useState([]);const [profile,setProfile_]=useState(null);const [progressPhotos,setProgressPhotos_]=useState([]);const [weightPhases,setWeightPhases_]=useState([]);const [ready,setReady]=useState(false);
   // Gym tracking state — schedule (which weekdays), per-weekday templates, completed session
@@ -8938,6 +9537,9 @@ function App(){
   // per-day log object, so history reads don't depend on that object's own rollover timing.
   const [medications,setMedications_]=useState([]);
   const [medLog,setMedLog_]=useState([]);
+  // Saved meal favourites — a short, user-curated list ("Breakfast", "Post-workout shake") for
+  // one-tap re-logging, distinct from Recent (which is derived automatically from history).
+  const [mealFavorites,setMealFavorites_]=useState([]);
   // User-editable day types. Seeded lazily from DEFAULT_DAY_TYPES on first render so the
   // energy engine has definitions to read even before the async boot load resolves.
   const [dayTypes,setDayTypes_]=useState(()=>{ setDayTypeRegistry(DEFAULT_DAY_TYPES); return DEFAULT_DAY_TYPES; });
@@ -9175,6 +9777,7 @@ function App(){
     const rRecipes=await store.get("fit_recipes",[]);
     const meds=await store.get("fit_medications",[]);
     const mLog=await store.get("fit_med_log",[]);
+    const mFavs=await store.get("fit_meal_favorites",[]);
     // Day types load before any target is computed below, so the first render prices the day
     // with the user's own definitions rather than briefly showing the builtin figures.
     const storedDayTypes=await store.get("fit_day_types",null);
@@ -9186,7 +9789,7 @@ function App(){
     // failing loudly. This app has been bricked by an unexpected storage shape before — cheap guard.
     const safeAssign = (gAssign && typeof gAssign==="object" && !Array.isArray(gAssign)) ? gAssign : {};
     setGymSchedule_(Array.isArray(gSchedule)?gSchedule:[]);setGymTemplates_(gTemplates||{});setGymDayAssign_(safeAssign);setGymSessions_(Array.isArray(gSessions)?gSessions:[]);setGymSettings_(gSettings||{trainingMethod:"maintain",customNote:""});setGymActiveSession_(normalizeGymSession(gActive));setGymExerciseLibrary_(gLibrary);setRecipes_(Array.isArray(rRecipes)?rRecipes:[]);
-    setMedications_(Array.isArray(meds)?meds:[]);setMedLog_(Array.isArray(mLog)?mLog:[]);setDayTypes_(dTypes);
+    setMedications_(Array.isArray(meds)?meds:[]);setMedLog_(Array.isArray(mLog)?mLog:[]);setDayTypes_(dTypes);setMealFavorites_(Array.isArray(mFavs)?mFavs:[]);
     // Recent history for streaks. Read after the main state is set so the first paint is not
     // delayed by it — streaks appearing a moment later is fine, a slower cold start is not.
     (async()=>{
@@ -9246,6 +9849,7 @@ function App(){
   const setRecipes=useCallback(upd=>{setRecipes_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_recipes",n);return n;});},[]);
   const setMedications=useCallback(upd=>{setMedications_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_medications",n);return n;});},[]);
   const setMedLog=useCallback(upd=>{setMedLog_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_med_log",n);return n;});},[]);
+  const setMealFavorites=useCallback(upd=>{setMealFavorites_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_meal_favorites",n);return n;});},[]);
   // The registry is updated inside the same setter as the state, so the pure energy helpers
   // and the rendered tree can never disagree about which day types exist.
   const setDayTypes=useCallback(upd=>{setDayTypes_(p=>{const n=typeof upd==="function"?upd(p):upd;setDayTypeRegistry(n);store.set("fit_day_types",n);return n;});},[]);
@@ -9296,6 +9900,18 @@ function App(){
     }
   }, [setMedLog, setMedications]);
   const latestWeight=weights[0]?.weight;
+  // Universal Quick Log — one "+" reachable from any tab. `quickAction` is null (closed),
+  // "picker" (the 6-option grid), or the id of whichever full sheet is currently open.
+  const [quickAction,setQuickAction]=useState(null);
+  const openQuickLog=()=>setQuickAction("picker");
+  const handleQuickMealAdd=entry=>{
+    if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode}));}
+    else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}));
+      const npValid=newProduct&&(newProduct.name||"").trim().length>0&&((newProduct.kcal||0)>0||(newProduct.p||0)>0||(newProduct.c||0)>0||(newProduct.f||0)>0);
+      if(npValid)setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);}
+    setQuickAction(null);
+  };
+  const quickDueMeds=dueMedReminders(medications,medLog);
   // Today's log lives in `dayData`; mirroring it into the streak window means logging a meal
   // updates the streak immediately instead of only after a reload.
   useEffect(()=>{ if(dayData) setRecentLogs(p=>p[today]===dayData?p:{...p,[today]:dayData}); },[dayData,today]);
@@ -9319,7 +9935,7 @@ function App(){
   // A live gym session pins the view to Activity and hides the tab bar (see below). Resolving
   // the tab here rather than guarding each branch keeps exactly one tab mounted — guarding
   // them individually let Food/History/Settings render *alongside* the pinned Activity tab.
-  const viewTab = gymActiveSession ? "activity" : tab;
+  const viewTab = gymActiveSession ? "training" : tab;
   if(needsOnboarding)return(<OnboardingScreen onDone={(p,startWeight)=>{
     setProfile(p);
     // Seed the weight log with the starting weight so day-one targets are computed from the
@@ -9338,16 +9954,32 @@ function App(){
       <button onClick={()=>setRolloverBanner(null)} style={{background:"none",border:"none",color:C.lime,fontSize:18,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button>
     </div>}
     <div style={{flex:1,overflow:"hidden"}}>
-      {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} setProfile={setProfile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence} progress={progress} gymSessions={gymSessions} gymDayAssign={gymDayAssign}/>}
-      {viewTab==="activity"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymDayAssign={gymDayAssign} setGymDayAssign={setGymDayAssign} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary}/>}
+      {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} setProfile={setProfile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("more")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence} progress={progress} gymSessions={gymSessions} gymDayAssign={gymDayAssign} mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
       {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes} onLogMeal={meal=>setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}))} gymSessions={gymSessions}/>}
-      {viewTab==="history"&&<HistoryTab weights={weights} products={products} profile={profile} medications={medications} medLog={medLog} progress={progress} onLogMed={logMedFor} onUnlogMed={unlogMed}/>}
-      {viewTab==="settings"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight} medications={medications} setMedications={setMedications} dayTypes={dayTypes} setDayTypes={setDayTypes}/>}
+      {viewTab==="training"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymDayAssign={gymDayAssign} setGymDayAssign={setGymDayAssign} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary}/>}
+      {viewTab==="progress"&&<HistoryTab weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} products={products} profile={profile} medications={medications} medLog={medLog} progress={progress} onLogMed={logMedFor} onUnlogMed={unlogMed}/>}
+      {viewTab==="more"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight} medications={medications} setMedications={setMedications} dayTypes={dayTypes} setDayTypes={setDayTypes} onGoToProgress={()=>setTab("progress")}/>}
     </div>
+
+    {/* Universal Quick Log FAB — same button, same six options, on every tab. Hidden during a
+        live gym session for the same reason the tab bar is (see below): a phone propped on a
+        bench is visible to whoever is behind you, and no stray tap should leave the session. */}
+    {!gymActiveSession&&<button onClick={openQuickLog} aria-label="Quick log"
+      style={{position:"absolute",bottom:`calc(58px + ${SAFE_BOTTOM} + 14px)`,right:16,width:52,height:52,borderRadius:"50%",background:C.lime,border:"none",fontSize:27,color:"#000",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 6px 22px ${C.lime}40, 0 2px 8px rgba(0,0,0,.45)`,zIndex:15}}>
+      <span aria-hidden="true" style={{marginTop:-2,fontWeight:400}}>+</span>
+    </button>}
+    {quickAction==="picker"&&<QuickLogPicker dueCount={quickDueMeds.length} onClose={()=>setQuickAction(null)} onPick={id=>setQuickAction(id)}/>}
+    {quickAction==="meal"&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleQuickMealAdd} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey} aiPrefs={profile.aiPrefs} initialMode="quick" mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
+    {quickAction==="barcode"&&<BarcodeScanSheet onAdd={handleQuickMealAdd} onClose={()=>setQuickAction(null)}/>}
+    {quickAction==="weight"&&<QuickWeightSheet weights={weights} setWeights={setWeights} onClose={()=>setQuickAction(null)}/>}
+    {quickAction==="activity"&&<AddActSheet onAdd={act=>{setDayData(p=>({...p,activities:[...(p.activities||[]),act]}));setQuickAction(null);}} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey} weightKg={latestWeight}/>}
+    {quickAction==="steps"&&<QuickStepsSheet dayData={dayData} setDayData={setDayData} onClose={()=>setQuickAction(null)}/>}
+    {quickAction==="supplement"&&<QuickSupplementSheet medications={medications} medLog={medLog} onMark={markMedOccurrence} onClose={()=>setQuickAction(null)}/>}
+
     {/* The tab bar is hidden while a gym session is live so "gym mode" is genuinely modal:
         no stray tap can reveal weight or food data to someone standing behind you, and no
         accidental swipe loses your place mid-set. Finishing or cancelling the session in the
-        Activity tab brings it straight back. */}
+        Training tab brings it straight back. */}
     {!gymActiveSession&&<Nav tab={tab} setTab={setTab}/>}
   </div>);
 }

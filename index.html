@@ -186,6 +186,14 @@ const sortProductsBy = (arr, mode) => {
   if (mode === "kcal") return list.sort((a,b)=>(a.kcal||0)-(b.kcal||0));
   return sortProducts(list);
 };
+// Every "pick a label" list in the app kept its own sort choice reset to "Name" on each open —
+// so picking "Protein" once didn't carry over to the next meal you logged. This is a per-device
+// UI preference (not data needing the cross-device `store` sync), so plain localStorage is
+// synchronous and simple. Shared by every sort dropdown in the app: pick one anywhere and it's
+// what you see everywhere next time.
+const LAST_PRODUCT_SORT_KEY = "fit_last_product_sort";
+const getLastProductSort = () => { try { return localStorage.getItem(LAST_PRODUCT_SORT_KEY) || "name"; } catch { return "name"; } };
+const setLastProductSort = v => { try { localStorage.setItem(LAST_PRODUCT_SORT_KEY, v); } catch {} };
 
 // ── Text search ───────────────────────────────────────────────────────────────
 // Folds case, accents, and the Latin letters that do NOT decompose under NFD, so typing plain
@@ -1274,6 +1282,32 @@ function ExerciseTileGrid({items, onPick, onGuide, empty="No matches."}){
     ))}
   </div>);
 }
+// Full-name row list — an alternative to the tile grid for contexts with fewer candidates
+// where readability matters more than picture-first browsability (picking a swap mid-set,
+// where the exercise's exact name and equipment matter and a handful of options is typical).
+// The tile grid clamps names to 2 lines to keep tiles small in a dense browse grid, which cut
+// off longer names entirely; a full-width row never needs to.
+function ExerciseSearchList({items, onPick, onGuide, empty="No matches."}){
+  if(!items.length) return <div style={{fontSize:T.sm,color:C.muted,padding:`${SP.sm}px 0`}}>{empty}</div>;
+  return(<div style={{display:"flex",flexDirection:"column",gap:6}}>
+    {items.map(it=>{
+      const guide = guideFor(it.name);
+      const mg = guide?.muscleGroup || it.muscleGroup;
+      // The movement pattern ("Cable Pushdown", "Barbell Extension"...) is the closest thing the
+      // data has to "which part of this muscle group" — a flat muscleGroup like "Triceps" alone
+      // doesn't say whether an alternative trains the same emphasis or a different one.
+      const sub = [guide?.pattern, mg].filter(Boolean).join(" · ");
+      return(<div key={it.id||it.name} style={{display:"flex",alignItems:"center",gap:9,background:C.card,border:`1px solid ${C.border}`,borderRadius:R.md,padding:"8px 10px"}}>
+        {mg&&<MuscleIcon muscleGroup={mg} size={28}/>}
+        <button onClick={()=>onPick(it)} style={{flex:1,minWidth:0,textAlign:"left",background:"none",border:"none",cursor:"pointer",padding:0}}>
+          <div style={{fontSize:T.sm,color:C.text,fontWeight:600,lineHeight:1.3,wordBreak:"break-word"}}>{it.name}</div>
+          {sub&&<div style={{fontSize:T.label,color:C.muted,marginTop:1}}>{sub}</div>}
+        </button>
+        {onGuide&&guide&&<button onClick={()=>onGuide(it.name)} aria-label={`How to do ${it.name}`} style={{flexShrink:0,width:26,height:26,borderRadius:"50%",background:C.bg,border:`1px solid ${C.blue}55`,color:C.blue,fontSize:T.label,fontWeight:700,lineHeight:1,display:"flex",alignItems:"center",justifyContent:"center"}}>?</button>}
+      </div>);
+    })}
+  </div>);
+}
 
 // ── Exercise guide catalog ────────────────────────────────────────────────────
 // 370 technique guides + 38 training-method guides, embedded as a JSON <script> block rather
@@ -1707,22 +1741,30 @@ function getTDEE(profile,weight){
 // always wins once the session is actually finished — the assumed number just stops being a
 // generic formula guess and starts being "the worst you've actually done lately, minus a
 // margin," which degrades gracefully to the old formula for anyone with no gym history yet.
-function plannedDayBurn(dayType, weightKg, gymSessions) {
-  return burnModelKcal(dayTypeById(dayType)?.burn, weightKg, gymSessions);
+function plannedDayBurn(dayType, weightKg, gymSessions, dayId=null) {
+  return burnModelKcal(dayTypeById(dayType)?.burn, weightKg, gymSessions, dayId);
 }
 // Prices a burn model directly, without needing it to be a saved day type yet — this is what
 // lets the day-type editor show the live "+320 kcal" figure while you are still choosing the
 // numbers, and what plannedDayBurn delegates to once the type exists.
-function burnModelKcal(burnModel, weightKg, gymSessions) {
+function burnModelKcal(burnModel, weightKg, gymSessions, dayId=null) {
   const w = weightKg || 75;
   const burn = burnModel || {kind:"rest"};
   switch (burn.kind) {
     case "lift": {
-      // Real history beats the generic formula: the lowest of the last 7 logged sessions,
-      // less a 5% margin. Lowest-of-recent rather than mean so one heavy session cannot
-      // inflate every future day's eating target.
-      const recent = (gymSessions||[]).filter(s=>(s.kcalBurned||0)>0).slice(0,7);
-      if (recent.length > 0) return Math.round(Math.min(...recent.map(s=>s.kcalBurned)) * 0.95);
+      // Real history beats the generic formula: the lowest of recent logged sessions, less a
+      // 5% margin. Lowest-of-recent rather than mean so one heavy session cannot inflate every
+      // future day's eating target.
+      //
+      // `dayId` narrows "recent" to the SAME numbered training plan (e.g. "Day 1 — Push") when
+      // known. Different plans on the same generic "gym" day type can have very different real
+      // burns (a heavy leg day vs a light arms day) — pooling all of them into one "last 7"
+      // window let a light day's burn suppress the target on a heavy day, and vice versa. Only
+      // 3 sessions of the SAME plan are needed to be representative, vs 7 across every plan.
+      const allRecent = (gymSessions||[]).filter(s=>(s.kcalBurned||0)>0);
+      const samePlan = dayId ? allRecent.filter(s=>s.dayId===dayId) : [];
+      const pool = samePlan.length>0 ? samePlan.slice(0,3) : allRecent.slice(0,7);
+      if (pool.length > 0) return Math.round(Math.min(...pool.map(s=>s.kcalBurned)) * 0.95);
       return Math.round(netMetKcal(ENERGY.LIFT_METS, w, burn.min || ENERGY.PLANNED_LIFT_MIN));
     }
     case "run":   return Math.round(runKcal(burn.km || 0, w));
@@ -1741,8 +1783,8 @@ function burnModelKcal(burnModel, weightKg, gymSessions) {
 // If the user logged actual activities, we use the larger of (logged, planned) so that
 // partial-logging doesn't silently lower the target. extraBurn here is the total kcal of
 // logged activities + any manual burnedExtra.
-function dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weightKg, gymSessions) {
-  const planned = plannedDayBurn(dayType, weightKg, gymSessions);
+function dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weightKg, gymSessions, dayId=null) {
+  const planned = plannedDayBurn(dayType, weightKg, gymSessions, dayId);
   const logged = extraBurn || 0;
   if (!hasLoggedActivity) return planned;
   // User logged activity — use the larger of what they actually burned vs the planned baseline.
@@ -1782,12 +1824,12 @@ const PROTEIN_G_PER_KG = {cut:2.2, maintain:1.8, bulk:1.6};
 // Returns `{kcal,protein,carbs,fat,unavailable?,issues}`. When the profile can't support a
 // calculation the numbers come back zeroed with `unavailable:true`, so callers show
 // "complete your profile" rather than a plausible-looking invention.
-function getDT(profile,dayType,weight,extraBurn=0,hasLoggedActivity=false,dailySteps=0,gymSessions=null){
+function getDT(profile,dayType,weight,extraBurn=0,hasLoggedActivity=false,dailySteps=0,gymSessions=null,dayId=null){
   const issues=targetIssues(profile,weight);
   const tdee=getTDEE(profile,weight);
   if(!tdee) return {kcal:0,protein:0,carbs:0,fat:0,unavailable:true,issues};
 
-  const burn = dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weight, gymSessions);
+  const burn = dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weight, gymSessions, dayId);
   const stepBonus = stepsKcal(dailySteps, profile.activityLevel||"sedentary", weight);
   const base = tdee + burn + stepBonus;
 
@@ -1841,10 +1883,10 @@ function getDT(profile,dayType,weight,extraBurn=0,hasLoggedActivity=false,dailyS
   }
   return {kcal, protein, carbs, fat:finalFat, issues};
 }
-function getMaint(profile,dayType,weight,extraBurn=0,hasLoggedActivity=false,dailySteps=0,gymSessions=null){
+function getMaint(profile,dayType,weight,extraBurn=0,hasLoggedActivity=false,dailySteps=0,gymSessions=null,dayId=null){
   const tdee=getTDEE(profile,weight);if(!tdee)return null;
   const stepBonus = stepsKcal(dailySteps, profile.activityLevel||"sedentary", weight);
-  return Math.round(tdee + dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weight, gymSessions) + stepBonus);
+  return Math.round(tdee + dayBurnTotal(dayType, extraBurn, hasLoggedActivity, weight, gymSessions, dayId) + stepBonus);
 }
 // Trend over the last ~21 days (or up to 14 entries if you weigh more often).
 // Requires at least 4 entries spanning at least 3 days. Returns kg/week (negative = losing).
@@ -2337,7 +2379,13 @@ const iBlks = imgs => imgs.map(i=>({type:"image",source:{type:"base64",media_typ
 // KNOWN product to its real recorded pack size instead of guessing a generic ~100g serving —
 // previously this context carried macros only, so there was no way for it to know a matched
 // product even HAD a recorded pack size.
-const pCtx  = ps  => ps.slice(0,30).map(p=>{
+//
+// The cap used to be 30 — for anyone with a real pantry (a couple hundred labels is normal
+// after a few months of scanning), most of it was invisible to every single analysis, so the
+// model would correctly-from-its-own-view say "X is not in the known list" for a product that
+// very much was, just past index 30. 400 covers any realistic pantry size; a product line here
+// costs roughly a dozen tokens, so even a large list is a trivial fraction of the context window.
+const pCtx  = ps  => ps.slice(0,400).map(p=>{
   const pack = p.packSizeG ? ` pack:${p.packSizeG}g` : "";
   const serving = (p.servingG||p.packageG) ? ` serving:${p.servingG||p.packageG}g` : "";
   return `${p.name}:${p.kcal}kcal P${p.p}g C${p.c}g F${p.f}g${pack}${serving}`;
@@ -2475,6 +2523,22 @@ async function aFood(imgs, ps, mt, desc, apiKey) {
       + "5. Per-ingredient kcal/protein/carbs/fat MUST be PER-100g standard values for that food. Top-level total kcal/protein/carbs/fat = sum of (per-100g × weight / 100) — i.e. actual meal totals.\n\n"
       + "Reply ONLY with JSON, nothing else:\n"
       + '{"type":"meal","name":"","kcal":0,"protein":0,"carbs":0,"fat":0,"notes":"canteen estimate — macros approximate","newProduct":null,"ingredients":[{"name":"generic component","weightG":0,"kcal":0,"protein":0,"carbs":0,"fat":0,"canteen":true}]}';
+  } else if (compressed.length === 0) {
+    // Description-only home meal — no photos, so none of the scale-reading instructions below
+    // apply (they were previously sent even with zero photos, which risked the model fixating
+    // on "reading a scale" that was never there). A separate, focused prompt instead: match
+    // named products from the user's own pantry, fall back to standard reference values.
+    prompt = "You are a nutrition analyst estimating a HOME-COOKED meal from a text description only (no photos provided).\n"
+      + "Description: " + desc + "\n"
+      + "Known products per 100g (this user's own pantry — prefer these when the description names one): " + ctx + "\n\n"
+      + "RULES:\n"
+      + "1. If the description names a specific product or brand from the known-products list, match it EXACTLY and use its per-100g values.\n"
+      + "2. For anything not in the known-products list, use standard reference per-100g values for that food (raw vs cooked as stated).\n"
+      + "3. Estimate weights from what the description says (explicit grams win) or a typical realistic home portion otherwise — do not default everything to 100g.\n"
+      + "4. List every ingredient the description implies. Small additions (oil, sauce, seasoning) still count if mentioned.\n"
+      + "5. Per ingredient: kcal/protein/carbs/fat MUST be PER-100g reference values (NOT scaled to weight). Top-level kcal/protein/carbs/fat = meal totals: sum of (per-100g × weightG / 100).\n\n"
+      + "Reply ONLY with this JSON:\n"
+      + '{"type":"meal","name":"","kcal":0,"protein":0,"carbs":0,"fat":0,"totalGrams":0,"notes":"estimated from description only","newProduct":null,"ingredients":[{"name":"","weightG":0,"kcal":0,"protein":0,"carbs":0,"fat":0}]}';
   } else {
     prompt = "Precision nutrition analyst with kitchen scale photos.\n"
       + (desc ? "MEAL DESCRIPTION — use this to identify ingredients and match products: " + desc + "\n" : "")
@@ -3233,8 +3297,12 @@ function Sheet({onClose,title,children}){
       <div aria-hidden="true" style={{width:38,height:4,borderRadius:4,background:C.faint,margin:"0 auto 12px"}}/>
       {/* Sticky header so the title and the close button stay reachable in tall sheets
           (the gym and recipe sheets scroll well past a screen height). */}
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,position:"sticky",top:0,background:C.surf,zIndex:2,paddingBottom:8}}>
-        <span style={{fontSize:18,fontWeight:700,color:C.text,letterSpacing:"-0.01em"}}>{title}</span>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,marginBottom:16,position:"sticky",top:0,background:C.surf,zIndex:2,paddingBottom:8}}>
+        {/* minWidth:0 is required for a flex child's text to actually truncate instead of
+            forcing the row wider — without it a long title (an exercise's full name, easily
+            30+ characters) pushed or crowded the × button rather than eliding, which is what
+            made the close button hard to hit reliably from exercise guide sheets specifically. */}
+        <span style={{flex:1,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",fontSize:18,fontWeight:700,color:C.text,letterSpacing:"-0.01em"}}>{title}</span>
         <button onClick={onClose} aria-label="Close"
           style={{background:C.card,border:`1px solid ${C.border}`,color:C.muted,fontSize:19,lineHeight:1,width:34,height:34,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>×</button>
       </div>
@@ -3380,7 +3448,7 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
   const [swapIdx, setSwapIdx] = useState(null);
   const [swapSearch, setSwapSearch] = useState("");
   const [swapCat, setSwapCat] = useState(null); // category filter id for the swap-ingredient search
-  const [swapSort, setSwapSort] = useState("name");
+  const [swapSort, setSwapSort] = useState(getLastProductSort);
   const [swapDescMode, setSwapDescMode] = useState(false); // true = show "describe it" input
   const [swapDescText, setSwapDescText] = useState(""); // user-provided description for AI estimate
   const [estimatingIdx, setEstimatingIdx] = useState(null);
@@ -3389,43 +3457,75 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
   const [addMode, setAddMode] = useState(null); // null | "label" | "manual"
   const [addSearch, setAddSearch] = useState("");
   const [addCat, setAddCat] = useState(null); // category filter id for the add-from-label search
-  const [addSort, setAddSort] = useState("name");
+  const [addSort, setAddSort] = useState(getLastProductSort);
   const [addPickedProd, setAddPickedProd] = useState(null);
   const [addPickedG, setAddPickedG] = useState("");
   const [addManual, setAddManual] = useState({name:"",weightG:"",kcal:"",protein:"",carbs:"",fat:""});
 
   // Match ingredient name to a product label using SPECIFIC food words, not modifiers.
+  //
+  // Rewritten after real reports of confidently-wrong auto-matches: "Almond Drink" silently
+  // matching a "Barebells ... Almond Protein Bar" (shared word "almond", nothing else), a plain
+  // "Banana" matching "AllNutrition Frulove Choco in Jelly Banana" (shared word "banana" only —
+  // a banana never HAS a label to begin with), and "Dulano Chicken Breast (cured and cooked)"
+  // matching a generic "Chicken Breast" reference entry instead of the actual Dulano product —
+  // the brand word "dulano" wasn't required to appear anywhere in the match at all. The old
+  // algorithm accepted a match on ANY single shared specific word clearing a low point total;
+  // a branded product's name is mostly OTHER words the ingredient never mentioned, and that was
+  // never checked. A wrong auto-match is worse than no match — the UI already has a clean
+  // fallback (AI estimate / manual pick) for "no confident match", so the bar here is now
+  // "near-certain, or don't match at all", matching what was asked for directly.
+  //
   // Rules:
-  //   1. Exact normalized match wins.
-  //   2. If both names contain "specific" words (non-stop), at least one must overlap.
-  //   3. Specific word overlaps score 4× more than stop-word overlaps.
-  //   4. Final score must clear a meaningful threshold.
+  //   1. Exact normalized match wins outright.
+  //   2. A product whose name is itself a mangled concatenation of several products (a known
+  //      data-quality failure mode — see the multi-name junk entries above) can never legitimately
+  //      match anything and is skipped before any scoring.
+  //   3. "Core" identity words = every specific word MINUS preparation-state words too (raw,
+  //      cooked, cured, breaded...) — those matter for the separate raw/cooked disqualification
+  //      below, not for "is this the same food". A single core word (e.g. bare "Banana") is
+  //      not enough signal to auto-match anything by itself — unlabelled produce should fall
+  //      through to AI estimation, not latch onto an unrelated branded product that happens to
+  //      mention the same fruit.
+  //   4. EVERY core word of the ingredient must be found in the candidate (full coverage) — a
+  //      candidate missing the ingredient's own brand/identity word, like "dulano", is rejected
+  //      even if it shares other common words like "chicken"/"breast".
+  //   5. The candidate can't be mostly made of words the ingredient never mentioned either — a
+  //      product name stuffed with extra unrelated specific words (flavor, product line) fails
+  //      even if it happens to fully contain the ingredient's (fewer) words.
   const bestMatch = (ingName) => {
     if (!products?.length) return null;
     const nl = normName(ingName);
     if (!nl) return null;
-    // Pass 1: exact normalized match
+    // Pass 1: exact normalized match — but not against a mangled multi-product name (rule 2
+    // still applies: such an entry is data corruption, never a legitimate single product).
+    const looksConcatenated = p => (p.split(/\s\/\s/).length >= 3) || (p.split(/;\s/).length >= 3);
     for (const p of products) {
-      if (normName(p.name) === nl) return p;
+      if (!looksConcatenated(p.name) && normName(p.name) === nl) return p;
     }
     const tokens = s => s.split(" ").filter(w => w.length > 2);
     const ingToks = tokens(nl);
     const ingSpecific = ingToks.filter(w => !STOP_WORDS.has(w));
     const ingPrep = ingToks.filter(w => PREP_WORDS.has(w));
+    const ingCore = ingSpecific.filter(w => !PREP_WORDS.has(w));
+    // Fewer than 2 core identity words = not enough to safely auto-match (see rule 3).
+    if (ingCore.length < 2) return null;
+    const wordMatches = (a, b) => a === b || (a.length >= 5 && b.includes(a)) || (b.length >= 5 && a.includes(b));
     let best = null, bestScore = 0;
     for (const p of products) {
+      if (looksConcatenated(p.name)) continue;
       const pl = normName(p.name);
       const prodToks = tokens(pl);
       const prodSpecific = prodToks.filter(w => !STOP_WORDS.has(w));
       const prodPrep = prodToks.filter(w => PREP_WORDS.has(w));
-      // Critical guard: if both names have specific words, at least one must match.
-      // This blocks "frozen blueberries" → "frozen peas" via the shared modifier "frozen".
-      if (ingSpecific.length > 0 && prodSpecific.length > 0) {
-        const anySpecificOverlap = ingSpecific.some(w =>
-          prodSpecific.some(pw => pw === w || (w.length >= 5 && pw.includes(w)) || (pw.length >= 5 && w.includes(pw)))
-        );
-        if (!anySpecificOverlap) continue;
-      }
+      const prodCore = prodSpecific.filter(w => !PREP_WORDS.has(w));
+      // Rule 4: full coverage — every core word of the ingredient must appear in the candidate.
+      const coreHits = ingCore.filter(w => prodCore.some(pw => wordMatches(w, pw)));
+      if (coreHits.length < ingCore.length) continue;
+      // Rule 5: the candidate can't be mostly extra words the ingredient never mentioned.
+      // Allow some slack for packaging words (brand suffix, weight, "slices"...) but a product
+      // name more than twice as "wordy" as what it's supposedly matching is a different product.
+      if (prodCore.length > ingCore.length * 2 + 1) continue;
       let score = 0;
       for (const w of ingSpecific) {
         for (const pw of prodSpecific) {
@@ -3698,8 +3798,8 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
                     {/* Default: label search + describe option */}
                     <div style={{fontSize:10,color:C.orange,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Pick a label:</div>
                     <ProductFilterBar products={products} q={swapSearch} setQ={setSwapSearch} cat={swapCat} setCat={setSwapCat}
-                      sort={swapSort} setSort={setSwapSort} placeholder="Search your product labels…" autoFocus/>
-                    <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:200,overflowY:"auto",marginBottom:8}}>
+                      sort={swapSort} setSort={v=>{setSwapSort(v);setLastProductSort(v);}} placeholder="Search your product labels…" autoFocus/>
+                    <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:380,overflowY:"auto",marginBottom:8}}>
                       {filteredProds.map(prod => (
                         <button key={prod.name} type="button" onClick={() => swapWith(i, prod)}
                           style={{padding:"9px 12px",borderRadius:8,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",userSelect:"none",textAlign:"left"}}>
@@ -3738,10 +3838,10 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
           </div>
           {!addPickedProd?(<>
             <ProductFilterBar products={products} q={addSearch} setQ={setAddSearch} cat={addCat} setCat={setAddCat}
-              sort={addSort} setSort={setAddSort} placeholder="Search labels…" autoFocus/>
+              sort={addSort} setSort={v=>{setAddSort(v);setLastProductSort(v);}} placeholder="Search labels…" autoFocus/>
             {(()=>{const list=filterProducts(products,{q:addSearch,cat:addCat,sort:addSort});return(
-            <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:200,overflowY:"auto"}}>
-              {list.slice(0,12).map(prod=>(
+            <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:380,overflowY:"auto"}}>
+              {list.slice(0,60).map(prod=>(
                 <button key={prod.name} type="button" onClick={()=>{setAddPickedProd(prod);setAddPickedG(defaultGramsFor(prod));}} style={{padding:"7px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
                   <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>
                   <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
@@ -3854,7 +3954,7 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
   const [extrasMode,setExtrasMode]=useState(null); // null | "pick" | "manual" | "photo"
   const [pickSearch,setPickSearch]=useState("");
   const [pickCat,setPickCat]=useState(null); // category filter id, "uncategorized", or null
-  const [pickSort,setPickSort]=useState("name");
+  const [pickSort,setPickSort]=useState(getLastProductSort);
   const [pickedProd,setPickedProd]=useState(null); // selected product when in pick mode
   const [pickedG,setPickedG]=useState("");
   const [manualForm,setManualForm]=useState({name:"",kcal:"",protein:"",carbs:"",fat:"",weightG:""});
@@ -4074,10 +4174,10 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
         </div>
         {!pickedProd?(<>
           <ProductFilterBar products={products} q={pickSearch} setQ={setPickSearch} cat={pickCat} setCat={setPickCat}
-            sort={pickSort} setSort={setPickSort} placeholder="Search your product labels…" autoFocus/>
+            sort={pickSort} setSort={v=>{setPickSort(v);setLastProductSort(v);}} placeholder="Search your product labels…" autoFocus/>
           {(()=>{const list=filterProducts(products,{q:pickSearch,cat:pickCat,sort:pickSort});return(
-          <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:240,overflowY:"auto"}}>
-            {list.slice(0,15).map(prod=>(
+          <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:400,overflowY:"auto"}}>
+            {list.slice(0,60).map(prod=>(
               <button key={prod.name} type="button" onClick={()=>{setPickedProd(prod);setPickedG(defaultGramsFor(prod));}} style={{padding:"8px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
                 <span style={{flex:1,minWidth:0,overflow:"hidden"}}><span style={{fontSize:12,color:C.text,display:"block",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>{prod.subtitle&&<span style={{fontSize:9.5,color:C.muted,display:"block"}}>{prod.subtitle}</span>}</span>
                 <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
@@ -4154,13 +4254,13 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
   const [mPickOpen,setMPickOpen]=useState(false);
   const [mPickSearch,setMPickSearch]=useState("");
   const [mPickCat,setMPickCat]=useState(null); // category filter id
-  const [mPickSort,setMPickSort]=useState("name");
+  const [mPickSort,setMPickSort]=useState(getLastProductSort);
   const [mPickedProd,setMPickedProd]=useState(null);
   const [mPickedG,setMPickedG]=useState("");
   // Dedicated labels-only mode state (issue 2)
   const [lblSearch,setLblSearch]=useState("");
   const [lblCat,setLblCat]=useState(null); // category filter in labels mode
-  const [lblSort,setLblSort]=useState("name");
+  const [lblSort,setLblSort]=useState(getLastProductSort);
   const [lblPicked,setLblPicked]=useState(null);
   const [lblG,setLblG]=useState("");
   const [lblItems,setLblItems]=useState([]); // [{id,name,weightG,kcal,protein,carbs,fat}]
@@ -4237,7 +4337,11 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
   };
   const confirm=()=>{if(result?.type==="activity"){onAdd({type:"activity_from_meal",burnedKcal:result.burnedKcal});return;}const{newProduct,...meal}={id:Date.now(),mealType,name:form.name||"Meal",kcal:parseFloat(form.kcal)||0,protein:parseFloat(form.protein)||0,carbs:parseFloat(form.carbs)||0,fat:parseFloat(form.fat)||0,notes:form.notes,time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"}),source:mt==="canteen"?"canteen":"home",ingredients:ingredients&&ingConfirmed?ingredients:undefined,newProduct:result?.newProduct||null};onAdd({...meal,newProduct});};
   const usePrep=prep=>{const n=prep.portions-prep.remaining+1;onAdd({id:Date.now(),name:prep.name,kcal:prep.perKcal,protein:prep.perProtein,carbs:prep.perCarbs,fat:prep.perFat,notes:`Prep ${n}/${prep.portions}`,time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})});setMealPreps(ps=>ps.map(p=>p.id===prep.id?{...p,remaining:p.remaining-1}:p));};
-  const canAnalyze=!loading&&imgs.length>0&&(mt==="canteen"?desc.trim().length>5:true);
+  // A photo used to be mandatory for both modes — canteen additionally required a description,
+  // but home cooked couldn't be logged from a description alone at all. The AI call itself
+  // already tolerates zero photos (the prompt conditionally includes photo-reading instructions
+  // only when photos exist); the gate here was the only thing stopping a description-only log.
+  const canAnalyze=!loading&&(imgs.length>0||desc.trim().length>5);
   return(<Sheet onClose={onClose} title="Log Meal">
     <div style={{display:"flex",gap:5,marginBottom:10,flexWrap:"wrap"}}>{[["📸 Photos","photos"],["🏷️ Labels","labels"],["✏️ Manual","manual"],["🍱 Prep","mealprep"]].map(([lbl,m])=>(<button key={m} onClick={()=>{setMode(m);setResult(null);}} style={{flex:1,minWidth:60,padding:"8px 4px",borderRadius:10,border:`1px solid ${mode===m?C.lime:C.border}`,background:mode===m?`${C.lime}20`:C.card,color:mode===m?C.lime:C.muted,fontWeight:mode===m?700:500,cursor:"pointer",fontSize:11}}>{lbl}</button>))}</div>
     <div style={{marginBottom:14}}>
@@ -4263,10 +4367,10 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
       </div>}
       {!lblPicked?(<>
         <ProductFilterBar products={products} q={lblSearch} setQ={setLblSearch} cat={lblCat} setCat={setLblCat}
-          sort={lblSort} setSort={setLblSort} placeholder="Search labels (protein bar, oats…)"/>
+          sort={lblSort} setSort={v=>{setLblSort(v);setLastProductSort(v);}} placeholder="Search labels (protein bar, oats…)"/>
         {(()=>{const list=filterProducts(products,{q:lblSearch,cat:lblCat,sort:lblSort});return(
-        <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:260,overflowY:"auto"}}>
-          {list.slice(0,20).map(prod=>(
+        <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:420,overflowY:"auto"}}>
+          {list.slice(0,60).map(prod=>(
             <button key={prod.name} type="button" onClick={()=>{setLblPicked(prod);setLblG(defaultGramsFor(prod));}} style={{padding:"8px 11px",borderRadius:8,background:C.bg,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
               <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>
               <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
@@ -4294,18 +4398,18 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
       </div>);})()}
     </div>)}
     {mode==="photos"&&!result&&(<>
-      <div style={{display:"flex",gap:6,marginBottom:10}}>{[["Home cooked","home"],["Canteen / Restaurant","canteen"]].map(([lbl,t])=>(<button key={t} onClick={()=>setMt(t)} style={{flex:1,padding:"8px 6px",borderRadius:8,border:`1px solid ${mt===t?C.lime:C.border}`,background:mt===t?`${C.lime}12`:C.bg,color:mt===t?C.lime:C.muted,fontWeight:mt===t?600:400,cursor:"pointer",fontSize:11}}>{lbl}</button>))}</div>
+      <div style={{display:"flex",gap:6,marginBottom:10}}>{[["Home cooked","home"],["Eating Out","canteen"]].map(([lbl,t])=>(<button key={t} onClick={()=>setMt(t)} style={{flex:1,padding:"8px 6px",borderRadius:8,border:`1px solid ${mt===t?C.lime:C.border}`,background:mt===t?`${C.lime}12`:C.bg,color:mt===t?C.lime:C.muted,fontWeight:mt===t?600:400,cursor:"pointer",fontSize:11}}>{lbl}</button>))}</div>
       <div style={{marginBottom:10}}>
-        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>{mt==="canteen"?"Describe the meal (required)":"Meal name / description (optional)"}</div>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>{mt==="canteen"?"Describe the meal (or attach a photo)":"Meal name / description (or attach a photo)"}</div>
         <textarea value={desc} onChange={e=>setDesc(e.target.value)} rows={2} placeholder={mt==="canteen"?"e.g. Grilled chicken ~150g, buckwheat, salad, butter sauce on side":"e.g. Overnight oats with banana and peanut butter"} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:T.body,outline:"none",resize:"none",fontFamily:"inherit"}}/>
       </div>
       <ImgZone imgs={imgs} setImgs={setImgs} maxPhotos={15}/>
       {err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ff8080",margin:"8px 0",wordBreak:"break-word"}}>{err}</div>}
       <button onClick={analyze} disabled={!canAnalyze} style={{width:"100%",padding:"12px 0",borderRadius:10,background:canAnalyze?C.lime:C.faint,color:"#000",fontWeight:700,border:"none",cursor:canAnalyze?"pointer":"default",fontSize:15,marginTop:10}}>
-        {loading?"Analyzing…":mt==="canteen"?"Estimate Meal":`Analyze ${imgs.length} photo${imgs.length!==1?"s":""}`}
+        {loading?"Analyzing…":imgs.length>0?`Analyze ${imgs.length} photo${imgs.length!==1?"s":""}${desc.trim()?" + description":""}`:"Estimate from description"}
       </button>
       <AnalyzeProgress active={loading} photoCount={imgs.length}/>
-      {mt==="canteen"&&!desc.trim()&&<div style={{fontSize:11,color:C.muted,marginTop:5,textAlign:"center"}}>Add a description first</div>}
+      {!canAnalyze&&!loading&&<div style={{fontSize:11,color:C.muted,marginTop:5,textAlign:"center"}}>Add a photo, or a short description to estimate from</div>}
     </>)}
     {mode==="manual"&&!result&&(<>
       {/* Picked labels list */}
@@ -4339,10 +4443,10 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
         </div>
         {!mPickedProd?(<>
           <ProductFilterBar products={products} q={mPickSearch} setQ={setMPickSearch} cat={mPickCat} setCat={setMPickCat}
-            sort={mPickSort} setSort={setMPickSort} placeholder="Search your product labels…" autoFocus/>
+            sort={mPickSort} setSort={v=>{setMPickSort(v);setLastProductSort(v);}} placeholder="Search your product labels…" autoFocus/>
           {(()=>{const list=filterProducts(products,{q:mPickSearch,cat:mPickCat,sort:mPickSort});return(
-          <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:240,overflowY:"auto"}}>
-            {list.slice(0,15).map(prod=>(
+          <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:400,overflowY:"auto"}}>
+            {list.slice(0,60).map(prod=>(
               <button key={prod.name} type="button" onClick={()=>{setMPickedProd(prod);setMPickedG(defaultGramsFor(prod));}} style={{padding:"8px 11px",borderRadius:7,background:C.card,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
                 <span style={{fontSize:12,color:C.text,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>
                 <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
@@ -4440,7 +4544,7 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
   const [buildMode,setBuildMode]=useState(null); // null | "labels"
   const [pickSearch,setPickSearch]=useState("");
   const [pickCat,setPickCat]=useState(null);
-  const [pickSort,setPickSort]=useState("name");
+  const [pickSort,setPickSort]=useState(getLastProductSort);
   const [pickedProd,setPickedProd]=useState(null);
   const [pickedG,setPickedG]=useState("");
   const [labelIngs,setLabelIngs]=useState([]); // [{id, name, weightG, kcal100, p100, c100, f100}]
@@ -4526,10 +4630,10 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
       </div>}
       {!pickedProd?(<>
         <ProductFilterBar products={products} q={pickSearch} setQ={setPickSearch} cat={pickCat} setCat={setPickCat}
-          sort={pickSort} setSort={setPickSort} placeholder="Search labels (chicken, rice, oats…)"/>
+          sort={pickSort} setSort={v=>{setPickSort(v);setLastProductSort(v);}} placeholder="Search labels (chicken, rice, oats…)"/>
         {(()=>{const list=filterProducts(products,{q:pickSearch,cat:pickCat,sort:pickSort});return(
-        <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:220,overflowY:"auto"}}>
-          {list.slice(0,15).map(prod=>(
+        <div style={{display:"flex",flexDirection:"column",gap:5,maxHeight:380,overflowY:"auto"}}>
+          {list.slice(0,60).map(prod=>(
             <button key={prod.name} type="button" onClick={()=>{setPickedProd(prod);setPickedG(defaultGramsFor(prod));}} style={{padding:"8px 11px",borderRadius:7,background:C.bg,border:`1px solid ${C.border}`,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",textAlign:"left"}}>
               <span style={{flex:1,minWidth:0,overflow:"hidden"}}><span style={{fontSize:12,color:C.text,display:"block",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(prod.categories||[]).map(cid=>catById(cid)?.emoji).filter(Boolean).join("")} {prod.name}</span>{prod.subtitle&&<span style={{fontSize:9.5,color:C.muted,display:"block"}}>{prod.subtitle}</span>}</span>
               <span style={{fontFamily:"monospace",fontSize:10,color:C.muted,flexShrink:0,marginLeft:8}}>{prod.kcal}k {prod.p}P</span>
@@ -4805,7 +4909,10 @@ function XpDetailSheet({xp, profile, setProfile, onClose}){
     </div>
   </Sheet>);
 }
-function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProducts,profile,setProfile,latestWeight,weights,setWeights,onGoToSettings,medications,medLog,onMarkMed,gymSessions,progress}){
+function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProducts,profile,setProfile,latestWeight,weights,setWeights,onGoToSettings,medications,medLog,onMarkMed,gymSessions,progress,gymDayAssign}){
+  // Which specific numbered training plan (if any) is assigned to today's weekday — lets the
+  // burn model use history from the SAME plan rather than pooling every gym day together.
+  const todayDayId=(gymDayAssign||{})[new Date().getDay()]||null;
   const [modal,setModal]=useState(null);const [wInput,setWInput]=useState("");
   // Re-render on the minute so a reminder appears/disappears exactly when its window opens or
   // closes, without needing any user action to refresh the tab.
@@ -4844,8 +4951,8 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
   const extraBurn=(dayData.activities||[]).reduce((s,a)=>s+a.kcal,0)+(dayData.burnedExtra||0);
   const hasLoggedAct=(dayData.activities||[]).length>0||(dayData.burnedExtra||0)>0;
   const dailySteps=dayData.dailySteps||0;
-  const dt=getDT(profile,dayData.dayType,latestWeight,extraBurn,hasLoggedAct,dailySteps,gymSessions);
-  const maint=getMaint(profile,dayData.dayType,latestWeight,extraBurn,hasLoggedAct,dailySteps,gymSessions);
+  const dt=getDT(profile,dayData.dayType,latestWeight,extraBurn,hasLoggedAct,dailySteps,gymSessions,todayDayId);
+  const maint=getMaint(profile,dayData.dayType,latestWeight,extraBurn,hasLoggedAct,dailySteps,gymSessions,todayDayId);
   const tot=dayData.meals.reduce((a,m)=>({kcal:a.kcal+m.kcal,protein:a.protein+m.protein,carbs:a.carbs+m.carbs,fat:a.fat+m.fat}),{kcal:0,protein:0,carbs:0,fat:0});
   const remKcal=dt.kcal-tot.kcal,remProt=dt.protein-tot.protein;
   const profileOK=profile.birthday&&profile.heightCm;const gc=gCol(profile.goal);
@@ -4872,7 +4979,15 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
   };
   const handleAdd=entry=>{
     if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode}));}
-    else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}));if(newProduct)setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);}
+    else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}));
+      // Auto-saving whatever the AI put in `newProduct` with no validation let a low-confidence
+      // or generic-reference guess (e.g. a bare "Chicken Breast (cooked, boneless, skinless)"
+      // instead of an actual brand read off a label) permanently contaminate the pantry — after
+      // which it competes with, and sometimes wins over, the real branded product in every
+      // future match. Same bar as manually saving a product label: needs a real name and either
+      // a real kcal value or some macro, or it's not saved at all.
+      const npValid = newProduct && (newProduct.name||"").trim().length>0 && ((newProduct.kcal||0)>0 || (newProduct.p||0)>0 || (newProduct.c||0)>0 || (newProduct.f||0)>0);
+      if(npValid)setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);}
     setModal(null);
   };
   const updateMeal=updated=>{setDayData(p=>({...p,meals:p.meals.map(m=>m.id===updated.id?updated:m)}));setEditingMealId(null);};
@@ -5327,10 +5442,13 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
   const [showFinish, setShowFinish] = useState(false);
   const [finishKcal, setFinishKcal] = useState("");
   const [addExMode, setAddExMode] = useState(false);
-  const [newExName, setNewExName] = useState("");
+  const [newExName, setNewExName] = useState(""); // doubles as the add-exercise search box text
   const [swapOpenFor, setSwapOpenFor] = useState(null); // exercise id showing swap alternatives
+  const [swapSearch, setSwapSearch] = useState(""); // free-text search inside the swap panel
   const [moveOpenFor, setMoveOpenFor] = useState(null); // exercise id showing the "move to combo" picker
   const [guideForName, setGuideFor] = useState(null); // exercise name whose technique guide is open
+  const [confirmDeleteEx, setConfirmDeleteEx] = useState(null); // exercise id pending delete confirmation
+  const [confirmDeleteCombo, setConfirmDeleteCombo] = useState(null); // combo id pending delete confirmation
   // Which body regions this session trains — drives the warm-up/cool-down suggestions so both
   // routines follow the day's own muscles rather than a fixed generic list.
   const trainedRegions = sessionRegions(session.combos, gymExerciseLibrary);
@@ -5414,23 +5532,34 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       return{...s, combos, currentExInRound:nextEx, resting, restStartedAt};
     });
   };
+  // Rolls the time spent on the CURRENT combo into its running total before the cursor moves
+  // elsewhere — every place that changes currentComboIdx must spread this in, or a jump/skip/
+  // new-combo would silently drop the time spent on the combo just left. Falls back to the
+  // session's own start time for a combo that's been current since the session began (or an
+  // older session saved before this field existed).
+  const commitComboTime = s => {
+    const now = Date.now();
+    const enteredAt = s.comboEnteredAt || s.startedAt;
+    const spent = Math.max(0, Math.floor((now - enteredAt)/1000));
+    const curId = s.combos[s.currentComboIdx]?.id;
+    const comboTimeLog = {...(s.comboTimeLog||{})};
+    if (curId!=null) comboTimeLog[curId] = (comboTimeLog[curId]||0) + spent;
+    return {comboEnteredAt: now, comboTimeLog};
+  };
   const skipCombo = () => {
     updateAction(s=>{
       if (s.currentComboIdx>=s.combos.length-1) return s; // last combo — nothing to skip to, use Finish instead
-      return {...s, currentComboIdx:s.currentComboIdx+1, currentExInRound:0, resting:false};
+      return {...s, ...commitComboTime(s), currentComboIdx:s.currentComboIdx+1, currentExInRound:0, resting:false};
     });
   };
-  // Jumping to a combo swaps it into the currently-active slot (rather than just moving the
-  // cursor to wherever it sat in the list) so the combo you jumped to visually moves to the
-  // front — matching the same "cursor stays positional" rule moveExerciseTo already follows.
+  // Jump to a combo by moving the cursor there — the combo's position in the list never
+  // changes. An earlier version physically swapped the target combo into the current slot
+  // (reasoning that it "matched moveExerciseTo's cursor-stays-positional rule"), but that rule
+  // is about REORDERING EXERCISES, not about which combo is active — swapping array positions
+  // here meant every jump relabelled every combo after it ("Combo 7" could become "Combo 1"),
+  // which is exactly what made combos feel "mixed up" and jumps land somewhere unexpected.
   const jumpToCombo = idx => {
-    updateAction(s=>{
-      if(idx===s.currentComboIdx) return s;
-      const combos=[...s.combos];
-      const cur=s.currentComboIdx;
-      [combos[cur], combos[idx]] = [combos[idx], combos[cur]];
-      return {...s, combos, currentComboIdx:cur, currentExInRound:0, resting:false};
-    });
+    updateAction(s=>({...s, ...commitComboTime(s), currentComboIdx:idx, currentExInRound:0, resting:false}));
     setShowJumpCombo(false);
   };
   const moveExercise = (comboIdx, idx, dir) => {
@@ -5464,6 +5593,52 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       const curEx = Math.min(s.currentExInRound, Math.max(0, (cur?.exercises.length||1)-1));
       return {...s, combos, currentExInRound:curEx};
     });
+  };
+
+  // Remove an exercise from a combo mid-session. Was missing entirely — the only way to undo
+  // adding the wrong exercise was to cancel the whole session. Undoable via the normal undo
+  // stack, so the confirmation only guards against fat-fingering the × on a set that's already
+  // been logged; an untouched exercise removes immediately.
+  const removeExerciseFromCombo = (comboIdx, exId) => {
+    updateAction(s=>{
+      const c={...s.combos[comboIdx]};
+      const idx = c.exercises.findIndex(e=>e.id===exId);
+      if(idx===-1) return s;
+      c.exercises = c.exercises.filter(e=>e.id!==exId);
+      const combos=[...s.combos]; combos[comboIdx]=c;
+      // Clamp the cursor if it pointed at or past the removed exercise, same rule
+      // moveExerciseTo already applies when a combo shrinks out from under the cursor.
+      let currentExInRound = s.currentExInRound;
+      if(comboIdx===s.currentComboIdx){
+        currentExInRound = Math.min(currentExInRound, Math.max(0, c.exercises.length-1));
+      }
+      return {...s, combos, currentExInRound};
+    });
+    if(swapOpenFor===exId) setSwapOpenFor(null);
+    if(moveOpenFor===exId) setMoveOpenFor(null);
+    setConfirmDeleteEx(null);
+  };
+
+  // Remove a whole combo mid-session — previously only "+ New Combo" existed, with no way back
+  // from an accidental add or a combo you decide to skip entirely for the rest of the plan.
+  // Always confirmed: unlike a single exercise this can drop several logged sets at once.
+  const removeCombo = (comboIdx) => {
+    updateAction(s=>{
+      if(s.combos.length<=1) return s; // always keep at least one combo to render into
+      const combos = s.combos.filter((_,i)=>i!==comboIdx);
+      let currentComboIdx = s.currentComboIdx;
+      let currentExInRound = s.currentExInRound;
+      let resting = s.resting;
+      let timePatch = {};
+      if(comboIdx < currentComboIdx) currentComboIdx -= 1;
+      else if(comboIdx === currentComboIdx){
+        timePatch = commitComboTime(s);
+        currentComboIdx = Math.min(currentComboIdx, combos.length-1);
+        currentExInRound = 0; resting = false;
+      }
+      return {...s, ...timePatch, combos, currentComboIdx, currentExInRound, resting};
+    });
+    setConfirmDeleteCombo(null);
   };
 
   // Correct a logged set. Mistyping reps was previously unrecoverable — the only way to fix
@@ -5585,6 +5760,24 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
         <span style={{fontFamily:"monospace",fontSize:12,color:C.muted}}>{fmtTime(elapsed)}</span>
       </div>
 
+      {/* A general countdown for whenever you're just holding something without naming it as a
+          routine item first — this sits ABOVE the named-stretch list on purpose: it's the thing
+          you reach for immediately, before deciding this stretch is worth adding as a tracked
+          item below. Was dropped when the named-item list (with its own per-item timers) was
+          added, leaving no timer at all until you'd already added something to the list. */}
+      <div style={{background:C.bg,borderRadius:R.md,padding:`${SP.md}px ${SP.lg}px`,marginBottom:SP.md,textAlign:"center"}}>
+        <div style={{...eyebrow(),marginBottom:SP.sm}}>Quick timer</div>
+        {stretchTarget?(<>
+          <TimerRing remaining={stretchRemaining} total={stretchTarget.duration} label="Quick timer" size={104} accent={C.blue}/>
+          <div style={{fontSize:T.sm,color:stretchRemaining<=0?C.lime:C.muted,marginTop:SP.xs,marginBottom:SP.sm}}>{stretchRemaining<=0?"⏰ Time's up!":"holding…"}</div>
+        </>):null}
+        <div style={{display:"flex",gap:SP.sm,justifyContent:"center"}}>
+          <button onClick={()=>startStretchTimer(30)} style={{flex:1,maxWidth:110,padding:"9px 0",borderRadius:R.sm,background:`${C.blue}18`,border:`1px solid ${C.blue}`,color:C.blue,fontWeight:700,cursor:"pointer",fontSize:T.sm}}>⏱ 30s</button>
+          <button onClick={()=>startStretchTimer(60)} style={{flex:1,maxWidth:110,padding:"9px 0",borderRadius:R.sm,background:`${C.blue}18`,border:`1px solid ${C.blue}`,color:C.blue,fontWeight:700,cursor:"pointer",fontSize:T.sm}}>⏱ 60s</button>
+        </div>
+        {stretchTarget&&<button onClick={()=>setStretchTarget(null)} style={{marginTop:SP.sm,background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:T.label,textDecoration:"underline"}}>✕ stop</button>}
+      </div>
+
       {/* Named stretches, each with its own countdown, replacing the two anonymous 30s/60s
           buttons — those recorded nothing about WHAT was held. */}
       <div style={{marginBottom:SP.md}}>
@@ -5671,7 +5864,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
         <div style={{fontSize:38,fontWeight:900,fontFamily:"monospace",color:C.orange,marginBottom:10}}>{fmtTime(restElapsed)}</div>
         {targetSets&&roundsDone>=targetSets&&<div style={{background:`${C.yellow}15`,border:`1px solid ${C.yellow}50`,borderRadius:8,padding:"7px 11px",marginBottom:10,fontSize:11,color:C.yellow}}>⚠ You've hit your usual {targetSets} sets — maybe move to the next combo</div>}
         <button onClick={()=>updateAction(s=>({...s,resting:false}))} style={{width:"100%",padding:"12px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",fontSize:T.body}}>▶ Start Next Round</button>
-        {!isLastCombo&&<button onClick={()=>updateAction(s=>({...s,resting:false,currentComboIdx:s.currentComboIdx+1,currentExInRound:0}))} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12}}>⏭ Next Combo →</button>}
+        {!isLastCombo&&<button onClick={()=>updateAction(s=>({...s,...commitComboTime(s),resting:false,currentComboIdx:s.currentComboIdx+1,currentExInRound:0}))} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12}}>⏭ Next Combo →</button>}
         {isLastCombo&&<button onClick={goToFinishOrCooldown} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.lime}60`,color:C.lime,fontSize:12,fontWeight:600}}>🏁 That's it — Wrap Up</button>}
       </div>
     )}
@@ -5705,12 +5898,28 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       // reach it, even though the per-row logic below specifically keeps it visible.
       const comboAllDone = c.exercises.length>0 && c.exercises.every(isExComplete);
       if(!showCompleted && comboAllDone && !isCurCombo) return null;
+      // Time spent on this combo: for the active one, the running total plus however long it's
+      // been current THIS visit (ticks live off the same 1s interval that drives `elapsed`,
+      // since both re-render together — no separate timer needed). For any other combo it's
+      // just the accumulated total from previous visits.
+      const comboSecs = isCurCombo
+        ? (session.comboTimeLog?.[c.id]||0) + Math.max(0, Math.floor((Date.now()-(session.comboEnteredAt||session.startedAt))/1000))
+        : (session.comboTimeLog?.[c.id]||0);
       return(<div key={c.id} style={{marginBottom:10,border:`1px solid ${isCurCombo?C.orange+"55":C.border}`,borderRadius:11,padding:"8px 9px",background:isCurCombo?`${C.orange}08`:"transparent"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7,paddingLeft:2}}>
           <span style={{fontSize:11,fontFamily:"monospace",color:isCurCombo?C.orange:C.muted,fontWeight:isCurCombo?700:400}}>
             COMBO {ci+1}{c.exercises.length>1?" · SUPERSET":""}{isCurCombo?" · NOW":""}
+            {comboSecs>0&&<span style={{color:C.muted,fontWeight:400}}> · {fmtTime(comboSecs)}</span>}
           </span>
-          {!isCurCombo&&<button onClick={()=>jumpToCombo(ci)} style={{fontSize:11,color:C.blue,background:"none",border:`1px solid ${C.blue}40`,borderRadius:6,padding:"3px 9px"}}>jump here</button>}
+          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+            {!isCurCombo&&<button onClick={()=>jumpToCombo(ci)} style={{fontSize:11,color:C.blue,background:"none",border:`1px solid ${C.blue}40`,borderRadius:6,padding:"3px 9px"}}>jump here</button>}
+            {session.combos.length>1&&(confirmDeleteCombo===c.id?(<>
+              <button onClick={()=>removeCombo(ci)} style={{fontSize:11,color:"#000",background:C.red,border:"none",borderRadius:6,padding:"3px 9px",fontWeight:700}}>Remove?</button>
+              <button onClick={()=>setConfirmDeleteCombo(null)} style={{fontSize:11,color:C.muted,background:"none",border:`1px solid ${C.border}`,borderRadius:6,padding:"3px 9px"}}>✕</button>
+            </>):(
+              <button onClick={()=>setConfirmDeleteCombo(c.id)} aria-label={`Remove combo ${ci+1}`} style={{fontSize:11,color:C.faint,background:"none",border:"none",padding:"3px 4px"}}>🗑</button>
+            ))}
+          </div>
         </div>
         {/* data-exkey makes an empty combo a valid drag-drop target too — elementFromPoint has
             nothing to land on in an empty combo otherwise, so a combo emptied by dragging out
@@ -5772,7 +5981,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
             {/* Technique guide, reachable mid-set from the row itself — the moment you actually
                 need it is the moment you are standing at the rack, not while planning. */}
             {guideFor(ex.name)&&<button onClick={()=>setGuideFor(ex.name)} style={{fontSize:11,color:C.blue,background:"none",border:"none",textDecoration:"underline"}}>📘 how to</button>}
-            {canSwap&&<button onClick={()=>setSwapOpenFor(swapOpenFor===ex.id?null:ex.id)} style={{fontSize:11,color:C.blue,background:"none",border:"none",textDecoration:"underline"}}>⇄ swap exercise</button>}
+            {canSwap&&<button onClick={()=>{setSwapOpenFor(swapOpenFor===ex.id?null:ex.id);setSwapSearch("");}} style={{fontSize:11,color:C.blue,background:"none",border:"none",textDecoration:"underline"}}>⇄ swap exercise</button>}
             {/* Arrow controls kept alongside the drag handle: dragging is unreachable by
                 keyboard and by screen-reader users, so it can't be the only way to reorder. */}
             {!isDone&&<button onClick={()=>moveExercise(ci,ei,-1)} disabled={ei===0} aria-label={`Move ${ex.name} up`} style={{fontSize:11,color:ei===0?C.faint:C.muted,background:"none",border:"none"}}>▲ up</button>}
@@ -5782,6 +5991,19 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
                 anything back via drag. Pointer drag is also unreliable on iOS Safari. This works
                 regardless of target combo state. */}
             {session.combos.length>1&&<button onClick={()=>setMoveOpenFor(moveOpenFor===ex.id?null:ex.id)} style={{fontSize:11,color:C.orange,background:"none",border:"none",textDecoration:"underline"}}>⇥ move to combo</button>}
+            {/* Kick an exercise out of the combo entirely — previously missing, so the only fix
+                for an accidentally-added or unwanted exercise was cancelling the whole session.
+                Confirmed only when it actually has logged sets to lose; an untouched row removes
+                on the first tap since there's nothing a confirmation would be protecting. */}
+            {confirmDeleteEx===ex.id ? (
+              <span style={{display:"inline-flex",gap:6,alignItems:"center"}}>
+                <span style={{fontSize:10.5,color:C.muted}}>Remove, losing {(ex.sets||[]).length} logged set{(ex.sets||[]).length!==1?"s":""}?</span>
+                <button onClick={()=>removeExerciseFromCombo(ci,ex.id)} style={{fontSize:11,color:"#000",background:C.red,border:"none",borderRadius:6,padding:"2px 8px",fontWeight:700}}>Remove</button>
+                <button onClick={()=>setConfirmDeleteEx(null)} style={{fontSize:11,color:C.muted,background:"none",border:`1px solid ${C.border}`,borderRadius:6,padding:"2px 8px"}}>✕</button>
+              </span>
+            ) : (
+              <button onClick={()=>(ex.sets||[]).length>0?setConfirmDeleteEx(ex.id):removeExerciseFromCombo(ci,ex.id)} aria-label={`Remove ${ex.name}`} style={{fontSize:11,color:C.faint,background:"none",border:"none",marginLeft:"auto"}}>🗑 remove</button>
+            )}
           </div>
           {moveOpenFor===ex.id&&(<div style={{marginBottom:8,background:C.card,border:`1px solid ${C.orange}40`,borderRadius:7,padding:"7px 9px"}}>
             <div style={{fontSize:9.5,color:C.muted,marginBottom:5}}>Move "{ex.name}" to:</div>
@@ -5793,18 +6015,33 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
             ))}</div>
           </div>)}
           {swapOpenFor===ex.id&&lib&&(()=>{
-            const alts = findAlternatives(lib.muscleGroup, gymExerciseLibrary, ex.name);
+            // Free-text search across the WHOLE library once typed — the same-muscle-group list
+            // alone had no way to find "that other machine" if it happened to sit in a different
+            // muscleGroup bucket, and there was no way to type at all. Empty search keeps the
+            // curated same-muscle-group suggestions as the default, quieter view.
+            const alts = swapSearch.trim()
+              ? (gymExerciseLibrary||[])
+                  .filter(e=>normExName(e.name)!==normExName(ex.name))
+                  .map(e=>{ const g=guideFor(e.name); return {e, score:searchScore(swapSearch, e.name, e.muscleGroup||"", g?.pattern||"", ...(g?.aliases||[]), ...(g?.equipment||[]))}; })
+                  .filter(x=>x.score>=0).sort((a,b)=>b.score-a.score).slice(0,20).map(x=>x.e)
+              : findAlternatives(lib.muscleGroup, gymExerciseLibrary, ex.name);
+            const curPattern = guideFor(ex.name)?.pattern;
             return(<div style={{marginBottom:8,background:C.card,border:`1px solid ${C.blue}40`,borderRadius:7,padding:"7px 9px"}}>
-              <div style={{fontSize:9.5,color:C.muted,marginBottom:5}}>Same muscle group ({lib.muscleGroup}) — equipment occupied?</div>
-              {/* Swapping mid-session is usually driven by "that machine is taken", so the
-                  equipment glyph on each tile is the thing being scanned for — not the name. */}
-              <ExerciseTileGrid items={alts} onGuide={setGuideFor} empty="No alternatives found."
+              <div style={{fontSize:9.5,color:C.muted,marginBottom:6}}>
+                {swapSearch.trim() ? "Search results:" : <>Same muscle group ({lib.muscleGroup}{curPattern?` · ${curPattern}`:""}) — equipment occupied?</>}
+              </div>
+              <input value={swapSearch} onChange={e=>setSwapSearch(e.target.value)} placeholder="Search any exercise…"
+                style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"6px 9px",color:C.text,fontSize:12,outline:"none",marginBottom:7}}/>
+              {/* Full-name rows rather than a tile grid: names get clipped in a compact tile, and
+                  the pattern subtitle (e.g. "Cable Pushdown" vs "Barbell Extension") is the
+                  closest the data has to "which part of Triceps this actually emphasizes". */}
+              <ExerciseSearchList items={alts} onGuide={setGuideFor} empty="No matches."
                 onPick={a=>{
                   const altLast=getLastPerformance(a.name,gymSessions);
                   // Writes to `ci`, the row's own combo — rows are no longer guaranteed to be in
                   // the currently-active combo now that the whole plan is on screen.
                   updateAction(s=>{const cc={...s.combos[ci]};cc.exercises=cc.exercises.map(x=>x.id===ex.id?{...x,name:a.name,weight:altLast?String(altLast.weight):""}:x);const combos=[...s.combos];combos[ci]=cc;return{...s,combos};});
-                  setSwapOpenFor(null);
+                  setSwapOpenFor(null); setSwapSearch("");
                 }}/>
             </div>);
           })()}
@@ -5868,25 +6105,35 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
 
     {!isLastCombo&&<button onClick={skipCombo} style={{width:"100%",padding:"9px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,fontSize:12,marginBottom:8}}>⏭ Skip current combo entirely</button>}
     <>
-      {/* Add exercise to this combo live — only between rounds to avoid awkward partial rounds */}
-      {atRoundStart&&(addExMode?(
+      {/* Add exercise to this combo live — only between rounds to avoid awkward partial rounds.
+          Previously just a bare text box with no way to browse or pick from the library at all
+          — every exercise had to be retyped from memory. Now the same search-and-tile picker
+          the offline plan editor uses, with a "not in the library" fallback for anything new. */}
+      {atRoundStart&&(addExMode?(()=>{
+        const q = newExName.trim();
+        const filteredLibForAdd = !q ? (gymExerciseLibrary||[]).slice(0,20) : (gymExerciseLibrary||[])
+          .map(e=>{ const g=guideFor(e.name); return {e, score:searchScore(q, e.name, e.muscleGroup||"", g?.pattern||"", ...(g?.aliases||[]), ...(g?.equipment||[]))}; })
+          .filter(x=>x.score>=0).sort((a,b)=>b.score-a.score).slice(0,20).map(x=>x.e);
+        const addFromLib = libEx => {
+          updateAction(s=>{const c={...s.combos[s.currentComboIdx]};c.exercises=[...c.exercises,{id:Date.now()+Math.random(),name:libEx.name,type:"weighted",weight:"",sets:[]}];const combos=[...s.combos];combos[s.currentComboIdx]=c;return{...s,combos};});
+          setNewExName(""); setAddExMode(false);
+        };
+        return(
         <div style={{background:C.bg,border:`1px dashed ${C.border}`,borderRadius:9,padding:"9px 11px",marginBottom:8}}>
-          <div style={{display:"flex",gap:6,marginBottom:6}}>
-            <input value={newExName} onChange={e=>setNewExName(e.target.value)} placeholder="Exercise name…" style={{flex:1,boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"6px 9px",color:C.text,fontSize:12,outline:"none"}}/>
+          <input value={newExName} onChange={e=>setNewExName(e.target.value)} placeholder="Search or type a new exercise…" autoFocus style={{width:"100%",boxSizing:"border-box",background:C.card,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 9px",color:C.text,fontSize:12,outline:"none",marginBottom:7}}/>
+          <div style={{maxHeight:260,overflowY:"auto",marginBottom:7}}>
+            <ExerciseTileGrid items={filteredLibForAdd} onPick={addFromLib} onGuide={setGuideFor} empty="No matches — add it as new below."/>
           </div>
-          <div style={{display:"flex",gap:6}}>
-            <button onClick={()=>setAddExMode(false)} style={{flex:1,padding:"6px 0",borderRadius:6,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button>
-            <button onClick={()=>{
-              if(!newExName.trim())return;
-              updateAction(s=>{const c={...s.combos[s.currentComboIdx]};c.exercises=[...c.exercises,{id:Date.now()+Math.random(),name:newExName.trim(),type:"weighted",weight:"",sets:[]}];const combos=[...s.combos];combos[s.currentComboIdx]=c;return{...s,combos};});
-              setNewExName(""); setAddExMode(false);
-            }} style={{flex:2,padding:"6px 0",borderRadius:6,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>+ Add to Combo</button>
-          </div>
+          {q&&!filteredLibForAdd.some(e=>normExName(e.name)===normExName(q))&&(
+            <button onClick={()=>addFromLib({name:q})} style={{width:"100%",padding:"7px 0",borderRadius:6,background:C.orange,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11,marginBottom:6}}>+ Add "{q}" as new exercise</button>
+          )}
+          <button onClick={()=>{setAddExMode(false);setNewExName("");}} style={{width:"100%",padding:"6px 0",borderRadius:6,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button>
         </div>
-      ):(
+        );
+      })():(
         <button onClick={()=>setAddExMode(true)} style={{width:"100%",padding:"8px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11,marginBottom:8}}>+ Add exercise to this combo</button>
       ))}
-      {atRoundStart&&<button onClick={()=>updateAction(s=>({...s,combos:[...s.combos,{id:Date.now(),exercises:[]}],currentComboIdx:s.combos.length,currentExInRound:0}))} style={{width:"100%",padding:"9px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,fontSize:12}}>+ New Combo</button>}
+      {atRoundStart&&<button onClick={()=>updateAction(s=>({...s,...commitComboTime(s),combos:[...s.combos,{id:Date.now(),exercises:[]}],currentComboIdx:s.combos.length,currentExInRound:0}))} style={{width:"100%",padding:"9px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,fontSize:12}}>+ New Combo</button>}
     </>
     {guideForName&&<ExerciseGuideSheet name={guideForName} onClose={()=>setGuideFor(null)}/>}
   </div>);
@@ -7266,7 +7513,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
   const [saveToast,setSaveToast]=useState(null);
   const [catFilter,setCatFilter]=useState(null); // category id, "uncategorized", or null
   const [martFilter,setMartFilter]=useState(null);
-  const [prodSort,setProdSort]=useState("name"); // one of PRODUCT_SORTS' ids
+  const [prodSort,setProdSort]=useState(getLastProductSort); // one of PRODUCT_SORTS' ids
   const [confirmDelete,setConfirmDelete]=useState(null); // index of product to delete
   const pff=k=>v=>setPForm(p=>({...p,[k]:v}));
   const active=mealPreps.filter(p=>p.remaining>0);const done=mealPreps.filter(p=>p.remaining===0);
@@ -7281,9 +7528,14 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
     try{const s=await aSubtitle(pForm.name.trim(),profile.apiKey);if(s)setPForm(p=>({...p,subtitle:s}));}catch(e){/* silent — subtitle is optional */}
     setSubtitleLoading(false);
   };
+  // A label with no name is unusable everywhere it'd be picked from a list; one with no kcal
+  // (and no macros at all) is indistinguishable from an accidental empty submit and would sit
+  // in the list contributing nothing to any total it's ever added to. Block both rather than
+  // silently saving a useless entry.
+  const pFormValid = f => f.name.trim().length>0 && (parseFloat(f.kcal)>0 || parseFloat(f.p)>0 || parseFloat(f.c)>0 || parseFloat(f.f)>0);
   const addProduct=()=>{
     const np=buildProductFromForm(pForm);
-    if(!np.name)return;
+    if(!pFormValid(pForm)){ setSaveToast({type:"invalid", reason: !np.name ? "name" : "kcal"}); return; }
     const dupIdx=products.findIndex(x=>x.name.toLowerCase()===np.name.toLowerCase());
     if(dupIdx>=0){
       // Don't silently drop the user's input — keep the form open and let them resolve.
@@ -7310,7 +7562,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
   };
   const saveEditP=()=>{
     const np=buildProductFromForm(pForm);
-    if(!np.name)return;
+    if(!pFormValid(pForm)){ setSaveToast({type:"invalid", reason: !np.name ? "name" : "kcal"}); return; }
     setProducts(prev=>prev.map((x,i)=>i===editPIdx?{...np,addedAt:x.addedAt||Date.now()}:x));
     setSaveToast({type:"updated",name:np.name});
     clearForm();setEditPIdx(null);
@@ -7333,7 +7585,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
   };
   // Auto-dismiss success/updated toasts after a few seconds; keep duplicate toasts until resolved.
   useEffect(()=>{
-    if(!saveToast||saveToast.type==="duplicate")return;
+    if(!saveToast||saveToast.type==="duplicate"||saveToast.type==="invalid")return;
     const t=setTimeout(()=>setSaveToast(null),4000);
     return ()=>clearTimeout(t);
   },[saveToast]);
@@ -7433,9 +7685,10 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
       </div>
       <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,overflowX:"auto",paddingBottom:2}}>
         <span style={{fontSize:10,color:C.muted,flexShrink:0,fontFamily:"monospace",textTransform:"uppercase"}}>Sort</span>
-        {PRODUCT_SORTS.map(s=>{const on=prodSort===s.id;return(<button key={s.id} type="button" onClick={()=>setProdSort(s.id)} style={{flexShrink:0,padding:"4px 10px",borderRadius:12,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:10.5,fontWeight:on?700:400,whiteSpace:"nowrap"}}>{s.label}</button>);})}
+        {PRODUCT_SORTS.map(s=>{const on=prodSort===s.id;return(<button key={s.id} type="button" onClick={()=>{setProdSort(s.id);setLastProductSort(s.id);}} style={{flexShrink:0,padding:"4px 10px",borderRadius:12,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,cursor:"pointer",fontSize:10.5,fontWeight:on?700:400,whiteSpace:"nowrap"}}>{s.label}</button>);})}
       </div>
       {saveToast&&(saveToast.type==="added"||saveToast.type==="updated")&&<div style={{background:`${C.lime}15`,border:`1px solid ${C.lime}66`,borderRadius:10,padding:"9px 13px",marginBottom:10,display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}><div style={{fontSize:12,color:C.lime,fontWeight:600}}>✓ {saveToast.type==="added"?"Added":"Updated"}: <span style={{fontFamily:"monospace"}}>{saveToast.name}</span></div><button onClick={()=>setSaveToast(null)} style={{background:"none",border:"none",color:C.lime,fontSize:16,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button></div>}
+      {saveToast&&saveToast.type==="invalid"&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:10,padding:"9px 13px",marginBottom:10,display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}><div style={{fontSize:12,color:"#ff8080",fontWeight:600}}>⚠ {saveToast.reason==="name"?"Enter a product name before saving.":"Enter a kcal value (or protein/carbs/fat) before saving."}</div><button onClick={()=>setSaveToast(null)} style={{background:"none",border:"none",color:"#ff8080",fontSize:16,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button></div>}
       {saveToast&&saveToast.type==="duplicate"&&<div style={{background:`${C.yellow}12`,border:`1px solid ${C.yellow}66`,borderRadius:10,padding:"10px 13px",marginBottom:10}}><div style={{fontSize:12,color:C.yellow,fontWeight:600,marginBottom:7,lineHeight:1.4}}>⚠ A product named <span style={{fontFamily:"monospace"}}>"{saveToast.name}"</span> already exists.</div><div style={{display:"flex",gap:6}}><button onClick={()=>resolveDup("update")} style={{flex:1,padding:"7px 0",borderRadius:7,background:C.yellow,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:11}}>Update existing</button><button onClick={()=>resolveDup("new")} style={{flex:1,padding:"7px 0",borderRadius:7,background:C.bg,border:`1px solid ${C.yellow}66`,color:C.yellow,fontWeight:600,cursor:"pointer",fontSize:11}}>Save as new (2)</button><button onClick={()=>setSaveToast(null)} style={{padding:"7px 10px",borderRadius:7,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Cancel</button></div></div>}
       {(showAdd||editPIdx!==null)&&<div ref={formRef} style={{background:C.card,border:`1px solid ${editPIdx!==null?C.lime:C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:10}}>
         <div style={{fontSize:11,color:editPIdx!==null?C.lime:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>{editPIdx!==null?"Editing product":"New product"}</div>
@@ -7509,7 +7762,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
           {(()=>{const k=parseFloat(pForm.kcal)||0,p=parseFloat(pForm.p)||0,c=parseFloat(pForm.c)||0,fv=parseFloat(pForm.f)||0;if(k<10)return null;const calc=Math.round(p*4+c*4+fv*9);const diff=Math.abs(k-calc);const pct=k>0?diff/k:0;if(pct<=0.25)return null;return(<div style={{background:"#1a1400",border:`1px solid ${C.yellow}40`,borderRadius:8,padding:"7px 11px",fontSize:11,color:C.yellow,lineHeight:1.4}}>⚠ Numbers don't add up: macros suggest <span style={{fontFamily:"monospace",fontWeight:700}}>~{calc} kcal</span> but you entered <span style={{fontFamily:"monospace",fontWeight:700}}>{k}</span> ({Math.round(pct*100)}% off). Double-check the label — likely one row was misread.</div>);})()}
           <div style={{display:"flex",gap:8}}>
             <button onClick={()=>{setShowAdd(false);setEditPIdx(null);setPForm(EMPTY_PFORM);setScanImgs([]);setMarketInput("");setTimeout(()=>window.scrollTo({top:savedScrollRef.current,behavior:"smooth"}),60);}} style={{flex:1,padding:"9px 0",borderRadius:8,background:C.bg,border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:T.body}}>Cancel</button>
-            <button onClick={editPIdx!==null?saveEditP:addProduct} style={{flex:2,padding:"9px 0",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:T.body}}>{editPIdx!==null?"Save":"Save Product"}</button>
+            <button onClick={editPIdx!==null?saveEditP:addProduct} disabled={!pFormValid(pForm)} style={{flex:2,padding:"9px 0",borderRadius:8,background:pFormValid(pForm)?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,cursor:pFormValid(pForm)?"pointer":"default",fontSize:T.body}}>{editPIdx!==null?"Save":"Save Product"}</button>
           </div>
         </div>
       </div>}
@@ -9085,7 +9338,7 @@ function App(){
       <button onClick={()=>setRolloverBanner(null)} style={{background:"none",border:"none",color:C.lime,fontSize:18,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button>
     </div>}
     <div style={{flex:1,overflow:"hidden"}}>
-      {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} setProfile={setProfile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence} progress={progress} gymSessions={gymSessions}/>}
+      {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} setProfile={setProfile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("settings")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence} progress={progress} gymSessions={gymSessions} gymDayAssign={gymDayAssign}/>}
       {viewTab==="activity"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymDayAssign={gymDayAssign} setGymDayAssign={setGymDayAssign} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary}/>}
       {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes} onLogMeal={meal=>setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}))} gymSessions={gymSessions}/>}
       {viewTab==="history"&&<HistoryTab weights={weights} products={products} profile={profile} medications={medications} medLog={medLog} progress={progress} onLogMed={logMedFor} onUnlogMed={unlogMed}/>}

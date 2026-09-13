@@ -2822,6 +2822,23 @@ async function lookupBarcode(code) {
     packSizeG, servingG,
   };
 }
+// Fallback for browsers without BarcodeDetector (notably Safari): read the barcode's own
+// printed digits from a photo via the vision model, the same way the app already reads a
+// nutrition label — this is plain OCR of numerals under the bars, not barcode decoding, so it
+// works without any camera/scanning API at all. The digits then go through the same
+// lookupBarcode() as a live scan or manual entry.
+async function aBarcodeFromPhoto(imgs, apiKey) {
+  const c = await prepImgs(imgs.slice(0,2));
+  const res = await callAI([
+    { type:"text", text:"You MUST return ONLY a JSON object — no explanation, no markdown.\n\n"
+      + "Read the barcode number printed as digits directly below or beside the black bars in this photo (EAN-13, EAN-8, or UPC — typically 8, 12 or 13 digits). Return exactly those digits, nothing else — no spaces, dashes or letters.\n\n"
+      + "If there is no barcode in the photo, or the digits are too blurry/cut off to read with confidence, return null instead of guessing.\n\n"
+      + 'Reply with EXACTLY this JSON: {"barcode":""} — or {"barcode":null} if unreadable.' },
+    ...iBlks(c),
+  ], apiKey, VISION_MODEL, 200);
+  const digits = res?.barcode ? String(res.barcode).replace(/\D/g,"") : null;
+  return digits && digits.length>=6 ? digits : null;
+}
 
 // Parse a pasted recipe text and/or photo(s) of a recipe (cookbook page, screenshot, note)
 // into structured ingredients + instructions. Used by the "auto-fill" flow in RecipeEditSheet.
@@ -4478,7 +4495,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
         style={{flex:1,minWidth:60,padding:"8px 4px",borderRadius:10,border:`1px solid ${mode===m?C.lime:C.border}`,background:mode===m?`${C.lime}20`:C.card,color:mode===m?C.lime:disabled?C.muted2:C.muted,fontWeight:mode===m?700:500,cursor:disabled?"default":"pointer",fontSize:11,opacity:disabled?0.5:1}}>{lbl}</button>);
     })}</div>
     {mode!=="quick"&&<button onClick={()=>setMode("quick")} style={{background:"none",border:"none",color:C.muted,fontSize:T.sm,textDecoration:"underline",cursor:"pointer",padding:0,marginBottom:12}}>← Recent &amp; Favourites</button>}
-    {showBarcode&&<BarcodeScanSheet onAdd={onAdd} onClose={()=>setShowBarcode(false)}/>}
+    {showBarcode&&<BarcodeScanSheet onAdd={onAdd} onClose={()=>setShowBarcode(false)} apiKey={apiKey}/>}
     {/* ── Quick pick: Recent + Favourites ── the landing screen for a bare "Log meal" open.
         Frequently-eaten items are one tap to log again instead of re-running Photos/Labels for
         the same chicken-and-rice bowl for the third time this week. */}
@@ -4714,7 +4731,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
 // digit entry is always available and is the reliable path on any device. A successful lookup
 // that gets logged also lands in `newProduct` on the returned entry, so it joins the pantry the
 // same way an AI-scanned label does — no separate "save to labels" step needed.
-function BarcodeScanSheet({onAdd,onClose}){
+function BarcodeScanSheet({onAdd,onClose,apiKey}){
   const [manualCode,setManualCode]=useState("");
   const [scanning,setScanning]=useState(false);
   const [scanErr,setScanErr]=useState(null);
@@ -4727,6 +4744,12 @@ function BarcodeScanSheet({onAdd,onClose}){
   const videoRef=useRef(null);
   const streamRef=useRef(null);
   const cameraSupported = typeof window!=="undefined" && "BarcodeDetector" in window;
+  // Photo fallback for browsers without live BarcodeDetector support (notably Safari) — reads
+  // the barcode's own printed digits from an uploaded/captured photo via the vision model
+  // instead of decoding the bars, then runs the same lookup as a live scan or manual entry.
+  const [photoImgs,setPhotoImgs]=useState([]);
+  const [readingPhoto,setReadingPhoto]=useState(false);
+  const [photoErr,setPhotoErr]=useState(null);
 
   const doLookup = async (code) => {
     setLooking(true); setLookupErr(null); setFound(null); setNotFoundCode(null);
@@ -4738,6 +4761,21 @@ function BarcodeScanSheet({onAdd,onClose}){
       setLookupErr({friendly:"Couldn't look that up. Check your connection and try again.", detail:String(e.message||e)});
     }
     setLooking(false);
+  };
+
+  const readFromPhoto = async () => {
+    if (!photoImgs.length) return;
+    setReadingPhoto(true); setPhotoErr(null);
+    try {
+      const digits = await aBarcodeFromPhoto(photoImgs, apiKey);
+      if (!digits) { setPhotoErr("Couldn't read a barcode in that photo — try getting closer and keeping the numbers in focus, or enter it manually below."); setReadingPhoto(false); return; }
+      setPhotoImgs([]);
+      setReadingPhoto(false);
+      doLookup(digits);
+    } catch(e) {
+      setPhotoErr(String(e.message||e));
+      setReadingPhoto(false);
+    }
   };
 
   const stopCamera = () => {
@@ -4795,7 +4833,13 @@ function BarcodeScanSheet({onAdd,onClose}){
         )}
         {scanErr&&<div style={{fontSize:T.sm,color:C.red,marginTop:8}}>{scanErr}</div>}
       </div>):(
-        <div style={{fontSize:T.sm,color:C.muted,marginBottom:14,lineHeight:1.5}}>Camera barcode scanning isn't supported in this browser — enter the barcode number instead (it's printed under the barcode lines on the pack).</div>
+        <div style={{marginBottom:14}}>
+          <div style={{fontSize:T.sm,color:C.muted,marginBottom:8,lineHeight:1.5}}>Live camera barcode scanning isn't supported in this browser (this is a Safari limitation). Take or upload a photo that clearly shows the barcode instead — the digits printed under the bars are read from the photo, same as reading a nutrition label.</div>
+          <ImgZone imgs={photoImgs} setImgs={setPhotoImgs} compact maxPhotos={1}/>
+          {photoImgs.length>0&&<button onClick={readFromPhoto} disabled={readingPhoto} style={{width:"100%",padding:"12px 0",borderRadius:10,background:readingPhoto?C.faint:C.lime,border:"none",color:"#000",fontWeight:700,fontSize:T.body,marginTop:8}}>{readingPhoto?"Reading…":"📷 Read barcode from photo"}</button>}
+          {photoErr&&<div style={{fontSize:T.sm,color:C.red,marginTop:8,lineHeight:1.4}}>{photoErr}</div>}
+          <div style={{fontSize:T.sm,color:C.muted,marginTop:10,textAlign:"center"}}>— or enter the number below —</div>
+        </div>
       )}
       <div style={{display:"flex",gap:8}}>
         <input type="text" inputMode="numeric" pattern="[0-9]*" placeholder="Barcode number" value={manualCode} onChange={e=>setManualCode(e.target.value.replace(/\D/g,""))} style={{flex:1,minHeight:44,background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.text,fontFamily:"monospace",fontSize:16,outline:"none"}}/>
@@ -9970,7 +10014,7 @@ function App(){
     </button>}
     {quickAction==="picker"&&<QuickLogPicker dueCount={quickDueMeds.length} onClose={()=>setQuickAction(null)} onPick={id=>setQuickAction(id)}/>}
     {quickAction==="meal"&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleQuickMealAdd} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey} aiPrefs={profile.aiPrefs} initialMode="quick" mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
-    {quickAction==="barcode"&&<BarcodeScanSheet onAdd={handleQuickMealAdd} onClose={()=>setQuickAction(null)}/>}
+    {quickAction==="barcode"&&<BarcodeScanSheet onAdd={handleQuickMealAdd} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey}/>}
     {quickAction==="weight"&&<QuickWeightSheet weights={weights} setWeights={setWeights} onClose={()=>setQuickAction(null)}/>}
     {quickAction==="activity"&&<AddActSheet onAdd={act=>{setDayData(p=>({...p,activities:[...(p.activities||[]),act]}));setQuickAction(null);}} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey} weightKg={latestWeight}/>}
     {quickAction==="steps"&&<QuickStepsSheet dayData={dayData} setDayData={setDayData} onClose={()=>setQuickAction(null)}/>}

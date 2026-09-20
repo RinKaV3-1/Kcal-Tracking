@@ -1529,9 +1529,31 @@ function distanceKcal(type, km, weightKg) {
 
 // Estimate active kcal burned during a gym session from duration, when the user doesn't enter
 // a manual figure. Deliberately conservative — see the note above.
-function estimateGymKcal(durationSec, bodyWeightKg) {
-  return Math.round(netMetKcal(ENERGY.LIFT_METS, bodyWeightKg, (durationSec||0)/60));
+//
+// Personalized when real history exists for THIS plan: a flat METs formula doesn't know how hard
+// this specific person trains this specific day, so a 90-minute leg day and a 40-minute arms day
+// both got the same generic per-minute rate — visibly wrong next to "my last 5 gym days all burned
+// ~500 and this 55-minute one is suggesting 300". Real sessions (same dayId when known, so a
+// heavy-legs plan and a light-arms plan on the same weekday don't blend into one rate) give an
+// actual kcal-per-minute rate, applied to THIS session's real elapsed time — reported time still
+// drives the number, it's just priced at what this workout actually costs instead of a generic
+// formula's guess. Falls back to the formula with fewer than 2 real sessions to learn from.
+function estimateGymKcal(durationSec, bodyWeightKg, gymSessions, dayId) {
+  const minutes = (durationSec||0)/60;
+  const pool = dayId ? (gymSessions||[]).filter(s=>s.dayId===dayId) : (gymSessions||[]);
+  const recent = pool.filter(s=>(s.kcalBurned||0)>0 && (s.durationSec||0)>0).slice(0,7);
+  if (recent.length>=2) {
+    const rate = recent.reduce((sum,s)=>sum+(s.kcalBurned/(s.durationSec/60)),0)/recent.length;
+    return Math.round(rate*minutes);
+  }
+  return Math.round(netMetKcal(ENERGY.LIFT_METS, bodyWeightKg, minutes));
 }
+// A plan's combo/exercise structure as a plain comparable value: which exercise ids appear, in
+// which combo, in which order, under which name. Order changes, additions, removals and swaps
+// (same exercise id, different name — see swapExercise) all show up as a different signature;
+// only the sets/weights logged during the session (which never touch id or name) don't.
+const comboPlanSignature = combos => (combos||[]).map(c => (c.exercises||[]).map(ex => `${ex.id}:${normExName(ex.name)}`));
+const comboPlanChanged = (a, b) => JSON.stringify(comboPlanSignature(a)) !== JSON.stringify(comboPlanSignature(b));
 // Normalize an exercise name for matching across sessions (case/whitespace/accent insensitive).
 const normExName = s => (s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/\s+/g," ").trim();
 // Find the most recent completed performance of a named exercise across past sessions.
@@ -3507,6 +3529,47 @@ function EditPrepSheet({prep,onSave,onClose}){
 
 // ── AddIngredientRow — inline add with name + weight ──────────────────────────
 
+// Raw/dry ingredients change weight as they cook — grains, pasta and legumes absorb water and
+// get heavier, meat and fish lose moisture and get lighter. A meal prep's ingredient weights are
+// (correctly) whatever was weighed going INTO the pot, raw, since that's what the per-100g macros
+// on the label/scale reading are actually for — cooking doesn't add calories, only water. But
+// naively summing those raw weights and calling it the finished dish's weight is wrong for
+// exactly the staples people build meal preps around: 300g of dry rice or buckwheat becomes
+// something like 800-850g cooked, not 300g. Used only to estimate the FINISHED weight (for
+// per-100g-of-the-dish math and grams-per-portion) — never to touch the macro totals themselves.
+const COOK_YIELD = [
+  // Grains, pasta and legumes roughly double-to-triple as they absorb water during cooking.
+  {re:/\b(rice)\b/, factor:2.8},
+  {re:/\b(buckwheat|kasha)\b/, factor:2.8},
+  {re:/\b(quinoa)\b/, factor:2.8},
+  {re:/\b(barley)\b/, factor:3},
+  {re:/\b(couscous|bulgur)\b/, factor:2},
+  {re:/\b(oat|oats|oatmeal|porridge)\b/, factor:2},
+  {re:/\b(pasta|spaghetti|noodles?|macaroni|penne|fusilli|tagliatelle)\b/, factor:2.25},
+  {re:/\b(lentils?)\b/, factor:2.5},
+  {re:/\b(beans?|chickpeas?|garbanzo)\b/, factor:2.5},
+  // Meat and fish lose moisture (and, for fattier cuts, rendered fat) as they cook.
+  {re:/\b(bacon)\b/, factor:0.6},
+  {re:/\b(chicken|turkey|beef|pork|mince|steak|sausage|meatballs?)\b/, factor:0.75},
+  {re:/\b(salmon|fish|cod|tuna|prawns?|shrimp)\b/, factor:0.85},
+];
+// Already in its finished state — cooked leftovers, canned/tinned goods (already hydrated), or
+// explicitly described as cooked — so no yield adjustment applies.
+const ALREADY_COOKED_RE = /\b(cooked|canned|tinned|pre-?cooked|ready.?to.?eat|leftover)\b/i;
+function cookYieldFactor(name) {
+  const n = (name||"").toLowerCase();
+  if (!n || ALREADY_COOKED_RE.test(n)) return 1;
+  for (const {re,factor} of COOK_YIELD) if (re.test(n)) return factor;
+  return 1;
+}
+// Estimate a meal prep's finished (cooked) weight from its raw ingredient weights. Summing raw
+// grams 1:1 systematically undercounts a grain/rice-based dish (which can nearly triple) and
+// overcounts a meat-based one (which shrinks) — this is what actually drives the "total cooked
+// weight" default shown when the user hasn't weighed the finished container themselves yet.
+function estimateCookedWeightG(ingredients) {
+  return (ingredients||[]).reduce((s,i)=>s+(parseFloat(i.weightG)||0)*cookYieldFactor(i.name), 0);
+}
+
 // ── IngredientConfirmPanel — shared between meal log and meal prep ─────────────
 // Stop words: modifiers/brands/adjectives that should NOT be used to match foods on their own.
 // Two ingredients sharing only stop words ("frozen blueberries" vs "frozen peas") must NOT match.
@@ -4349,7 +4412,7 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
   </div>);
 }
 
-function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,initialMode,aiPrefs,mealFavorites,setMealFavorites}){
+function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onAddKeepOpen,onClose,apiKey,initialMode,aiPrefs,mealFavorites,setMealFavorites}){
   const mealAnalysisOn = aiPrefs?.mealAnalysis ?? true;
   // "quick" (Recent + Favourites) is the default landing screen for an unspecified open — the
   // advanced tools (Photos/Barcode/Labels/Manual/Prep) are one tap away rather than the first
@@ -4495,7 +4558,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
         style={{flex:1,minWidth:60,padding:"8px 4px",borderRadius:10,border:`1px solid ${mode===m?C.lime:C.border}`,background:mode===m?`${C.lime}20`:C.card,color:mode===m?C.lime:disabled?C.muted2:C.muted,fontWeight:mode===m?700:500,cursor:disabled?"default":"pointer",fontSize:11,opacity:disabled?0.5:1}}>{lbl}</button>);
     })}</div>
     {mode!=="quick"&&<button onClick={()=>setMode("quick")} style={{background:"none",border:"none",color:C.muted,fontSize:T.sm,textDecoration:"underline",cursor:"pointer",padding:0,marginBottom:12}}>← Recent &amp; Favourites</button>}
-    {showBarcode&&<BarcodeScanSheet onAdd={onAdd} onClose={()=>setShowBarcode(false)} apiKey={apiKey}/>}
+    {showBarcode&&<BarcodeScanSheet onAdd={onAdd} onAddKeepOpen={onAddKeepOpen||onAdd} onClose={()=>setShowBarcode(false)} onFinish={onClose} onPickLabels={()=>setShowBarcode(false)} apiKey={apiKey}/>}
     {/* ── Quick pick: Recent + Favourites ── the landing screen for a bare "Log meal" open.
         Frequently-eaten items are one tap to log again instead of re-running Photos/Labels for
         the same chicken-and-rice bowl for the third time this week. */}
@@ -4731,37 +4794,20 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onClose,apiKey,init
 // digit entry is always available and is the reliable path on any device. A successful lookup
 // that gets logged also lands in `newProduct` on the returned entry, so it joins the pantry the
 // same way an AI-scanned label does — no separate "save to labels" step needed.
-function BarcodeScanSheet({onAdd,onClose,apiKey}){
+// Shared barcode-acquisition UI: camera scan where BarcodeDetector exists, photo-based fallback
+// (Safari) otherwise, or manual digit entry — calls onCode(digits) once one is obtained. Extracted
+// so the same scan mechanics work both for logging a meal (BarcodeScanSheet) and for prefilling a
+// new product label or a meal-prep ingredient, which need the digits but not "log it as a meal".
+function BarcodeCapture({onCode, apiKey}){
   const [manualCode,setManualCode]=useState("");
   const [scanning,setScanning]=useState(false);
   const [scanErr,setScanErr]=useState(null);
-  const [looking,setLooking]=useState(false);
-  const [lookupErr,setLookupErr]=useState(null);
-  const [found,setFound]=useState(null); // result of lookupBarcode()
-  const [notFoundCode,setNotFoundCode]=useState(null);
-  const [grams,setGrams]=useState("100");
-  const [mealType,setMealType]=useState(mealTypeByTime());
-  const videoRef=useRef(null);
-  const streamRef=useRef(null);
-  const cameraSupported = typeof window!=="undefined" && "BarcodeDetector" in window;
-  // Photo fallback for browsers without live BarcodeDetector support (notably Safari) — reads
-  // the barcode's own printed digits from an uploaded/captured photo via the vision model
-  // instead of decoding the bars, then runs the same lookup as a live scan or manual entry.
   const [photoImgs,setPhotoImgs]=useState([]);
   const [readingPhoto,setReadingPhoto]=useState(false);
   const [photoErr,setPhotoErr]=useState(null);
-
-  const doLookup = async (code) => {
-    setLooking(true); setLookupErr(null); setFound(null); setNotFoundCode(null);
-    try {
-      const res = await lookupBarcode(code);
-      if (res) { setFound(res); setGrams(res.servingG?String(res.servingG):"100"); }
-      else setNotFoundCode(code.replace(/\D/g,""));
-    } catch(e) {
-      setLookupErr({friendly:"Couldn't look that up. Check your connection and try again.", detail:String(e.message||e)});
-    }
-    setLooking(false);
-  };
+  const videoRef=useRef(null);
+  const streamRef=useRef(null);
+  const cameraSupported = typeof window!=="undefined" && "BarcodeDetector" in window;
 
   const readFromPhoto = async () => {
     if (!photoImgs.length) return;
@@ -4771,7 +4817,7 @@ function BarcodeScanSheet({onAdd,onClose,apiKey}){
       if (!digits) { setPhotoErr("Couldn't read a barcode in that photo — try getting closer and keeping the numbers in focus, or enter it manually below."); setReadingPhoto(false); return; }
       setPhotoImgs([]);
       setReadingPhoto(false);
-      doLookup(digits);
+      onCode(digits);
     } catch(e) {
       setPhotoErr(String(e.message||e));
       setReadingPhoto(false);
@@ -4794,7 +4840,7 @@ function BarcodeScanSheet({onAdd,onClose,apiKey}){
         if (!streamRef.current || !videoRef.current) return;
         try {
           const codes = await detector.detect(videoRef.current);
-          if (codes.length) { stopCamera(); doLookup(codes[0].rawValue); return; }
+          if (codes.length) { stopCamera(); onCode(codes[0].rawValue); return; }
         } catch {}
         if (streamRef.current) requestAnimationFrame(tick);
       };
@@ -4806,6 +4852,60 @@ function BarcodeScanSheet({onAdd,onClose,apiKey}){
   };
   useEffect(() => stopCamera, []); // stop the camera stream if the sheet closes mid-scan
 
+  return(<div>
+    {cameraSupported?(<div style={{marginBottom:14}}>
+      {scanning?(<div style={{position:"relative",borderRadius:12,overflow:"hidden",background:"#000"}}>
+        <video ref={videoRef} playsInline muted style={{width:"100%",display:"block"}}/>
+        <div style={{position:"absolute",inset:0,border:`2px solid ${C.lime}80`,borderRadius:12,pointerEvents:"none"}}/>
+        <button onClick={stopCamera} style={{position:"absolute",bottom:10,left:"50%",transform:"translateX(-50%)",padding:"8px 16px",borderRadius:20,background:"rgba(0,0,0,.6)",border:"none",color:"#fff",fontSize:T.sm}}>Cancel scan</button>
+      </div>):(
+        <button onClick={startCamera} style={{width:"100%",padding:"14px 0",borderRadius:10,background:C.lime,border:"none",color:"#000",fontWeight:700,fontSize:T.body}}>📷 Scan with camera</button>
+      )}
+      {scanErr&&<div style={{fontSize:T.sm,color:C.red,marginTop:8}}>{scanErr}</div>}
+    </div>):(
+      <div style={{marginBottom:14}}>
+        <div style={{fontSize:T.sm,color:C.muted,marginBottom:8,lineHeight:1.5}}>Live camera barcode scanning isn't supported in this browser (this is a Safari limitation). Take or upload a photo that clearly shows the barcode instead — the digits printed under the bars are read from the photo, same as reading a nutrition label.</div>
+        <ImgZone imgs={photoImgs} setImgs={setPhotoImgs} compact maxPhotos={1}/>
+        {photoImgs.length>0&&<button onClick={readFromPhoto} disabled={readingPhoto} style={{width:"100%",padding:"12px 0",borderRadius:10,background:readingPhoto?C.faint:C.lime,border:"none",color:"#000",fontWeight:700,fontSize:T.body,marginTop:8}}>{readingPhoto?"Reading…":"📷 Read barcode from photo"}</button>}
+        {photoErr&&<div style={{fontSize:T.sm,color:C.red,marginTop:8,lineHeight:1.4}}>{photoErr}</div>}
+        <div style={{fontSize:T.sm,color:C.muted,marginTop:10,textAlign:"center"}}>— or enter the number below —</div>
+      </div>
+    )}
+    <div style={{display:"flex",gap:8}}>
+      <input type="text" inputMode="numeric" pattern="[0-9]*" placeholder="Barcode number" value={manualCode} onChange={e=>setManualCode(e.target.value.replace(/\D/g,""))} style={{flex:1,minHeight:44,background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.text,fontFamily:"monospace",fontSize:16,outline:"none"}}/>
+      <button onClick={()=>manualCode.trim()&&onCode(manualCode)} disabled={!manualCode.trim()} style={{padding:"0 18px",minHeight:44,borderRadius:R.sm,background:manualCode.trim()?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,fontSize:T.body}}>Look up</button>
+    </div>
+  </div>);
+}
+// `onAddKeepOpen` (falls back to `onAdd`) commits a logged item WITHOUT closing anything, so
+// several barcodes can be scanned in one sitting instead of the sheet closing after the first.
+// `onFinish` (falls back to `onClose`) is the actual "I'm done" action — separate from `onClose`,
+// which (when nested inside AddMealSheet's own barcode tab) only steps back to that sheet's own
+// quick-pick screen. `onPickLabels`, when provided, offers a way to continue logging from product
+// labels/search instead of scanning — the caller decides what that means for its own context.
+function BarcodeScanSheet({onAdd,onAddKeepOpen,onClose,onFinish,onPickLabels,apiKey}){
+  const [looking,setLooking]=useState(false);
+  const [lookupErr,setLookupErr]=useState(null);
+  const [found,setFound]=useState(null); // result of lookupBarcode()
+  const [notFoundCode,setNotFoundCode]=useState(null);
+  const [grams,setGrams]=useState("100");
+  const [mealType,setMealType]=useState(mealTypeByTime());
+  const [addedCount,setAddedCount]=useState(0);
+  const [justAdded,setJustAdded]=useState(null); // {name,kcal} of the most recently logged item
+  const [scanKey,setScanKey]=useState(0); // bumped to remount BarcodeCapture with fresh state
+
+  const doLookup = async (code) => {
+    setLooking(true); setLookupErr(null); setFound(null); setNotFoundCode(null);
+    try {
+      const res = await lookupBarcode(code);
+      if (res) { setFound(res); setGrams(res.servingG?String(res.servingG):"100"); }
+      else setNotFoundCode(code.replace(/\D/g,""));
+    } catch(e) {
+      setLookupErr({friendly:"Couldn't look that up. Check your connection and try again.", detail:String(e.message||e)});
+    }
+    setLooking(false);
+  };
+
   const macrosFor = g => {
     const s = (parseFloat(g)||0)/100;
     return {kcal:Math.round(found.kcal*s), protein:Math.round(found.p*s*10)/10, carbs:Math.round(found.c*s*10)/10, fat:Math.round(found.f*s*10)/10};
@@ -4814,44 +4914,32 @@ function BarcodeScanSheet({onAdd,onClose,apiKey}){
   const logIt = () => {
     const g = parseFloat(grams)||0; if (g<=0) return;
     const m = macrosFor(g);
-    onAdd({
+    (onAddKeepOpen||onAdd)({
       id:Date.now(), mealType, name:found.name, kcal:m.kcal, protein:m.protein, carbs:m.carbs, fat:m.fat,
       notes:`${Math.round(g)}g · scanned barcode`, time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"}),
       newProduct:{name:found.name, kcal:found.kcal, p:found.p, c:found.c, f:found.f, packSizeG:found.packSizeG, servingG:found.servingG, barcode:found.barcode, categories:[], addedAt:Date.now()},
     });
+    setAddedCount(c=>c+1);
+    setJustAdded({name:found.name, kcal:m.kcal});
+    // Reset to a fresh scan so the next barcode can be looked up right away.
+    setFound(null); setNotFoundCode(null); setLookupErr(null); setGrams("100");
+    setScanKey(k=>k+1);
   };
 
   return(<Sheet onClose={onClose} title="Scan Barcode">
-    {!found&&!notFoundCode&&(<>
-      {cameraSupported?(<div style={{marginBottom:14}}>
-        {scanning?(<div style={{position:"relative",borderRadius:12,overflow:"hidden",background:"#000"}}>
-          <video ref={videoRef} playsInline muted style={{width:"100%",display:"block"}}/>
-          <div style={{position:"absolute",inset:0,border:`2px solid ${C.lime}80`,borderRadius:12,pointerEvents:"none"}}/>
-          <button onClick={stopCamera} style={{position:"absolute",bottom:10,left:"50%",transform:"translateX(-50%)",padding:"8px 16px",borderRadius:20,background:"rgba(0,0,0,.6)",border:"none",color:"#fff",fontSize:T.sm}}>Cancel scan</button>
-        </div>):(
-          <button onClick={startCamera} style={{width:"100%",padding:"14px 0",borderRadius:10,background:C.lime,border:"none",color:"#000",fontWeight:700,fontSize:T.body}}>📷 Scan with camera</button>
-        )}
-        {scanErr&&<div style={{fontSize:T.sm,color:C.red,marginTop:8}}>{scanErr}</div>}
-      </div>):(
-        <div style={{marginBottom:14}}>
-          <div style={{fontSize:T.sm,color:C.muted,marginBottom:8,lineHeight:1.5}}>Live camera barcode scanning isn't supported in this browser (this is a Safari limitation). Take or upload a photo that clearly shows the barcode instead — the digits printed under the bars are read from the photo, same as reading a nutrition label.</div>
-          <ImgZone imgs={photoImgs} setImgs={setPhotoImgs} compact maxPhotos={1}/>
-          {photoImgs.length>0&&<button onClick={readFromPhoto} disabled={readingPhoto} style={{width:"100%",padding:"12px 0",borderRadius:10,background:readingPhoto?C.faint:C.lime,border:"none",color:"#000",fontWeight:700,fontSize:T.body,marginTop:8}}>{readingPhoto?"Reading…":"📷 Read barcode from photo"}</button>}
-          {photoErr&&<div style={{fontSize:T.sm,color:C.red,marginTop:8,lineHeight:1.4}}>{photoErr}</div>}
-          <div style={{fontSize:T.sm,color:C.muted,marginTop:10,textAlign:"center"}}>— or enter the number below —</div>
-        </div>
-      )}
-      <div style={{display:"flex",gap:8}}>
-        <input type="text" inputMode="numeric" pattern="[0-9]*" placeholder="Barcode number" value={manualCode} onChange={e=>setManualCode(e.target.value.replace(/\D/g,""))} style={{flex:1,minHeight:44,background:C.bg,border:`1px solid ${C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.text,fontFamily:"monospace",fontSize:16,outline:"none"}}/>
-        <button onClick={()=>doLookup(manualCode)} disabled={!manualCode.trim()||looking} style={{padding:"0 18px",minHeight:44,borderRadius:R.sm,background:manualCode.trim()&&!looking?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,fontSize:T.body}}>{looking?"…":"Look up"}</button>
-      </div>
-      {lookupErr&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ff8080",marginTop:10}}>{lookupErr.friendly}<details style={{marginTop:4}}><summary style={{cursor:"pointer",color:"#ff8080cc",fontSize:10}}>Details</summary><div style={{marginTop:3,fontFamily:"monospace",fontSize:10,opacity:0.85}}>{lookupErr.detail}</div></details></div>}
-    </>)}
+    {justAdded&&<div style={{background:`${C.lime}12`,border:`1px solid ${C.lime}45`,borderRadius:10,padding:"10px 12px",marginBottom:14}}>
+      <div style={{fontSize:T.sm,color:C.text}}>✓ Added <b>{justAdded.name}</b> · {Math.round(justAdded.kcal)}kcal</div>
+      {addedCount>1&&<div style={{fontSize:T.label,color:C.muted,marginTop:2}}>{addedCount} items logged this session</div>}
+    </div>}
+
+    {!found&&!notFoundCode&&<BarcodeCapture key={scanKey} onCode={doLookup} apiKey={apiKey}/>}
+    {looking&&<div style={{fontSize:T.sm,color:C.muted,marginTop:-6,marginBottom:10}}>Looking up…</div>}
+    {lookupErr&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ff8080",marginTop:10}}>{lookupErr.friendly}<details style={{marginTop:4}}><summary style={{cursor:"pointer",color:"#ff8080cc",fontSize:10}}>Details</summary><div style={{marginTop:3,fontFamily:"monospace",fontSize:10,opacity:0.85}}>{lookupErr.detail}</div></details></div>}
 
     {notFoundCode&&(<div style={{textAlign:"center",padding:"14px 4px"}}>
       <div style={{fontSize:T.body,color:C.text,marginBottom:6}}>No match for barcode <span style={{fontFamily:"monospace"}}>{notFoundCode}</span></div>
       <div style={{fontSize:T.sm,color:C.muted,marginBottom:14}}>Not every product is in the Open Food Facts database yet — you can still add it by photo or manually.</div>
-      <button onClick={()=>{setNotFoundCode(null);setManualCode("");}} style={{padding:"9px 18px",minHeight:44,borderRadius:8,background:"none",border:`1px solid ${C.border}`,color:C.text,fontSize:T.body}}>← Try another code</button>
+      <button onClick={()=>{setNotFoundCode(null);setScanKey(k=>k+1);}} style={{padding:"9px 18px",minHeight:44,borderRadius:8,background:"none",border:`1px solid ${C.border}`,color:C.text,fontSize:T.body}}>← Try another code</button>
     </div>)}
 
     {found&&(<div>
@@ -4866,10 +4954,17 @@ function BarcodeScanSheet({onAdd,onClose,apiKey}){
       </div>
       {parseFloat(grams)>0&&(()=>{const m=macrosFor(grams);return(<div style={{display:"flex",gap:10,marginBottom:14}}><Chip val={m.kcal} label="kcal" color={C.lime}/><Chip val={m.protein} label="P" color={C.blue}/><Chip val={m.carbs} label="C" color={C.orange}/><Chip val={m.fat} label="F" color={C.purple}/></div>);})()}
       <div style={{display:"flex",gap:8}}>
-        <button onClick={()=>{setFound(null);setManualCode("");}} style={{flex:1,padding:"11px 0",minHeight:44,borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,fontSize:T.body}}>← Back</button>
+        <button onClick={()=>{setFound(null);setScanKey(k=>k+1);}} style={{flex:1,padding:"11px 0",minHeight:44,borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,fontSize:T.body}}>← Back</button>
         <button onClick={logIt} disabled={!(parseFloat(grams)>0)} style={{flex:2,padding:"11px 0",minHeight:44,borderRadius:10,background:parseFloat(grams)>0?C.lime:C.faint,border:"none",color:"#000",fontWeight:700,fontSize:T.body}}>Log it</button>
       </div>
     </div>)}
+
+    {/* Batch controls: only once at least one item has actually been logged this session — before
+        that the Sheet's own × close is the only "leave" affordance, same as before. */}
+    {addedCount>0&&<div style={{display:"flex",gap:8,marginTop:16,paddingTop:14,borderTop:`1px solid ${C.border}`}}>
+      {onPickLabels&&<button onClick={onPickLabels} style={{flex:1,padding:"11px 0",minHeight:44,borderRadius:10,background:"none",border:`1px solid ${C.border}`,color:C.text,fontWeight:600,fontSize:T.sm}}>🏷️ Pick from labels</button>}
+      <button onClick={onFinish||onClose} style={{flex:1,padding:"11px 0",minHeight:44,borderRadius:10,background:C.lime,border:"none",color:"#000",fontWeight:700,fontSize:T.sm}}>✓ Done ({addedCount})</button>
+    </div>}
   </Sheet>);
 }
 function AddActSheet({onAdd,onClose,apiKey,weightKg}){
@@ -4881,7 +4976,7 @@ function AddActSheet({onAdd,onClose,apiKey,weightKg}){
     {type==="walk"&&<div style={{fontSize:11,color:C.muted,marginBottom:12,lineHeight:1.5,display:"flex",alignItems:"flex-start",gap:6}}><span style={{flexShrink:0}}>ⓘ</span><span>For a <b style={{color:C.text}}>deliberate walk</b> — a separate outing you went on. Don't also count those steps in Daily Steps. Use Daily Steps only for incidental movement (errands, around home) that doesn't get its own activity entry.</span></div>}<div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:9,marginBottom:6}}>{(type==="run"||type==="walk")&&<Field label="Distance km" value={dist} onChange={setDist} type="number" placeholder="10"/>}<Field label="Duration min" value={dur} onChange={setDur} type="number" placeholder="45"/><Field label="Active kcal" value={kcal} onChange={setKcal} type="number" placeholder={est?String(est):"0"}/></div><div style={{fontSize:10,color:C.muted,marginBottom:12,lineHeight:1.4}}>💡 Enter <b>active calories</b> (the burn above your resting baseline). On Garmin/Apple/Strava use "Active Calories", not "Total Calories" — your daily TDEE already counts the resting burn.</div>{est>0&&!parseFloat(kcal)&&<div style={{fontSize:11,color:C.muted,marginBottom:10,lineHeight:1.45}}><span style={{fontFamily:"monospace"}}>Auto-estimated: ~{est} kcal</span>{weightKg?<span> — net of resting burn, at {Math.round(weightKg)}kg.</span>:<span> — log a weight for a figure based on your bodyweight.</span>}</div>}<div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 14px",marginBottom:12}}><div style={{fontSize:11,color:C.muted,marginBottom:8}}>Or scan Strava / Apple Fitness / Garmin screenshot</div><ImgZone imgs={imgs} setImgs={setImgs} compact/>{imgs.length>0&&<button onClick={scan} disabled={loading} style={{width:"100%",padding:"9px 0",borderRadius:8,background:loading?C.faint:C.orange,color:"#000",fontWeight:700,border:"none",cursor:loading?"default":"pointer",fontSize:T.body,marginTop:8}}>{loading?"Scanning…":"Read App Screenshot"}</button>}</div>{err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ff8080",marginBottom:10,wordBreak:"break-word"}}>{err}</div>}{finalKcal>0&&<div style={{background:"#140e03",border:"1px solid #2e1e07",borderRadius:10,padding:"10px 14px",marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{fontSize:12,color:C.muted}}>Adds to daily target</span><span style={{fontFamily:"monospace",fontSize:18,fontWeight:800,color:C.orange}}>+{finalKcal} kcal</span></div>}<div style={{display:"flex",gap:8}}><button onClick={onClose} style={{flex:1,padding:"11px 0",borderRadius:10,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer"}}>Cancel</button><button onClick={confirm} disabled={!finalKcal} style={{flex:2,padding:"11px 0",borderRadius:10,background:finalKcal?C.lime:C.faint,color:"#000",fontWeight:700,border:"none",cursor:finalKcal?"pointer":"default",fontSize:15}}>Log Activity</button></div></Sheet>);
 }
 
-function CreatePrepSheet({products,onSave,onClose,apiKey}){
+function CreatePrepSheet({products,onSave,onClose,apiKey,setProducts}){
   const [name,setName]=useState("");const [imgs,setImgs]=useState([]);const [desc,setDesc]=useState("");const [result,setResult]=useState(null);const [wt,setWt]=useState("");const [portions,setPortions]=useState("4");const [form,setForm]=useState({kcal:"",protein:"",carbs:"",fat:""});const [loading,setLoading]=useState(false);const [err,setErr]=useState(null);const [prepIngredients,setPrepIngredients]=useState(null);const [ingConfirmed,setIngConfirmed]=useState(false);const [saveErr,setSaveErr]=useState("");
   // Label-builder: user picks labels manually instead of (or alongside) photos
   const [buildMode,setBuildMode]=useState(null); // null | "labels"
@@ -4891,6 +4986,25 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
   const [pickedProd,setPickedProd]=useState(null);
   const [pickedG,setPickedG]=useState("");
   const [labelIngs,setLabelIngs]=useState([]); // [{id, name, weightG, kcal100, p100, c100, f100}]
+  const [showPrepScan,setShowPrepScan]=useState(false);
+  const [prepScanLooking,setPrepScanLooking]=useState(false);
+  const [prepScanErr,setPrepScanErr]=useState(null);
+  // Barcode alternative to searching for a label: looks the product up, drops straight into the
+  // same "enter raw/dry weight" step a manual pick lands on, and — same as scanning a barcode
+  // while logging a meal — saves it as a label for next time if it isn't one already.
+  const handlePrepBarcode=async(code)=>{
+    setPrepScanLooking(true);setPrepScanErr(null);
+    try{
+      const res=await lookupBarcode(code);
+      if(!res){setPrepScanErr(`No match for barcode ${code.replace(/\D/g,"")} — search or add it manually.`);setPrepScanLooking(false);return;}
+      setPickedProd({name:res.name,kcal:res.kcal,p:res.p,c:res.c,f:res.f});
+      setPickedG(res.servingG?String(res.servingG):"100");
+      if(setProducts&&!products.some(p=>p.name.toLowerCase()===res.name.toLowerCase())){
+        setProducts(prev=>[...prev,{name:res.name,kcal:res.kcal,p:res.p,c:res.c,f:res.f,packSizeG:res.packSizeG,servingG:res.servingG,barcode:res.barcode,categories:[],addedAt:Date.now()}]);
+      }
+      setShowPrepScan(false);setPrepScanLooking(false);
+    }catch(e){setPrepScanErr(String(e.message||e));setPrepScanLooking(false);}
+  };
   const f=k=>v=>setForm(p=>({...p,[k]:v}));
   const analyze=async()=>{setLoading(true);setErr(null);setSaveErr("");setIngConfirmed(false);try{
     const res=await aPrep(imgs,products,desc,apiKey);
@@ -4903,7 +5017,14 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
     }
     setResult(res);
     setForm({kcal:String(Math.round(res.totalKcal)||""),protein:String(Math.round(res.totalProtein)||""),carbs:String(Math.round(res.totalCarbs)||""),fat:String(Math.round(res.totalFat)||"")});
-    if(res.estimatedWeightG&&!wt)setWt(String(res.estimatedWeightG));
+    if(!wt){
+      // res.estimatedWeightG is just a raw-ingredient-weight sum (see aPrep's prompt) — realistic
+      // only when nothing in the dish changes weight during cooking. Re-derive it per-ingredient
+      // whenever we have the breakdown, so rice/grain-heavy preps don't default to a cooked weight
+      // that's really just their raw weight, and meat-heavy ones aren't overstated either.
+      const est = res.ingredients?.length ? estimateCookedWeightG(res.ingredients) : res.estimatedWeightG;
+      if(est>0)setWt(String(Math.round(est)));
+    }
     if(res.ingredients&&res.ingredients.length>0){
       setPrepIngredients(res.ingredients.map(ing=>({...ing,weightG:String(ing.weightG||0)})));
     }
@@ -4940,7 +5061,7 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
       <div style={{flex:1}}><Field label="Total cooked weight g (optional)" value={wt} onChange={setWt} type="number" placeholder="e.g. 800"/></div>
       <div style={{flex:1}}><Field label="Portions" value={portions} onChange={setPortions} type="number" placeholder="4"/></div>
     </div>
-    <div style={{fontSize:10,color:C.muted,marginTop:4,marginBottom:8,lineHeight:1.4}}>💡 Weigh the finished container now, before eating. Drives the portion-size suggestion. Macros are independent.</div>
+    <div style={{fontSize:10,color:C.muted,marginTop:4,marginBottom:8,lineHeight:1.4}}>💡 Weigh the finished container now, before eating — most accurate. Left blank, we estimate it from your ingredients (rice/grains soak up water and get heavier once cooked, meat loses moisture and gets lighter), not just their raw weights added up. Macros are independent either way.</div>
 
     {/* Photos — optional now */}
     <div style={{marginBottom:4,fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Photos (optional — AI can estimate from description alone)</div>
@@ -4972,6 +5093,16 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
         </div>))}
       </div>}
       {!pickedProd?(<>
+        {!showPrepScan?(
+          <button onClick={()=>{setShowPrepScan(true);setPrepScanErr(null);}} style={{width:"100%",padding:"8px 0",borderRadius:8,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11.5,marginBottom:8}}>📷 Scan barcode instead</button>
+        ):(
+          <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 12px",marginBottom:10}}>
+            <BarcodeCapture onCode={handlePrepBarcode} apiKey={apiKey}/>
+            {prepScanLooking&&<div style={{fontSize:11,color:C.muted,marginTop:8}}>Looking up…</div>}
+            {prepScanErr&&<div style={{fontSize:11,color:"#ff8080",marginTop:8,wordBreak:"break-word"}}>{prepScanErr}</div>}
+            <button onClick={()=>setShowPrepScan(false)} style={{width:"100%",padding:"7px 0",marginTop:8,background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:11,textDecoration:"underline"}}>Cancel scan</button>
+          </div>
+        )}
         <ProductFilterBar products={products} q={pickSearch} setQ={setPickSearch} cat={pickCat} setCat={setPickCat}
           sort={pickSort} setSort={v=>{setPickSort(v);setLastProductSort(v);}} placeholder="Search labels (chicken, rice, oats…)"/>
         {(()=>{const list=filterProducts(products,{q:pickSearch,cat:pickCat,sort:pickSort});return(
@@ -5007,13 +5138,13 @@ function CreatePrepSheet({products,onSave,onClose,apiKey}){
         const totalG=labelIngs.reduce((s,i)=>s+i.weightG,0);
         setResult({ingredients:ings,totalKcal:totalK,totalProtein:totalP,totalCarbs:totalC,totalFat:totalF,estimatedWeightG:totalG,notes:""});
         setForm({kcal:String(Math.round(totalK)),protein:String(Math.round(totalP)),carbs:String(Math.round(totalC)),fat:String(Math.round(totalF))});
-        if(!wt)setWt(String(Math.round(totalG)));
+        if(!wt){const est=estimateCookedWeightG(labelIngs);setWt(String(Math.round(est>0?est:totalG)));}
         setPrepIngredients(ings);
         setBuildMode(null);
       }} style={{width:"100%",marginTop:10,padding:"10px 0",borderRadius:8,background:C.lime,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:T.body}}>Use these {labelIngs.length} ingredient{labelIngs.length!==1?"s":""} →</button>}
     </div>}
 
-    {showPanel?(<div style={{marginTop:12}}><IngredientConfirmPanel ingredients={prepIngredients} setIngredients={setPrepIngredients} products={products} apiKey={apiKey} confirmLabel="Use These Weights →" onSkip={()=>setIngConfirmed(true)} onConfirm={(ings,totals)=>{const totalG=ings.reduce((s,i)=>s+(parseFloat(i.weightG)||0),0);setForm({kcal:String(Math.round(totals.kcal)),protein:String(Math.round(totals.protein)),carbs:String(Math.round(totals.carbs)),fat:String(Math.round(totals.fat))});if(!wt&&totalG>0)setWt(String(Math.round(totalG)));setIngConfirmed(true);}}/></div>):!result?(<>
+    {showPanel?(<div style={{marginTop:12}}><IngredientConfirmPanel ingredients={prepIngredients} setIngredients={setPrepIngredients} products={products} apiKey={apiKey} confirmLabel="Use These Weights →" onSkip={()=>setIngConfirmed(true)} onConfirm={(ings,totals)=>{const est=estimateCookedWeightG(ings);setForm({kcal:String(Math.round(totals.kcal)),protein:String(Math.round(totals.protein)),carbs:String(Math.round(totals.carbs)),fat:String(Math.round(totals.fat))});if(!wt&&est>0)setWt(String(Math.round(est)));setIngConfirmed(true);}}/></div>):!result?(<>
       {(!imgs.length&&!desc.trim())&&<div style={{textAlign:"center",fontSize:11,color:C.muted,marginTop:14,marginBottom:6}}>Add photos or describe what's in the prep to let AI estimate macros, or skip to manual entry</div>}
       <button onClick={()=>setResult(true)} style={{width:"100%",padding:"9px 0",borderRadius:10,background:"none",border:`1px solid ${C.border}`,color:C.muted,fontWeight:500,cursor:"pointer",fontSize:T.body,marginTop:(imgs.length||desc.trim())?0:4}}>Enter macros manually</button>
     </>):(<>
@@ -5348,7 +5479,9 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
     setSaved(true);
     setTimeout(()=>setSaved(false),1900);
   };
-  const handleAdd=entry=>{
+  // Commits one logged entry without closing the sheet — lets a barcode scan keep it open for
+  // another item instead of forcing one-at-a-time exits.
+  const addEntry=entry=>{
     if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode}));}
     else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}));
       // Auto-saving whatever the AI put in `newProduct` with no validation let a low-confidence
@@ -5359,8 +5492,8 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
       // a real kcal value or some macro, or it's not saved at all.
       const npValid = newProduct && (newProduct.name||"").trim().length>0 && ((newProduct.kcal||0)>0 || (newProduct.p||0)>0 || (newProduct.c||0)>0 || (newProduct.f||0)>0);
       if(npValid)setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);}
-    setModal(null);
   };
+  const handleAdd=entry=>{addEntry(entry);setModal(null);};
   const updateMeal=updated=>{setDayData(p=>({...p,meals:p.meals.map(m=>m.id===updated.id?updated:m)}));setEditingMealId(null);};
   const mealUndo=useUndoToast();
   const deleteMeal=id=>{
@@ -5553,7 +5686,7 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
         from every tab, not just Today) — this sheet mount stays for the empty-state "+ Log your
         first meal" and the active-prep "+ Eat" buttons above, which still need their own route
         into AddMealSheet. */}
-    {(modal==="meal"||modal==="mealprep")&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleAdd} onClose={()=>setModal(null)} apiKey={profile.apiKey} aiPrefs={profile.aiPrefs} initialMode={modal==="mealprep"?"mealprep":"quick"} mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
+    {(modal==="meal"||modal==="mealprep")&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleAdd} onAddKeepOpen={addEntry} onClose={()=>setModal(null)} apiKey={profile.apiKey} aiPrefs={profile.aiPrefs} initialMode={modal==="mealprep"?"mealprep":"quick"} mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
     {showXp&&progress?.xp&&<XpDetailSheet xp={progress.xp} profile={profile} setProfile={setProfile} onClose={()=>setShowXp(false)}/>}
     {levelUp&&<LevelUpToast info={levelUp} xp={progress?.xp} onClose={()=>setLevelUp(null)}/>}
     <UndoToast pending={mealUndo.pending} onUndo={mealUndo.undo}/>
@@ -6195,7 +6328,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
 
   // ── Finish confirmation ──
   if (showFinish) {
-    const est = estimateGymKcal(elapsed, latestWeight);
+    const est = estimateGymKcal(elapsed, latestWeight, gymSessions, session.dayId);
     return(<div style={{background:C.card,border:`1px solid ${C.lime}`,borderRadius:14,padding:"16px 18px",marginBottom:14}}>
       <div style={{fontSize:T.body,fontWeight:700,color:C.lime,marginBottom:10}}>🏁 Finish Session</div>
       <div style={{fontSize:12,color:C.muted,marginBottom:10}}>Duration: <span style={{color:C.text,fontFamily:"monospace",fontWeight:700}}>{fmtTime(elapsed)}</span></div>
@@ -7180,8 +7313,8 @@ function WeightProgressCard({profile,weights,setWeights,weightPhases,setWeightPh
     <UndoToast pending={weightUndo.pending} onUndo={weightUndo.undo}/>
   </>);
 }
-function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases,setWeightPhases,gymSchedule,setGymSchedule,gymTemplates,setGymTemplates,gymDayAssign,setGymDayAssign,gymSessions,setGymSessions,gymSettings,setGymSettings,gymActiveSession,setGymActiveSession,gymExerciseLibrary,setGymExerciseLibrary}){
-  const [modal,setModal]=useState(false);const [view,setView]=useState("today");const [histDates,setHistDates]=useState([]);const [histLogs,setHistLogs]=useState({});const [histLoaded,setHistLoaded]=useState(false);
+function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases,setWeightPhases,gymSchedule,setGymSchedule,gymTemplates,setGymTemplates,gymDayAssign,setGymDayAssign,gymSessions,setGymSessions,gymSettings,setGymSettings,gymActiveSession,setGymActiveSession,gymExerciseLibrary,setGymExerciseLibrary,onFinishSession}){
+  const [view,setView]=useState("today");const [histDates,setHistDates]=useState([]);const [histLogs,setHistLogs]=useState({});const [histLoaded,setHistLoaded]=useState(false);
   const activities=dayData.activities||[];const totalBurned=activities.reduce((s,a)=>s+a.kcal,0)+(dayData.burnedExtra||0);
 
   // ── Gym tracking ──────────────────────────────────────────────────────────
@@ -7235,40 +7368,6 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
     setGymActiveSession(buildSessionFromTemplate(weekday,template,dayId));
   };
   const cancelGymSession=()=>setGymActiveSession(null);
-  const finishGymSession=({durationSec,kcal,method})=>{
-    const sess=gymActiveSession;
-    if(!sess)return;
-    const sessionId=Date.now();
-    const record={id:sessionId,date:sess.date,weekday:sess.weekday,dayId:sess.dayId||null,durationSec,warmup:sess.warmup,cooldown:sess.cooldown,combos:sess.combos,kcalBurned:kcal,kcalMethod:method};
-    setGymSessions(prev=>[record,...(prev||[])]);
-    const durMin=Math.round(durationSec/60);
-    // sessionId links the day-log activity back to the full gym record, so activity lists can
-    // show the exercise breakdown inline. Older activities predate this field and are matched
-    // by date instead (see findSessionFor).
-    setDayData(p=>({...p,activities:[...(p.activities||[]),{id:sessionId,sessionId,type:"gym",label:`Gym — ${gymDayLabel(gymTemplates,sess.dayId)}`,kcal,durationMin:durMin,time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}]}));
-    // The live session's combo/exercise order reflects however it was ACTUALLY done — reordered
-    // mid-workout (equipment busy, jumped ahead, moved into a different combo), not necessarily
-    // the order the template started with. Writing that final order back into the plan means the
-    // next run of THIS DAY starts pre-arranged the way it was last actually performed, instead of
-    // reverting to whatever the plan originally said. Only the combo/exercise structure is
-    // synced — warmup/cooldown config stays whatever was configured.
-    //
-    // Keyed on the session's own dayId, so a session started before a weekday re-assignment
-    // still writes back into the plan it was actually built from. A session that predates the
-    // day-plan split (or an ad-hoc one) has no dayId, so it falls back to whatever plan that
-    // weekday currently runs — otherwise upgrading mid-workout would silently lose the sync.
-    const syncDayId = sess.dayId || (gymDayAssign||{})[sess.weekday] || null;
-    if(syncDayId) setGymTemplates(prev=>({
-      ...(prev||{}),
-      [syncDayId]: {
-        ...(prev?.[syncDayId]||{}),
-        combos: (sess.combos||[])
-          .filter(c=>(c.exercises||[]).length>0)
-          .map(c=>({id:c.id, exercises:(c.exercises||[]).map(ex=>({id:ex.id, name:ex.name, type:ex.type||"weighted"}))})),
-      },
-    }));
-    setGymActiveSession(null);
-  };
   useEffect(()=>{if(view==="history"&&!histLoaded){store.get("fit_dates",[]).then(async ds=>{const e={};for(const d of ds){const log=await store.get(`fit_day_${d}`,null);if(log&&(log.activities||[]).length>0)e[d]=log;}setHistLogs(e);setHistDates(Object.keys(e).sort((a,b)=>b.localeCompare(a)));setHistLoaded(true);});}},[view]);
   // Resolve the gym record behind an activity row. Sessions logged since the sessionId link
   // was added match exactly; older ones fall back to same-day matching.
@@ -7277,7 +7376,6 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
     const all=gymSessions||[];
     return (act.sessionId&&all.find(s=>s.id===act.sessionId))||all.find(s=>s.date===date)||null;
   };
-  const addActivity=act=>{setDayData(p=>({...p,activities:[...(p.activities||[]),act]}));setModal(false);};
   const actUndo=useUndoToast();
   const delActivity=id=>{
     const list=dayData.activities||[];
@@ -7308,7 +7406,7 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
         <span style={{fontSize:11,color:C.muted,border:`1px solid ${C.border}`,borderRadius:20,padding:"4px 10px",flexShrink:0}}>🔒 Private</span>
       </div>
       <div data-scroll style={{flex:1,overflowY:"auto",padding:"14px 16px calc(24px + "+SAFE_BOTTOM+")"}}>
-        <GymSessionPanel session={gymActiveSession} setSession={setGymActiveSession} gymSessions={gymSessions||[]} gymSettings={gymSettings} latestWeight={latestWeightForGym} gymExerciseLibrary={gymExerciseLibrary||[]} setGymExerciseLibrary={setGymExerciseLibrary} onFinish={finishGymSession} onCancel={cancelGymSession}/>
+        <GymSessionPanel session={gymActiveSession} setSession={setGymActiveSession} gymSessions={gymSessions||[]} gymSettings={gymSettings} latestWeight={latestWeightForGym} gymExerciseLibrary={gymExerciseLibrary||[]} setGymExerciseLibrary={setGymExerciseLibrary} onFinish={onFinishSession} onCancel={cancelGymSession}/>
       </div>
     </div>);
   }
@@ -7421,8 +7519,6 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
           </div>);
         })}</>)}
     </div>
-    {view==="today"&&<button onClick={()=>setModal(true)} style={{position:"absolute",bottom:16,right:16,width:54,height:54,borderRadius:"50%",background:C.orange,border:"none",cursor:"pointer",fontSize:28,color:"#000",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 0 20px ${C.orange}55`,zIndex:10}}>+</button>}
-    {modal&&<AddActSheet onAdd={addActivity} onClose={()=>setModal(false)} apiKey={profile.apiKey} weightKg={latestWeightForGym}/>}
     <UndoToast pending={actUndo.pending} onUndo={actUndo.undo}/>
   </div>);
 }
@@ -7867,7 +7963,7 @@ function RecipesSection({recipes, setRecipes, products, profile, onLogMeal}){
 // Blank product form. Previously this literal was written out at five separate reset sites
 // and had already drifted (one of them still set a legacy `supermarket:""` string field),
 // so a new form key had to be remembered in five places or it would silently go undefined.
-const EMPTY_PFORM = {name:"",kcal:"",p:"",c:"",f:"",servingG:"",packSizeG:"",alwaysFullPack:false,categories:[],supermarkets:[],subtitle:""};
+const EMPTY_PFORM = {name:"",kcal:"",p:"",c:"",f:"",servingG:"",packSizeG:"",alwaysFullPack:false,categories:[],supermarkets:[],subtitle:"",barcode:""};
 
 // Form → stored product record.
 // `packageG` is written alongside `servingG` purely for backward compatibility: every existing
@@ -7887,6 +7983,7 @@ const buildProductFromForm = f => {
     packageG:servingG, // legacy alias — see note above
     categories:f.categories||[], supermarkets:f.supermarkets||[],
     subtitle:(f.subtitle||"").trim()||null,
+    barcode:(f.barcode||"").trim()||null,
   };
 };
 
@@ -7907,6 +8004,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
   const formRef=useRef(null); // ref on the add/edit form div — scrolled to on edit
   const savedScrollRef=useRef(0); // saves scroll position before opening edit
   const [pForm,setPForm]=useState(EMPTY_PFORM);const [scanImgs,setScanImgs]=useState([]);const [scanning,setScanning]=useState(false);const [scanErr,setScanErr]=useState(null);
+  const [showLabelScan,setShowLabelScan]=useState(false);const [labelScanLooking,setLabelScanLooking]=useState(false);const [labelScanErr,setLabelScanErr]=useState(null);
   const [subtitleLoading,setSubtitleLoading]=useState(false);
   const [marketInput,setMarketInput]=useState(""); // text field for typing a new supermarket name
   const [saveToast,setSaveToast]=useState(null);
@@ -7917,7 +8015,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
   const pff=k=>v=>setPForm(p=>({...p,[k]:v}));
   const active=mealPreps.filter(p=>p.remaining>0);const done=mealPreps.filter(p=>p.remaining===0);
   const [showDone,setShowDone]=useState(false);
-  const clearForm=()=>{setPForm(EMPTY_PFORM);setScanImgs([]);setMarketInput("");};
+  const clearForm=()=>{setPForm(EMPTY_PFORM);setScanImgs([]);setMarketInput("");setShowLabelScan(false);setLabelScanErr(null);};
   const toggleCat=id=>setPForm(p=>({...p,categories:(p.categories||[]).includes(id)?p.categories.filter(c=>c!==id):[...(p.categories||[]),id]}));
   const toggleMarket=m=>setPForm(p=>({...p,supermarkets:(p.supermarkets||[]).includes(m)?p.supermarkets.filter(x=>x!==m):[...(p.supermarkets||[]),m]}));
   const addTypedMarket=()=>{const m=marketInput.trim();if(!m)return;setPForm(p=>(p.supermarkets||[]).some(x=>x.toLowerCase()===m.toLowerCase())?p:{...p,supermarkets:[...(p.supermarkets||[]),m]});setMarketInput("");};
@@ -7954,7 +8052,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
       servingG:(p.servingG||p.packageG)?String(p.servingG||p.packageG):"",
       packSizeG:p.packSizeG?String(p.packSizeG):"",
       alwaysFullPack:!!p.alwaysFullPack,
-      categories:p.categories||[],supermarkets:existingMarkets,subtitle:p.subtitle||""});
+      categories:p.categories||[],supermarkets:existingMarkets,subtitle:p.subtitle||"",barcode:p.barcode||""});
     setEditPIdx(i);setShowAdd(false);setSaveToast(null);setMarketInput("");
     // Scroll to form after it renders
     setTimeout(()=>formRef.current?.scrollIntoView({behavior:"smooth",block:"start"}),60);
@@ -8005,6 +8103,24 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
       // field isn't left empty — silently skip on failure, it's a nice-to-have not a blocker.
       if(!res.subtitle&&name){aSubtitle(name,profile.apiKey).then(s=>{if(s)setPForm(f=>(f.name===name&&!f.subtitle)?{...f,subtitle:s}:f);}).catch(()=>{});}
     }}catch(e){setScanErr(String(e.message||e));}setScanning(false);};
+  // Barcode alternative to scanning the nutrition label by hand: looks the product up on Open
+  // Food Facts and prefills the same form fields a label scan would, instead of requiring a
+  // photo of the label at all when the barcode is already enough.
+  const handleLabelBarcode=async(code)=>{
+    setLabelScanLooking(true);setLabelScanErr(null);
+    try{
+      const res=await lookupBarcode(code);
+      if(!res){setLabelScanErr(`No match for barcode ${code.replace(/\D/g,"")} in Open Food Facts — enter details manually below.`);setLabelScanLooking(false);return;}
+      const name=res.name||"";
+      setPForm(f=>({...f,name:name||f.name,kcal:String(res.kcal||""),p:String(res.p||""),c:String(res.c||""),f:String(res.f||""),
+        packSizeG:res.packSizeG?String(res.packSizeG):f.packSizeG,
+        servingG:res.servingG?String(res.servingG):f.servingG,
+        barcode:res.barcode||code}));
+      setShowLabelScan(false);setLabelScanLooking(false);
+      const dupIdx=products.findIndex(x=>x.name.trim().toLowerCase()===name.trim().toLowerCase());
+      if(dupIdx>=0&&name){const np=buildProductFromForm({name,kcal:res.kcal,p:res.p,c:res.c,f:res.f,servingG:res.servingG?String(res.servingG):"",packSizeG:res.packSizeG?String(res.packSizeG):"",alwaysFullPack:false,categories:[],supermarkets:[],subtitle:"",barcode:res.barcode||code});setSaveToast({type:"duplicate",name,dupIdx,np});}
+    }catch(e){setLabelScanErr(String(e.message||e));setLabelScanLooking(false);}
+  };
   // Category + text handling goes through the shared accent-folding fuzzy matcher (so "Kedainiu"
   // finds "Kėdainių" here too); the supermarket filter is specific to this screen and stays local.
   const filtered=filterProducts(products,{q:search,cat:catFilter,sort:prodSort}).filter(p=>{
@@ -8092,6 +8208,21 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
       {(showAdd||editPIdx!==null)&&<div ref={formRef} style={{background:C.card,border:`1px solid ${editPIdx!==null?C.lime:C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:10}}>
         <div style={{fontSize:11,color:editPIdx!==null?C.lime:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>{editPIdx!==null?"Editing product":"New product"}</div>
         {showAdd&&editPIdx===null&&<div style={{marginBottom:10}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Scan Nutrition Label</div><ImgZone imgs={scanImgs} setImgs={setScanImgs} compact/>{scanImgs.length>0&&<button onClick={scanLabelFn} disabled={scanning} style={{width:"100%",padding:"9px 0",borderRadius:8,background:scanning?C.faint:C.blue,color:"#000",fontWeight:700,border:"none",cursor:scanning?"default":"pointer",fontSize:T.body,marginTop:8}}>{scanning?"Reading label…":"Read Label"}</button>}{scanErr&&<div style={{fontSize:11,color:"#ff8080",marginTop:6,wordBreak:"break-word"}}>{scanErr.includes("unreadable")?"Label unreadable — please enter values manually below":scanErr}</div>}</div>}
+        {/* Barcode is an alternative to photographing the label — same underlying lookup as
+            logging a scanned meal, just filling this form instead of logging a meal. */}
+        {showAdd&&editPIdx===null&&<div style={{marginBottom:10}}>
+          <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Or Scan Barcode</div>
+          {!showLabelScan?(
+            <button onClick={()=>{setShowLabelScan(true);setLabelScanErr(null);}} style={{width:"100%",padding:"9px 0",borderRadius:8,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:T.body}}>📷 Scan Barcode</button>
+          ):(
+            <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 12px"}}>
+              <BarcodeCapture onCode={handleLabelBarcode} apiKey={profile.apiKey}/>
+              {labelScanLooking&&<div style={{fontSize:T.sm,color:C.muted,marginTop:8}}>Looking up…</div>}
+              {labelScanErr&&<div style={{fontSize:11,color:"#ff8080",marginTop:8,wordBreak:"break-word"}}>{labelScanErr}</div>}
+              <button onClick={()=>setShowLabelScan(false)} style={{width:"100%",padding:"7px 0",marginTop:8,background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:11,textDecoration:"underline"}}>Cancel scan</button>
+            </div>
+          )}
+        </div>}
         <div style={{display:"flex",flexDirection:"column",gap:8}}>
           <Field label="Product name" value={pForm.name} onChange={pff("name")} placeholder="e.g. Lidl Greek Yogurt"/>
           <div>
@@ -8185,7 +8316,7 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
     {/* No more floating corner FAB here — it sat exactly where a thumb lands reaching for the
         product-label "+ Add" button below, so it kept getting hit by accident. Meal-prep
         creation now lives as an explicit button on its own section, right where it's used. */}
-    {modal&&<CreatePrepSheet products={products} onSave={prep=>{setMealPreps(p=>[prep,...p]);setModal(false);}} onClose={()=>setModal(false)} apiKey={profile.apiKey}/>}
+    {modal&&<CreatePrepSheet products={products} setProducts={setProducts} onSave={prep=>{setMealPreps(p=>[prep,...p]);setModal(false);}} onClose={()=>setModal(false)} apiKey={profile.apiKey}/>}
     {editPrep&&<EditPrepSheet prep={editPrep} onSave={updated=>{setMealPreps(p=>p.map(x=>x.id===updated.id?updated:x));setEditPrep(null);}} onClose={()=>setEditPrep(null)}/>}
   </div>);
 }
@@ -9890,6 +10021,42 @@ function App(){
   // would otherwise persist it and brick the next launch.
   const setGymActiveSession=useCallback(upd=>{setGymActiveSession_(p=>{const raw=typeof upd==="function"?upd(p):upd;const n=raw?normalizeGymSession(raw):null;store.set("fit_gym_active_session",n);return n;});},[]);
   const setGymExerciseLibrary=useCallback(upd=>{setGymExerciseLibrary_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_gym_exercise_library",n);return n;});},[]);
+  // Set when a just-finished session's combo/exercise structure differs from the plan it started
+  // from — holds the {dayId, combos} to write if the user confirms, null otherwise. Lives here
+  // (not in ActivityTab) because finishing a session immediately clears gymActiveSession, which
+  // un-forces viewTab back to whatever tab is actually selected — ActivityTab can unmount in that
+  // very same update (e.g. a session resumed on reload while "Today" was the selected tab), which
+  // would silently destroy this as component-local state before the user ever saw the prompt.
+  const [pendingTemplateSync,setPendingTemplateSync]=useState(null);
+  const finishGymSession=({durationSec,kcal,method})=>{
+    const sess=gymActiveSession;
+    if(!sess)return;
+    const sessionId=Date.now();
+    const record={id:sessionId,date:sess.date,weekday:sess.weekday,dayId:sess.dayId||null,durationSec,warmup:sess.warmup,cooldown:sess.cooldown,combos:sess.combos,kcalBurned:kcal,kcalMethod:method};
+    setGymSessions(prev=>[record,...(prev||[])]);
+    const durMin=Math.round(durationSec/60);
+    // sessionId links the day-log activity back to the full gym record, so activity lists can
+    // show the exercise breakdown inline. Older activities predate this field and are matched
+    // by date instead (see findSessionFor).
+    setDayData(p=>({...p,activities:[...(p.activities||[]),{id:sessionId,sessionId,type:"gym",label:`Gym — ${gymDayLabel(gymTemplates,sess.dayId)}`,kcal,durationMin:durMin,time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}]}));
+    // The plan itself is a fixed reference — combos/exercises stay exactly as set up in Gym Setup
+    // from one session to the next. A live session is still free to reorder, add or swap
+    // exercises mid-workout (equipment busy, jumped ahead), but that's a one-off for THIS run, not
+    // a silent rewrite of the plan everyone expects next time. Only when the finished session's
+    // structure actually differs from the plan it started from do we ask whether to keep that as
+    // the new default; an unchanged session (by far the common case) needs no prompt and nothing
+    // to write. Keyed on the session's own dayId, falling back to the weekday's current plan for
+    // ad-hoc/legacy sessions with no dayId.
+    const syncDayId = sess.dayId || (gymDayAssign||{})[sess.weekday] || null;
+    if(syncDayId){
+      const newCombos = (sess.combos||[])
+        .filter(c=>(c.exercises||[]).length>0)
+        .map(c=>({id:c.id, exercises:(c.exercises||[]).map(ex=>({id:ex.id, name:ex.name, type:ex.type||"weighted"}))}));
+      const origCombos = (gymTemplates||{})[syncDayId]?.combos || [];
+      if(comboPlanChanged(origCombos, newCombos)) setPendingTemplateSync({dayId:syncDayId, combos:newCombos});
+    }
+    setGymActiveSession(null);
+  };
   const setRecipes=useCallback(upd=>{setRecipes_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_recipes",n);return n;});},[]);
   const setMedications=useCallback(upd=>{setMedications_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_medications",n);return n;});},[]);
   const setMedLog=useCallback(upd=>{setMedLog_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_med_log",n);return n;});},[]);
@@ -9948,13 +10115,15 @@ function App(){
   // "picker" (the 6-option grid), or the id of whichever full sheet is currently open.
   const [quickAction,setQuickAction]=useState(null);
   const openQuickLog=()=>setQuickAction("picker");
-  const handleQuickMealAdd=entry=>{
+  // Commits one logged entry without closing Quick Log — lets a barcode scan (or any future
+  // multi-add flow) keep the sheet open for another item instead of forcing one-at-a-time exits.
+  const addEntryQuick=entry=>{
     if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode}));}
     else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}));
       const npValid=newProduct&&(newProduct.name||"").trim().length>0&&((newProduct.kcal||0)>0||(newProduct.p||0)>0||(newProduct.c||0)>0||(newProduct.f||0)>0);
       if(npValid)setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);}
-    setQuickAction(null);
   };
+  const handleQuickMealAdd=entry=>{addEntryQuick(entry);setQuickAction(null);};
   const quickDueMeds=dueMedReminders(medications,medLog);
   // Today's log lives in `dayData`; mirroring it into the streak window means logging a meal
   // updates the streak immediately instead of only after a reload.
@@ -9997,10 +10166,25 @@ function App(){
       <div style={{flex:1,fontSize:12,color:C.lime,lineHeight:1.4}}>It's a new day — you're now logging for <b>{new Date(rolloverBanner.toDate+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</b>. Late-night meals can be moved to yesterday from the History tab.</div>
       <button onClick={()=>setRolloverBanner(null)} style={{background:"none",border:"none",color:C.lime,fontSize:18,cursor:"pointer",padding:"0 4px",lineHeight:1}}>×</button>
     </div>}
+    {/* Shown right after finishing a gym session whose combos/exercises ended up different from
+        the plan it started from (reordered, added, swapped) — rendered here rather than inside
+        ActivityTab so it survives finishing un-forcing viewTab back to whatever tab is actually
+        selected (ActivityTab can unmount in that same update). The plan itself never changes
+        silently; this is the only path that writes to it, and only on confirmation. */}
+    {pendingTemplateSync&&(
+      <div style={{background:C.card,borderBottom:`1px solid ${C.blue}60`,padding:"12px 16px"}}>
+        <div style={{fontSize:T.body,fontWeight:600,color:C.text,marginBottom:3}}>Today's plan differed from usual</div>
+        <div style={{fontSize:T.sm,color:C.muted,marginBottom:10,lineHeight:1.4}}>You reordered, added or swapped exercises this session. Save that as the new default for this day, or keep the original plan for next time?</div>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>setPendingTemplateSync(null)} style={{flex:1,padding:"9px 0",borderRadius:8,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12}}>Keep original plan</button>
+          <button onClick={()=>{setGymTemplates(prev=>({...(prev||{}),[pendingTemplateSync.dayId]:{...(prev?.[pendingTemplateSync.dayId]||{}),combos:pendingTemplateSync.combos}}));setPendingTemplateSync(null);}} style={{flex:1,padding:"9px 0",borderRadius:8,background:C.blue,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Save as new default</button>
+        </div>
+      </div>
+    )}
     <div style={{flex:1,overflow:"hidden"}}>
       {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} setProfile={setProfile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("more")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence} progress={progress} gymSessions={gymSessions} gymDayAssign={gymDayAssign} mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
       {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes} onLogMeal={meal=>setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}))} gymSessions={gymSessions}/>}
-      {viewTab==="training"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymDayAssign={gymDayAssign} setGymDayAssign={setGymDayAssign} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary}/>}
+      {viewTab==="training"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymDayAssign={gymDayAssign} setGymDayAssign={setGymDayAssign} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary} onFinishSession={finishGymSession}/>}
       {viewTab==="progress"&&<HistoryTab weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} products={products} profile={profile} medications={medications} medLog={medLog} progress={progress} onLogMed={logMedFor} onUnlogMed={unlogMed}/>}
       {viewTab==="more"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight} medications={medications} setMedications={setMedications} dayTypes={dayTypes} setDayTypes={setDayTypes} onGoToProgress={()=>setTab("progress")}/>}
     </div>
@@ -10013,8 +10197,8 @@ function App(){
       <span aria-hidden="true" style={{marginTop:-2,fontWeight:400}}>+</span>
     </button>}
     {quickAction==="picker"&&<QuickLogPicker dueCount={quickDueMeds.length} onClose={()=>setQuickAction(null)} onPick={id=>setQuickAction(id)}/>}
-    {quickAction==="meal"&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleQuickMealAdd} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey} aiPrefs={profile.aiPrefs} initialMode="quick" mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
-    {quickAction==="barcode"&&<BarcodeScanSheet onAdd={handleQuickMealAdd} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey}/>}
+    {quickAction==="meal"&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleQuickMealAdd} onAddKeepOpen={addEntryQuick} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey} aiPrefs={profile.aiPrefs} initialMode="quick" mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
+    {quickAction==="barcode"&&<BarcodeScanSheet onAdd={handleQuickMealAdd} onAddKeepOpen={addEntryQuick} onClose={()=>setQuickAction(null)} onPickLabels={()=>setQuickAction("meal")} apiKey={profile.apiKey}/>}
     {quickAction==="weight"&&<QuickWeightSheet weights={weights} setWeights={setWeights} onClose={()=>setQuickAction(null)}/>}
     {quickAction==="activity"&&<AddActSheet onAdd={act=>{setDayData(p=>({...p,activities:[...(p.activities||[]),act]}));setQuickAction(null);}} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey} weightKg={latestWeight}/>}
     {quickAction==="steps"&&<QuickStepsSheet dayData={dayData} setDayData={setDayData} onClose={()=>setQuickAction(null)}/>}

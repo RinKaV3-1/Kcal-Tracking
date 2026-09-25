@@ -472,6 +472,13 @@ function mealTypeFromContent(text){
   if(snackKw.some(k=>s.includes(k)))return"snack";
   return null;
 }
+// Does this text describe a meal eaten OUT (restaurant / fast-food chain / café / takeaway /
+// canteen) rather than cooked at home? Used to flip "Home cooked" → "Eating Out" automatically
+// when the user forgot to — the eating-out analysis path reads published nutrition tables and
+// never tries to match the user's own pantry labels, both of which are wrong for a restaurant meal.
+// Word-boundary matching so "pizza" doesn't fire on "pizzazz" and short chain names stay safe.
+const EATING_OUT_RE = /\b(hesburger|hesburgeris|hesburger's|mcdonald'?s?|mcd|mc\s?donalds|kfc|burger\s?king|subway|pizza\s?hut|domino'?s|telepizza|cili(?:\s?pica|\s?kaimas)?|wolt|bolt\s?food|foodora|starbucks|costa|dunkin|taco\s?bell|popeyes|five\s?guys|nando'?s|chopstix|restaurant|restoran\w*|takeaway|take-?out|delivery|canteen|cafeteria|valgykl\w*|kavin\w*|caf[eé]|bistro|diner|drive-?thru|fast\s?food|food\s?court)\b/i;
+function looksLikeEatingOut(text){ return !!text && EATING_OUT_RE.test(text); }
 const GOALS = [
   { id:"cut",      label:"Cut",      emoji:"✂️", col:"#ff6b35",
     submodes:[
@@ -1554,6 +1561,33 @@ function estimateGymKcal(durationSec, bodyWeightKg, gymSessions, dayId) {
 // only the sets/weights logged during the session (which never touch id or name) don't.
 const comboPlanSignature = combos => (combos||[]).map(c => (c.exercises||[]).map(ex => `${ex.id}:${normExName(ex.name)}`));
 const comboPlanChanged = (a, b) => JSON.stringify(comboPlanSignature(a)) !== JSON.stringify(comboPlanSignature(b));
+// Scheduled gym days from the last `lookback` days that never happened, newest first — used to
+// offer a catch-up when starting gym mode ("Tuesday's Push day was skipped — do it now?").
+// A day counts as missed only if: its weekday has a plan with real exercises; NO session was
+// logged that date; that same plan wasn't made up on a later date; the user hasn't dismissed it;
+// and it falls after their first ever logged session (so setting up a plan on Thursday doesn't
+// immediately nag about a Monday and Wednesday that predate the plan).
+function findMissedGymDays(today, gymDayAssign, gymTemplates, gymSessions, dismissed, lookback = 7) {
+  const sessions = gymSessions || [];
+  if (!sessions.length) return [];
+  const firstDate = sessions.reduce((m, s) => (s.date && s.date < m ? s.date : m), "9999-99-99");
+  const out = [];
+  for (let i = 1; i <= lookback; i++) {
+    const d = new Date(today + "T12:00:00Z"); d.setUTCDate(d.getUTCDate() - i);
+    const date = d.toISOString().split("T")[0];
+    if (date < firstDate) break;
+    if ((dismissed || []).includes(date)) continue;
+    const weekday = new Date(date + "T12:00:00").getDay();
+    const dayId = (gymDayAssign || {})[weekday];
+    if (!dayId) continue;
+    const planned = ((gymTemplates || {})[dayId]?.combos || []).some(c => (c.exercises || []).length > 0);
+    if (!planned) continue;
+    if (sessions.some(s => s.date === date)) continue;
+    if (sessions.some(s => s.dayId === dayId && s.date > date)) continue;
+    out.push({ date, weekday, dayId });
+  }
+  return out;
+}
 // Normalize an exercise name for matching across sessions (case/whitespace/accent insensitive).
 const normExName = s => (s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/\s+/g," ").trim();
 // Find the most recent completed performance of a named exercise across past sessions.
@@ -2509,12 +2543,24 @@ async function fetchClaudeOnce(content, apiKey, model, maxTokens) {
     headers["anthropic-dangerous-direct-browser-access"] = "true";
   }
   const body = JSON.stringify({ model: model||VISION_MODEL, max_tokens: maxTokens||1500, messages: [{ role: "user", content }] });
+  // There used to be NO timeout at all: a request that stalled (a mobile connection dropping
+  // mid-response is enough) left the UI on "Analyzing… 120s" indefinitely and nothing was ever
+  // logged. Every attempt is now aborted after a deadline that scales with how many photos it
+  // carries (each image adds real processing time), so a stalled call fails visibly and can be
+  // retried instead of hanging forever.
+  const imageCount = Array.isArray(content) ? content.filter(b => b && b.type === "image").length : 0;
+  const timeoutMs = Math.min(120000, 40000 + imageCount * 8000);
+  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
   let data;
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers, body });
+    const response = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers, body, ...(ctrl ? { signal: ctrl.signal } : {}) });
     data = await response.json();
   } catch(e) {
+    if (e && e.name === "AbortError") throw new Error(`Timed out — no response from the AI service after ${Math.round(timeoutMs/1000)}s`);
     throw new Error("Connection error: " + e.message);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   if (data.error) throw new Error("API: " + (data.error.message || JSON.stringify(data.error)));
   if (!data.content) throw new Error("No content in response: " + JSON.stringify(data).slice(0,100));
@@ -2533,7 +2579,7 @@ async function fetchClaudeOnce(content, apiKey, model, maxTokens) {
 // limit) still surfaces immediately — retrying it would just fail the same way three times over.
 async function fetchClaudeWithRetry(content, apiKey, model, maxTokens, parse) {
   const delays = [0, 700, 1500];
-  let lastErr, budget = maxTokens;
+  let lastErr, budget = maxTokens, timeouts = 0;
   for (const delay of delays) {
     if (delay) await new Promise(r => setTimeout(r, delay));
     try {
@@ -2546,6 +2592,10 @@ async function fetchClaudeWithRetry(content, apiKey, model, maxTokens, parse) {
     } catch (e) {
       lastErr = e;
       if (/^API:/.test(e.message)) throw e; // not transient — don't burn retries on it
+      // A timeout is already a long wait; retry once in case the socket simply stalled, but a
+      // second timeout means the service/connection is really down — fail rather than spend
+      // several more minutes on the same outcome.
+      if (/^Timed out/.test(e.message) && ++timeouts >= 2) throw e;
     }
   }
   throw lastErr;
@@ -2569,12 +2619,18 @@ async function aFood(imgs, ps, mt, desc, apiKey) {
     // are home pantry items, not what a canteen kitchen used. Use generic ingredient names so
     // the UI's fuzzy-matcher can't latch onto the wrong product (e.g. "duck breast" → "Lidl
     // Breaded Chicken Breast").
-    prompt = "You are a nutrition analyst estimating a CANTEEN/CAFETERIA meal. You do NOT know what specific brands or products the kitchen used.\n"
+    prompt = "You are a nutrition analyst estimating a meal eaten OUT — a restaurant, fast-food chain, café, takeaway/delivery order, or a canteen/cafeteria. You do NOT know what specific brands or products a kitchen used.\n"
       + "User description: " + (desc || "(none)") + "\n"
       + (compressed.length ? compressed.length + " photo(s) attached.\n" : "")
       + "\nRULES:\n"
-      + "1. Use ONLY generic ingredient names — e.g. 'grilled chicken breast', 'cooked white rice', 'cucumber slices'. NEVER guess at brands.\n"
-      + "2. Use REALISTIC, CONSERVATIVE per-100g values for canteen/workplace cafeteria food. Do NOT inflate as if it were heavy restaurant or fast-food cooking. Reference per-100g (cooked) values:\n"
+      + "0. OFFICIAL NUTRITION INFO WINS. Photos are often screenshots or photos of the venue's own published nutrition information (a restaurant website/app product page, a menu board, a printed nutrition table). When a photo shows such a table for an item the user named or ate, READ the numbers off it and use them EXACTLY as that item's values — do not replace them with your own estimate. Details:\n"
+      + "   • Take the kcal figure, not kJ (a row like '2 722 kJ / 654 kcal' means 654 kcal). Comma decimals are decimals ('42,3' = 42.3).\n"
+      + "   • Labels in any language: fat = riebalai/Fett/fat; carbohydrates = angliavandeniai/Kohlenhydrate/carbs; protein = baltymai/Eiweiß/protein. IGNORE the 'of which sugars' and salt rows.\n"
+      + "   • Work out whether a table is PER PORTION (a header like 'porcija 266 g' / 'per serving') or PER 100 g, and scale to what was actually eaten — by default one portion/one item of each thing shown, unless the description says otherwise. Each photo may be a DIFFERENT item; match each table to the item named in its header (e.g. 'Skrudintos bulvytės' = fries, 'Tortilija su vištiena' = chicken tortilla).\n"
+      + "   • Return each menu item as its own ingredient row. Set weightG to the portion weight if the table states one (otherwise a realistic portion) and set that row's per-100g kcal/protein/carbs/fat so that per-100g × weightG / 100 reproduces the published figures exactly.\n"
+      + "   • With no such table for an item: if it is a well-known chain item you may use that chain's typical published values; otherwise estimate with the reference values in rule 2.\n"
+      + "1. Use generic ingredient names for anything you have to estimate — e.g. 'grilled chicken breast', 'cooked white rice'. Menu items taken from an official table keep their menu name. NEVER guess at pantry brands.\n"
+      + "2. For canteen/workplace-cafeteria style food with no published numbers, use REALISTIC, CONSERVATIVE per-100g values — do NOT inflate as if it were heavy fast-food cooking. Reference per-100g (cooked) values:\n"
       + "   • Cooked white/yellow rice (light butter/turmeric): 130–150 kcal\n"
       + "   • Cooked plain pasta: 130–160 kcal\n"
       + "   • Boiled potatoes: 85–100 kcal · roasted potatoes: 130–160 kcal\n"
@@ -2590,7 +2646,7 @@ async function aFood(imgs, ps, mt, desc, apiKey) {
       + "4. Estimate weights honestly from the photo. A standard canteen plate of rice is ~150–200g, a meat portion ~120–160g, a side salad ~50–80g.\n"
       + "5. Per-ingredient kcal/protein/carbs/fat MUST be PER-100g standard values for that food. Top-level total kcal/protein/carbs/fat = sum of (per-100g × weight / 100) — i.e. actual meal totals.\n\n"
       + "Reply ONLY with JSON, nothing else:\n"
-      + '{"type":"meal","name":"","kcal":0,"protein":0,"carbs":0,"fat":0,"notes":"canteen estimate — macros approximate","newProduct":null,"ingredients":[{"name":"generic component","weightG":0,"kcal":0,"protein":0,"carbs":0,"fat":0,"canteen":true}]}';
+      + '{"type":"meal","name":"","kcal":0,"protein":0,"carbs":0,"fat":0,"totalGrams":0,"eatingOut":true,"notes":"eating-out estimate — say here if the numbers came from a published nutrition table in a photo","newProduct":null,"ingredients":[{"name":"menu item or generic component","weightG":0,"kcal":0,"protein":0,"carbs":0,"fat":0,"canteen":true}]}';
   } else if (compressed.length === 0) {
     // Description-only home meal — no photos, so none of the scale-reading instructions below
     // apply (they were previously sent even with zero photos, which risked the model fixating
@@ -2605,8 +2661,9 @@ async function aFood(imgs, ps, mt, desc, apiKey) {
       + "3. Estimate weights from what the description says (explicit grams win) or a typical realistic home portion otherwise — do not default everything to 100g.\n"
       + "4. List every ingredient the description implies. Small additions (oil, sauce, seasoning) still count if mentioned.\n"
       + "5. Per ingredient: kcal/protein/carbs/fat MUST be PER-100g reference values (NOT scaled to weight). Top-level kcal/protein/carbs/fat = meal totals: sum of (per-100g × weightG / 100).\n\n"
+      + "6. eatingOut: set true ONLY if the description clearly indicates a restaurant, fast-food chain (e.g. Hesburger, McDonald's, KFC, Burger King), café, takeaway/delivery order or canteen meal rather than something cooked at home; otherwise false.\n\n"
       + "Reply ONLY with this JSON:\n"
-      + '{"type":"meal","name":"","kcal":0,"protein":0,"carbs":0,"fat":0,"totalGrams":0,"notes":"estimated from description only","newProduct":null,"ingredients":[{"name":"","weightG":0,"kcal":0,"protein":0,"carbs":0,"fat":0}]}';
+      + '{"type":"meal","name":"","kcal":0,"protein":0,"carbs":0,"fat":0,"totalGrams":0,"eatingOut":false,"notes":"estimated from description only","newProduct":null,"ingredients":[{"name":"","weightG":0,"kcal":0,"protein":0,"carbs":0,"fat":0}]}';
   } else {
     prompt = "Precision nutrition analyst with kitchen scale photos.\n"
       + (desc ? "MEAL DESCRIPTION — use this to identify ingredients and match products: " + desc + "\n" : "")
@@ -2658,9 +2715,10 @@ async function aFood(imgs, ps, mt, desc, apiKey) {
       + "3. Per ingredient: kcal/protein/carbs/fat MUST be PER-100g reference values for that ingredient (NOT scaled to weight). If matched to a known product, copy its per-100g values exactly. If not matched, give standard reference per-100g values for that food.\n"
       + "4. Top-level kcal/protein/carbs/fat = meal totals (already scaled): sum of (per-100g × weightG / 100). totalGrams = sum of weightG.\n"
       + "5. Unknown product: if label visible in photo, read it and populate newProduct with brand name and per-100g macros.\n"
-      + "6. For each ingredient include '_scaleRead': the literal bright digits you saw (e.g. '47', '6', '108'). If weightUncertain:true, add a brief note like 'bright digits unclear, estimated from portion'.\n\n"
+      + "6. For each ingredient include '_scaleRead': the literal bright digits you saw (e.g. '47', '6', '108'). If weightUncertain:true, add a brief note like 'bright digits unclear, estimated from portion'.\n"
+      + "7. eatingOut: set true ONLY if the photos/description clearly show a restaurant, fast-food chain (e.g. Hesburger, McDonald's, KFC), café, takeaway/delivery or canteen meal — branded restaurant packaging, a restaurant plate, a menu/nutrition screenshot from a venue — rather than food prepared at home; otherwise false.\n\n"
       + "Reply ONLY with this JSON:\n"
-      + '{"type":"meal","name":"","kcal":0,"protein":0,"carbs":0,"fat":0,"totalGrams":0,"notes":"","newProduct":{"name":"","kcal":0,"p":0,"c":0,"f":0},"ingredients":[{"name":"","weightG":0,"_scaleRead":"","weightUncertain":false,"kcal":0,"protein":0,"carbs":0,"fat":0}]}';
+      + '{"type":"meal","name":"","kcal":0,"protein":0,"carbs":0,"fat":0,"totalGrams":0,"eatingOut":false,"notes":"","newProduct":{"name":"","kcal":0,"p":0,"c":0,"f":0},"ingredients":[{"name":"","weightG":0,"_scaleRead":"","weightUncertain":false,"kcal":0,"protein":0,"carbs":0,"fat":0}]}';
   }
   // 4096, not 2500 — a full 15-ingredient breakdown (each with name/weightG/_scaleRead/
   // weightUncertain/kcal/protein/carbs/fat) genuinely needs the room, and running out mid-JSON
@@ -2740,6 +2798,17 @@ async function aSubtitle(name, apiKey) {
       + '{"subtitle":""}' }
   ], apiKey, TEXT_MODEL, 100);
   return res?.subtitle || "";
+}
+// Products created from a barcode scan (Open Food Facts has no generic-category tag) used to be
+// saved with no subtitle at all, unlike ones created by scanning a label photo. This fills it in
+// afterwards in the background — same short generic tag ("Beef", "Protein Bar") — and only ever
+// sets it on a product that still has none, so it can't overwrite anything the user typed.
+async function fillSubtitleFor(name, apiKey, setProducts) {
+  if (!name || !apiKey || !setProducts) return;
+  try {
+    const s = await aSubtitle(name, apiKey);
+    if (s) setProducts(prev => prev.map(p => (p.name === name && !p.subtitle) ? { ...p, subtitle: s } : p));
+  } catch { /* the subtitle is a nice-to-have, never worth surfacing an error for */ }
 }
 
 // Per-ingredient AI estimate: cheap text-only call returning per-100g macros
@@ -3411,7 +3480,14 @@ function Sheet({onClose,title,children}){
   // here (centred, max-width, and the live --app-top/--app-height the visualViewport effect
   // maintains) so the sheet still fills exactly the app column and not the whole browser window
   // on a wide screen.
-  return(<div role="dialog" aria-modal="true" aria-label={title}
+  //
+  // Portalled to the app shell (see the return below) for a second, iOS-specific reason: even as
+  // position:fixed, a sheet rendered INSIDE a scrolling container (the Gym Mode session lives in
+  // an overflow:auto pane under its own header) gets confined to that pane by Safari — the dim
+  // overlay stops short of the pane, so the "Gym Mode" header stayed bright and on top of the
+  // exercise guide, covering its close button. Rendering the sheet as a direct child of the shell
+  // takes it out of every scroller's paint/clip region.
+  const sheet = (<div role="dialog" aria-modal="true" aria-label={title}
     style={{position:"fixed",top:"var(--app-top, 0px)",left:0,right:0,margin:"0 auto",maxWidth:520,
       height:"var(--app-height, 100dvh)",
       background:"rgba(0,0,0,0.72)",backdropFilter:"blur(3px)",WebkitBackdropFilter:"blur(3px)",zIndex:60,display:"flex",flexDirection:"column",justifyContent:"flex-end",animation:"fadeIn .18s ease"}}
@@ -3433,6 +3509,11 @@ function Sheet({onClose,title,children}){
       {children}
     </div>
   </div>);
+  // createPortal is absent from the bare react-dom/client entry (the jsdom test harness), where
+  // the sheet just renders in place; in the browser's UMD build it is always there.
+  const host = typeof document!=="undefined" ? document.querySelector(".app-shell") : null;
+  const portal = typeof ReactDOM!=="undefined" ? ReactDOM.createPortal : null;
+  return (host && portal) ? portal(sheet, host) : sheet;
 }
 function MacroFields({form,setForm}){
   const f=k=>v=>setForm(p=>({...p,[k]:v}));
@@ -4418,7 +4499,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onAddKeepOpen,onClo
   // advanced tools (Photos/Barcode/Labels/Manual/Prep) are one tap away rather than the first
   // thing shown, since most days the thing being logged was already logged recently.
   const initial = initialMode || "quick";
-  const [mode,setMode]=useState(initial==="photos"&&!mealAnalysisOn?"manual":initial);const [mt,setMt]=useState("home");const [desc,setDesc]=useState("");const [imgs,setImgs]=useState([]);const [result,setResult]=useState(null);const [loading,setLoading]=useState(false);const [err,setErr]=useState(null);const [form,setForm]=useState({name:"",kcal:"",protein:"",carbs:"",fat:"",notes:""});const [mealType,setMealType]=useState(mealTypeByTime());const [mealTypeTouched,setMealTypeTouched]=useState(false);const [gramsEaten,setGramsEaten]=useState("");const [per100,setPer100]=useState(null);const [aiNotes,setAiNotes]=useState("");
+  const [mode,setMode]=useState(initial);const [mt,setMt]=useState("home");const [desc,setDesc]=useState("");const [imgs,setImgs]=useState([]);const [result,setResult]=useState(null);const [loading,setLoading]=useState(false);const [err,setErr]=useState(null);const [form,setForm]=useState({name:"",kcal:"",protein:"",carbs:"",fat:"",notes:""});const [mealType,setMealType]=useState(mealTypeByTime());const [mealTypeTouched,setMealTypeTouched]=useState(false);const [gramsEaten,setGramsEaten]=useState("");const [per100,setPer100]=useState(null);const [aiNotes,setAiNotes]=useState("");
   // Recent — derived from the last 14 days of logs (loaded once on mount), grouped by
   // normalized meal name to the most recent occurrence. Not persisted state: it's a read of
   // history, same idea as the Coach's own recent-logs fetch.
@@ -4474,6 +4555,11 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onAddKeepOpen,onClo
   const [ingConfirmed,setIngConfirmed]=useState(false); // when true, ingredients exist but user has moved past panel
   const analyze=async()=>{setLoading(true);setErr(null);setIngConfirmed(false);try{
     const res=await aFood(imgs,products,mt,desc,apiKey);
+    // The user can forget to flip Home cooked → Eating Out. The description keyword check has
+    // already covered typed text; this covers photos (branded packaging, a menu screenshot):
+    // the model reports `eatingOut`, and unless the user picked a source themselves we follow it.
+    const aiSaysEatingOut=res.eatingOut===true&&mt!=="canteen"&&!mtTouched;
+    if(aiSaysEatingOut){setMt("canteen");setAutoEatingOut(true);}
     setResult(res);
     if(res.type!=="activity"){
       const resKcal=Math.round(res.kcal)||0,resProt=Math.round(res.protein)||0,resCarbs=Math.round(res.carbs)||0,resFat=Math.round(res.fat)||0;
@@ -4495,7 +4581,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onAddKeepOpen,onClo
       // For canteen meals, mark each ingredient as _canteen so the confirm panel does NOT
       // auto-match against the user's product labels (we don't know what the kitchen used).
       if(res.ingredients&&res.ingredients.length>0){
-        const isCanteen=mt==="canteen";
+        const isCanteen=mt==="canteen"||aiSaysEatingOut;
         setIngredients(res.ingredients.map(ing=>({
           ...ing,
           weightG:String(ing.weightG||0),
@@ -4503,7 +4589,10 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onAddKeepOpen,onClo
         })));
       }
     }
-  }catch(e){setErr({friendly:"Meal analysis failed. Try again.", detail:String(e.message||e)});}setLoading(false);};
+  }catch(e){
+    const detail=String(e.message||e);
+    setErr({friendly:/^Timed out/.test(detail)?"The AI service didn't respond in time — check your connection and try again (fewer or smaller photos also help).":"Meal analysis failed. Try again.", detail});
+  }setLoading(false);};
   // Recalculate totals from confirmed ingredient list
   const recalcFromIngredients=()=>{
     if(!ingredients)return;
@@ -4551,14 +4640,25 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onAddKeepOpen,onClo
   // → log flow (same component the global Quick Log FAB uses) that either logs directly or is
   // backed out of, never a multi-step form living inside this one's own mode machinery.
   const [showBarcode,setShowBarcode]=useState(false);
+  // Home cooked ↔ Eating Out follows the description automatically until the user picks a side
+  // themselves (mtTouched) — so "Hesburger tortillas and fries" flips to Eating Out without the
+  // toggle having to be remembered, and an explicit tap on either button is never overridden.
+  const [mtTouched,setMtTouched]=useState(false);
+  const [autoEatingOut,setAutoEatingOut]=useState(false);
+  useEffect(()=>{
+    if(mtTouched||mt==="canteen")return;
+    if(looksLikeEatingOut(desc)){setMt("canteen");setAutoEatingOut(true);}
+  },[desc,mtTouched,mt]);
   return(<Sheet onClose={onClose} title="Log Meal">
-    <div style={{display:"flex",gap:5,marginBottom:10,flexWrap:"wrap"}}>{[["📸 Photos","photos"],["📷 Barcode","barcode"],["🏷️ Labels","labels"],["✏️ Manual","manual"],["🍱 Prep","mealprep"]].map(([lbl,m])=>{
-      const disabled = m==="photos" && !mealAnalysisOn;
-      return(<button key={m} onClick={()=>{if(disabled)return;if(m==="barcode"){setShowBarcode(true);return;}setMode(m);setResult(null);}} disabled={disabled} title={disabled?"AI meal analysis is off — enable in Settings → AI & Privacy":undefined}
-        style={{flex:1,minWidth:60,padding:"8px 4px",borderRadius:10,border:`1px solid ${mode===m?C.lime:C.border}`,background:mode===m?`${C.lime}20`:C.card,color:mode===m?C.lime:disabled?C.muted2:C.muted,fontWeight:mode===m?700:500,cursor:disabled?"default":"pointer",fontSize:11,opacity:disabled?0.5:1}}>{lbl}</button>);
-    })}</div>
+    {/* One tab for anything you point a camera at: a photo of the meal, or a package's barcode
+        (scan button inside). They used to be two separate tabs — and two separate Quick Log
+        entries — for what is, from the user's side, the same act of "log this by camera". */}
+    <div style={{display:"flex",gap:5,marginBottom:10,flexWrap:"wrap"}}>{[["📸 Photo / Barcode","photos"],["🏷️ Labels","labels"],["✏️ Manual","manual"],["🍱 Prep","mealprep"]].map(([lbl,m])=>(
+      <button key={m} onClick={()=>{setMode(m);setResult(null);}}
+        style={{flex:m==="photos"?2:1,minWidth:60,padding:"8px 4px",borderRadius:10,border:`1px solid ${mode===m?C.lime:C.border}`,background:mode===m?`${C.lime}20`:C.card,color:mode===m?C.lime:C.muted,fontWeight:mode===m?700:500,cursor:"pointer",fontSize:11}}>{lbl}</button>
+    ))}</div>
     {mode!=="quick"&&<button onClick={()=>setMode("quick")} style={{background:"none",border:"none",color:C.muted,fontSize:T.sm,textDecoration:"underline",cursor:"pointer",padding:0,marginBottom:12}}>← Recent &amp; Favourites</button>}
-    {showBarcode&&<BarcodeScanSheet onAdd={onAdd} onAddKeepOpen={onAddKeepOpen||onAdd} onClose={()=>setShowBarcode(false)} onFinish={onClose} onPickLabels={()=>setShowBarcode(false)} apiKey={apiKey}/>}
+    {showBarcode&&<BarcodeScanSheet onAdd={onAdd} onAddKeepOpen={onAddKeepOpen||onAdd} onClose={()=>setShowBarcode(false)} onFinish={onClose} onPickLabels={()=>{setShowBarcode(false);setMode("labels");setResult(null);}} apiKey={apiKey}/>}
     {/* ── Quick pick: Recent + Favourites ── the landing screen for a bare "Log meal" open.
         Frequently-eaten items are one tap to log again instead of re-running Photos/Labels for
         the same chicken-and-rice bowl for the third time this week. */}
@@ -4649,16 +4749,20 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onAddKeepOpen,onClo
         <button onClick={()=>{const tot=lblItems.reduce((a,b)=>({kcal:a.kcal+b.kcal,protein:a.protein+b.protein,carbs:a.carbs+b.carbs,fat:a.fat+b.fat}),{kcal:0,protein:0,carbs:0,fat:0});const name=lblItems.length===1?lblItems[0].name:lblItems.map(l=>l.name.split(" ")[0]).join(" + ");const ings=lblItems.map(l=>({name:l.name,weightG:String(Math.round(l.weightG)),kcal:l.kcal/l.weightG*100,protein:l.protein/l.weightG*100,carbs:l.carbs/l.weightG*100,fat:l.fat/l.weightG*100}));onAdd({id:Date.now(),mealType,name,kcal:Math.round(tot.kcal),protein:Math.round(tot.protein*10)/10,carbs:Math.round(tot.carbs*10)/10,fat:Math.round(tot.fat*10)/10,ingredients:ings,notes:lblItems.map(l=>l.name+" "+Math.round(l.weightG)+"g").join(", "),time:new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})});}} style={{width:"100%",padding:"12px 0",borderRadius:10,background:C.lime,color:"#000",fontWeight:800,border:"none",cursor:"pointer",fontSize:15}}>Log Meal ({lblItems.length} item{lblItems.length!==1?"s":""})</button>
       </div>);})()}
     </div>)}
+    {mode==="photos"&&!result&&(
+      <button onClick={()=>setShowBarcode(true)} style={{width:"100%",padding:"12px 0",minHeight:48,borderRadius:10,background:`${C.lime}14`,border:`1px solid ${C.lime}55`,color:C.lime,fontWeight:700,fontSize:T.body,marginBottom:12}}>📷 Scan a barcode instead</button>
+    )}
     {mode==="photos"&&!mealAnalysisOn&&(
       <div style={{background:C.bg,border:`1px dashed ${C.border}`,borderRadius:10,padding:"16px",textAlign:"center"}}>
-        <div style={{fontSize:12,color:C.muted,lineHeight:1.6}}>AI meal analysis is turned off in Settings → AI &amp; Privacy. Use Labels, Manual or Prep instead, or turn it back on.</div>
+        <div style={{fontSize:12,color:C.muted,lineHeight:1.6}}>AI meal analysis is turned off in Settings → AI &amp; Privacy, so photos can't be analysed — barcode scanning above still works. Use Labels, Manual or Prep for everything else, or turn it back on.</div>
       </div>
     )}
     {mode==="photos"&&mealAnalysisOn&&!result&&(<>
-      <div style={{display:"flex",gap:6,marginBottom:10}}>{[["Home cooked","home"],["Eating Out","canteen"]].map(([lbl,t])=>(<button key={t} onClick={()=>setMt(t)} style={{flex:1,padding:"8px 6px",borderRadius:8,border:`1px solid ${mt===t?C.lime:C.border}`,background:mt===t?`${C.lime}12`:C.bg,color:mt===t?C.lime:C.muted,fontWeight:mt===t?600:400,cursor:"pointer",fontSize:11}}>{lbl}</button>))}</div>
+      <div style={{display:"flex",gap:6,marginBottom:autoEatingOut?6:10}}>{[["Home cooked","home"],["Eating Out","canteen"]].map(([lbl,t])=>(<button key={t} onClick={()=>{setMt(t);setMtTouched(true);setAutoEatingOut(false);}} style={{flex:1,padding:"8px 6px",borderRadius:8,border:`1px solid ${mt===t?C.lime:C.border}`,background:mt===t?`${C.lime}12`:C.bg,color:mt===t?C.lime:C.muted,fontWeight:mt===t?600:400,cursor:"pointer",fontSize:11}}>{lbl}</button>))}</div>
+      {autoEatingOut&&<div style={{fontSize:T.label,color:C.muted,marginBottom:10,lineHeight:1.4}}>🍴 Switched to Eating Out automatically — this reads like a restaurant meal. Tap "Home cooked" to change it back.</div>}
       <div style={{marginBottom:10}}>
         <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>{mt==="canteen"?"Describe the meal (or attach a photo)":"Meal name / description (or attach a photo)"}</div>
-        <textarea value={desc} onChange={e=>setDesc(e.target.value)} rows={2} placeholder={mt==="canteen"?"e.g. Grilled chicken ~150g, buckwheat, salad, butter sauce on side":"e.g. Overnight oats with banana and peanut butter"} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:T.body,outline:"none",resize:"none",fontFamily:"inherit"}}/>
+        <textarea value={desc} onChange={e=>setDesc(e.target.value)} rows={2} placeholder={mt==="canteen"?"e.g. Hesburger chicken tortilla and fries — attach a screenshot of the venue's nutrition page for exact numbers":"e.g. Overnight oats with banana and peanut butter"} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:T.body,outline:"none",resize:"none",fontFamily:"inherit"}}/>
       </div>
       <ImgZone imgs={imgs} setImgs={setImgs} maxPhotos={15}/>
       {err&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#ff8080",margin:"8px 0",wordBreak:"break-word"}}>
@@ -5001,6 +5105,7 @@ function CreatePrepSheet({products,onSave,onClose,apiKey,setProducts}){
       setPickedG(res.servingG?String(res.servingG):"100");
       if(setProducts&&!products.some(p=>p.name.toLowerCase()===res.name.toLowerCase())){
         setProducts(prev=>[...prev,{name:res.name,kcal:res.kcal,p:res.p,c:res.c,f:res.f,packSizeG:res.packSizeG,servingG:res.servingG,barcode:res.barcode,categories:[],addedAt:Date.now()}]);
+        fillSubtitleFor(res.name,apiKey,setProducts);
       }
       setShowPrepScan(false);setPrepScanLooking(false);
     }catch(e){setPrepScanErr(String(e.message||e));setPrepScanLooking(false);}
@@ -5491,7 +5596,11 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
       // future match. Same bar as manually saving a product label: needs a real name and either
       // a real kcal value or some macro, or it's not saved at all.
       const npValid = newProduct && (newProduct.name||"").trim().length>0 && ((newProduct.kcal||0)>0 || (newProduct.p||0)>0 || (newProduct.c||0)>0 || (newProduct.f||0)>0);
-      if(npValid)setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);}
+      if(npValid){
+        const isNewProduct=!products.some(x=>x.name.toLowerCase()===newProduct.name.toLowerCase());
+        setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);
+        if(isNewProduct&&!newProduct.subtitle)fillSubtitleFor(newProduct.name,profile.apiKey,setProducts);
+      }}
   };
   const handleAdd=entry=>{addEntry(entry);setModal(null);};
   const updateMeal=updated=>{setDayData(p=>({...p,meals:p.meals.map(m=>m.id===updated.id?updated:m)}));setEditingMealId(null);};
@@ -5971,6 +6080,12 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
   const [showJumpCombo, setShowJumpCombo] = useState(false);
   const [stretchTarget, setStretchTarget] = useState(null); // {duration, startedAt} for the 30s/60s stretch timer, or null
   const [stretchRemaining, setStretchRemaining] = useState(0);
+  // Warm-up SETS: solo lifts at a lighter weight (e.g. bench press 20kg × 10) ahead of the working
+  // sets — kept separate from the combos so they never count as work (progression, volume, the
+  // plan-vs-session diff all only look at combos).
+  const [wuName, setWuName] = useState("");
+  const [wuWeight, setWuWeight] = useState("");
+  const [wuReps, setWuReps] = useState("");
 
   useEffect(() => {
     if (!stretchTarget) { setStretchRemaining(0); return; }
@@ -6254,6 +6369,43 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
           accent={C.orange} presets={routinePresetsFor("warmup",trainedRegions)} addPlaceholder="e.g. Band pull-aparts"
           onSuggest={()=>update(s=>({...s,warmup:{...s.warmup,items:buildRoutineItems("warmup",trainedRegions)}}))}/>
       </div>
+      {/* Warm-up sets — lighter solo lifts (e.g. bench press 20kg × 10) before the working sets.
+          Suggestion chips come from the exercises this session actually contains, and picking one
+          pre-fills roughly half of what was last lifted so a ramp-up is one tap + reps. */}
+      {(()=>{
+        const wuSets = session.warmup.sets||[];
+        const names = [...new Set((session.combos||[]).flatMap(c=>(c.exercises||[]).map(e=>e.name)))].slice(0,8);
+        const suggestWeight = name => {
+          const last = getLastPerformance(name, gymSessions);
+          const w = parseFloat(last?.weight);
+          return w>0 ? String(Math.max(2.5, Math.round(w*0.5/2.5)*2.5)) : "";
+        };
+        const addWarmupSet = () => {
+          const name = wuName.trim(); const reps = parseInt(wuReps)||0;
+          if (!name || !reps) return;
+          updateAction(s=>({...s,warmup:{...s.warmup,sets:[...(s.warmup.sets||[]),{id:Date.now()+Math.random(),name,weight:wuWeight||null,unit:"kg",reps}]}}));
+          setWuReps(""); // name + weight stay put — the next ramp-up set is usually the same lift
+        };
+        return(<div style={{marginBottom:SP.md}}>
+          <div style={{...eyebrow(),marginBottom:SP.sm}}>Warm-up sets · lighter weight</div>
+          {wuSets.length>0&&<div style={{display:"flex",flexDirection:"column",gap:5,marginBottom:SP.sm}}>
+            {wuSets.map(ws=>(<div key={ws.id} style={{display:"flex",alignItems:"center",gap:8,background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"7px 10px"}}>
+              <span style={{flex:1,minWidth:0,fontSize:12,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ws.name}</span>
+              <span style={{fontFamily:"monospace",fontSize:12,color:C.orange,fontWeight:700,flexShrink:0}}>{ws.weight?`${ws.weight}${ws.unit||"kg"} × `:""}{ws.reps}</span>
+              <button onClick={()=>updateAction(s=>({...s,warmup:{...s.warmup,sets:(s.warmup.sets||[]).filter(x=>x.id!==ws.id)}}))} aria-label={`Remove warm-up set ${ws.name}`} style={{background:"none",border:"none",color:C.faint,fontSize:T.body,padding:"0 2px",lineHeight:1}}>×</button>
+            </div>))}
+          </div>}
+          {names.length>0&&<div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:SP.sm}}>
+            {names.map(n=>(<button key={n} onClick={()=>{setWuName(n);setWuWeight(suggestWeight(n));}} style={{padding:"5px 9px",borderRadius:14,border:`1px solid ${normExName(wuName)===normExName(n)?C.orange:C.border}`,background:normExName(wuName)===normExName(n)?`${C.orange}18`:C.bg,color:normExName(wuName)===normExName(n)?C.orange:C.muted,fontSize:11}}>{n}</button>))}
+          </div>}
+          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+            <input value={wuName} onChange={e=>setWuName(e.target.value)} placeholder="Exercise (e.g. Bench Press)" aria-label="Warm-up exercise" style={{flex:1,minWidth:0,minHeight:44,boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"8px 10px",color:C.text,fontSize:12,outline:"none"}}/>
+            <input value={wuWeight} onChange={e=>setWuWeight(e.target.value.replace(",","."))} inputMode="decimal" placeholder="kg" aria-label="Warm-up weight" style={{width:56,minHeight:44,boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"8px",color:C.text,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
+            <input value={wuReps} onChange={e=>setWuReps(e.target.value.replace(/\D/g,""))} inputMode="numeric" placeholder="reps" aria-label="Warm-up reps" onKeyDown={e=>{if(e.key==="Enter")addWarmupSet();}} style={{width:56,minHeight:44,boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"8px",color:C.text,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
+          </div>
+          <button onClick={addWarmupSet} disabled={!wuName.trim()||!(parseInt(wuReps)>0)} style={{width:"100%",marginTop:6,padding:"9px 0",minHeight:40,borderRadius:8,background:(wuName.trim()&&parseInt(wuReps)>0)?`${C.orange}22`:C.bg,border:`1px solid ${(wuName.trim()&&parseInt(wuReps)>0)?C.orange:C.border}`,color:(wuName.trim()&&parseInt(wuReps)>0)?C.orange:C.faint,fontWeight:700,fontSize:12}}>+ Add warm-up set</button>
+        </div>);
+      })()}
       <textarea value={session.warmup.notes||""} onChange={e=>update(s=>({...s,warmup:{...s.warmup,notes:e.target.value}}))} placeholder="Notes (optional)…" rows={2} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:T.body,outline:"none",resize:"none",fontFamily:"inherit",marginBottom:9}}/>
       <button onClick={()=>updateAction(s=>({...s,warmup:{...s.warmup,done:true}}))} style={{width:"100%",padding:"11px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:T.body}}>✓ Finish Warmup</button>
       <div style={{display:"flex",justifyContent:"center",gap:16,marginTop:8}}>
@@ -6359,6 +6511,9 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
     </div>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
       <button onClick={()=>setShowJumpCombo(p=>!p)} style={{fontSize:10,color:C.muted,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>🔀 jump to another combo</button>
+      {/* Warm-up sets can be added even when the plan has no warm-up step (or it was already
+          finished/skipped) — this reopens that screen, and "Finish Warmup" returns here. */}
+      <button onClick={()=>updateAction(s=>({...s,warmup:{type:"other",fields:{},notes:"",items:[],...(s.warmup||{}),done:false}}))} style={{fontSize:10,color:C.orange,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>🔥 warm-up sets</button>
       <button onClick={tryCancel} style={{fontSize:10,color:C.muted,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>cancel session</button>
     </div>
     {showCancelConfirm&&<CancelConfirmBox onSaveFinish={()=>{setShowCancelConfirm(false);goToFinishOrCooldown();}} onDiscard={onCancel} onKeepGoing={()=>setShowCancelConfirm(false)}/>}
@@ -6619,11 +6774,14 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
 
     {!isLastCombo&&<button onClick={skipCombo} style={{width:"100%",padding:"9px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,fontSize:12,marginBottom:8}}>⏭ Skip current combo entirely</button>}
     <>
-      {/* Add exercise to this combo live — only between rounds to avoid awkward partial rounds.
-          Previously just a bare text box with no way to browse or pick from the library at all
-          — every exercise had to be retyped from memory. Now the same search-and-tile picker
-          the offline plan editor uses, with a "not in the library" fallback for anything new. */}
-      {atRoundStart&&(addExMode?(()=>{
+      {/* Add exercise to the current combo live. This used to be limited to "between rounds"
+          (currentExInRound===0) to avoid awkward partial rounds, which meant the button vanished
+          the moment a combo was actually under way — exactly when you realise you want to add
+          something. The new exercise is appended to the END of the combo, so it can never disturb
+          the cursor position of the round that's in progress; it just comes up after the others.
+          Same search-and-tile picker the offline plan editor uses, with a "not in the library"
+          fallback for anything new. */}
+      {(addExMode?(()=>{
         const q = newExName.trim();
         const filteredLibForAdd = !q ? (gymExerciseLibrary||[]).slice(0,20) : (gymExerciseLibrary||[])
           .map(e=>{ const g=guideFor(e.name); return {e, score:searchScore(q, e.name, e.muscleGroup||"", g?.pattern||"", ...(g?.aliases||[]), ...(g?.equipment||[]))}; })
@@ -6647,7 +6805,11 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       })():(
         <button onClick={()=>setAddExMode(true)} style={{width:"100%",padding:"8px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11,marginBottom:8}}>+ Add exercise to this combo</button>
       ))}
-      {atRoundStart&&<button onClick={()=>updateAction(s=>({...s,...commitComboTime(s),combos:[...s.combos,{id:Date.now(),exercises:[]}],currentComboIdx:s.combos.length,currentExInRound:0}))} style={{width:"100%",padding:"9px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,fontSize:12}}>+ New Combo</button>}
+      {/* Between rounds a new combo takes over as the active one (the old behaviour); mid-round it is
+          only appended, so the combo you're partway through keeps its place. */}
+      <button onClick={()=>updateAction(s=>atRoundStart
+        ? ({...s,...commitComboTime(s),combos:[...s.combos,{id:Date.now(),exercises:[]}],currentComboIdx:s.combos.length,currentExInRound:0})
+        : ({...s,combos:[...s.combos,{id:Date.now(),exercises:[]}]}))} style={{width:"100%",padding:"9px 0",borderRadius:9,background:"none",border:`1px dashed ${C.border}`,color:C.muted,fontSize:12}}>+ New Combo</button>
     </>
     {guideForName&&<ExerciseGuideSheet name={guideForName} onClose={()=>setGuideFor(null)}/>}
   </div>);
@@ -7025,10 +7187,13 @@ function GymSessionDetailSheet({session, onClose, onDelete}){
       </div>
     </div>
 
-    {session.warmup&&(session.warmup.notes||fieldSummary(session.warmup.fields)||(session.warmup.items||[]).length>0)&&(
+    {session.warmup&&(session.warmup.notes||fieldSummary(session.warmup.fields)||(session.warmup.items||[]).length>0||(session.warmup.sets||[]).length>0)&&(
       <div style={{background:C.card,border:`1px solid ${C.orange}40`,borderRadius:10,padding:"11px 13px",marginBottom:10}}>
         <div style={{fontSize:11,fontWeight:700,color:C.orange,marginBottom:5}}>🔥 Warmup</div>
         <RoutineSummary items={session.warmup.items}/>
+        {(session.warmup.sets||[]).length>0&&<div style={{fontSize:11,color:C.muted,marginBottom:3}}>
+          {(session.warmup.sets||[]).map(ws=>`${ws.name} ${ws.weight?`${ws.weight}${ws.unit||"kg"} × `:""}${ws.reps}`).join(" · ")}
+        </div>}
         {fieldSummary(session.warmup.fields)&&<div style={{fontSize:11,color:C.muted}}>{fieldSummary(session.warmup.fields)}</div>}
         {session.warmup.notes&&<div style={{fontSize:11,color:C.muted,marginTop:3}}>{session.warmup.notes}</div>}
       </div>
@@ -7367,6 +7532,15 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
   const startGymSession=(weekday,template,dayId)=>{
     setGymActiveSession(buildSessionFromTemplate(weekday,template,dayId));
   };
+  // Entering gym mode first checks for scheduled days that were skipped this past week; if any,
+  // the catch-up sheet asks whether to do one of those instead of (or before) today's plan.
+  const [missedPromptOpen,setMissedPromptOpen]=useState(false);
+  const missedDays=findMissedGymDays(TODAY(),gymDayAssign,gymTemplates,gymSessions,gymSettings?.missedDismissed).slice(0,3);
+  const requestStartSession=()=>{
+    if(missedDays.length) setMissedPromptOpen(true);
+    else startGymSession(todayWeekday,todayTemplate,todayDayId);
+  };
+  const dismissMissedDays=()=>setGymSettings(p=>({...(p||{}),missedDismissed:[...new Set([...((p||{}).missedDismissed||[]),...missedDays.map(m=>m.date)])].slice(-60)}));
   const cancelGymSession=()=>setGymActiveSession(null);
   useEffect(()=>{if(view==="history"&&!histLoaded){store.get("fit_dates",[]).then(async ds=>{const e={};for(const d of ds){const log=await store.get(`fit_day_${d}`,null);if(log&&(log.activities||[]).length>0)e[d]=log;}setHistLogs(e);setHistDates(Object.keys(e).sort((a,b)=>b.localeCompare(a)));setHistLoaded(true);});}},[view]);
   // Resolve the gym record behind an activity row. Sessions logged since the sessionId link
@@ -7433,12 +7607,26 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
           <div><div style={{fontSize:T.body,fontWeight:600,color:C.text}}>🏋️ At the gym already?</div><div style={{fontSize:10,color:C.muted,marginTop:2}}>{WEEKDAYS[todayWeekday].full} · {todayDayId?gymDayLabel(gymTemplates,todayDayId):"scheduled gym day"}</div></div>
           <div style={{display:"flex",gap:6,flexShrink:0}}>
             <button onClick={()=>setPromptDismissed(true)} style={{padding:"7px 10px",borderRadius:8,background:"none",border:`1px solid ${C.border}`,color:C.muted,cursor:"pointer",fontSize:11}}>Not yet</button>
-            <button onClick={()=>startGymSession(todayWeekday,todayTemplate,todayDayId)} style={{padding:"7px 14px",borderRadius:8,background:C.orange,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Start Session</button>
+            <button onClick={requestStartSession} style={{padding:"7px 14px",borderRadius:8,background:C.orange,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Start Session</button>
           </div>
         </div>
       ) : (
-        <button onClick={()=>startGymSession(todayWeekday,todayTemplate,todayDayId)} style={{width:"100%",padding:"9px 0",borderRadius:10,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12,marginBottom:12}}>🏋️ + Start ad-hoc gym session</button>
+        <button onClick={requestStartSession} style={{width:"100%",padding:"9px 0",borderRadius:10,background:"none",border:`1px dashed ${C.border}`,color:C.muted,cursor:"pointer",fontSize:12,marginBottom:12}}>🏋️ + Start ad-hoc gym session</button>
       )}
+      {missedPromptOpen&&missedDays.length>0&&(<Sheet onClose={()=>setMissedPromptOpen(false)} title="Missed a gym day?">
+        <div style={{fontSize:T.sm,color:C.muted,marginBottom:12,lineHeight:1.5}}>{missedDays.length===1?"A scheduled session wasn't logged.":"A few scheduled sessions weren't logged."} Want to do one of them now instead of (or before) today's plan?</div>
+        <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
+          {missedDays.map(m=>(<button key={m.date} onClick={()=>{setMissedPromptOpen(false);startGymSession(todayWeekday,(gymTemplates||{})[m.dayId]||null,m.dayId);}}
+            style={{textAlign:"left",padding:"12px 14px",minHeight:48,borderRadius:10,background:C.card,border:`1px solid ${C.orange}70`,color:C.text}}>
+            <div style={{fontSize:T.body,fontWeight:700,color:C.orange}}>Do {WEEKDAYS[m.weekday].full}'s {gymDayLabel(gymTemplates,m.dayId)}</div>
+            <div style={{fontSize:T.label,color:C.muted,marginTop:2}}>{new Date(m.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"short"})} · not logged</div>
+          </button>))}
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>{dismissMissedDays();setMissedPromptOpen(false);startGymSession(todayWeekday,todayTemplate,todayDayId);}} style={{flex:1,padding:"11px 0",minHeight:44,borderRadius:10,background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12}}>Skip them{todayDayId?" — start today's":" — ad-hoc session"}</button>
+          <button onClick={()=>{setMissedPromptOpen(false);startGymSession(todayWeekday,todayTemplate,todayDayId);}} style={{flex:1,padding:"11px 0",minHeight:44,borderRadius:10,background:C.lime,border:"none",color:"#000",fontWeight:700,fontSize:12}}>{todayDayId?"Start today's plan":"Start ad-hoc"}</button>
+        </div>
+      </Sheet>)}
       {gymSetupOpen&&<GymSetupSheet
         gymSchedule={gymSchedule||[]} setGymSchedule={setGymSchedule}
         gymSettings={gymSettings} setGymSettings={setGymSettings}
@@ -8117,6 +8305,9 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
         servingG:res.servingG?String(res.servingG):f.servingG,
         barcode:res.barcode||code}));
       setShowLabelScan(false);setLabelScanLooking(false);
+      // Open Food Facts has no generic category tag, so generate the subtitle here exactly as a
+      // label-photo scan does (background, silent on failure, never overwrites a typed value).
+      if(name&&profile.apiKey){aSubtitle(name,profile.apiKey).then(s=>{if(s)setPForm(f=>(f.name===name&&!f.subtitle)?{...f,subtitle:s}:f);}).catch(()=>{});}
       const dupIdx=products.findIndex(x=>x.name.trim().toLowerCase()===name.trim().toLowerCase());
       if(dupIdx>=0&&name){const np=buildProductFromForm({name,kcal:res.kcal,p:res.p,c:res.c,f:res.f,servingG:res.servingG?String(res.servingG):"",packSizeG:res.packSizeG?String(res.packSizeG):"",alwaysFullPack:false,categories:[],supermarkets:[],subtitle:"",barcode:res.barcode||code});setSaveToast({type:"duplicate",name,dupIdx,np});}
     }catch(e){setLabelScanErr(String(e.message||e));setLabelScanLooking(false);}
@@ -8128,6 +8319,21 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
     if(martFilter&&!marketsOf(p).includes(martFilter))return false;
     return true;
   });
+  // The label list is paged. With a few hundred labels, mounting every row (each with category
+  // emojis, chips and two buttons) at the moment the section opens is what made the Food tab
+  // stutter; 50 rows at a time keeps opening it instant however big the pantry grows.
+  const PROD_PAGE_SIZE=50;
+  const [prodPage,setProdPage]=useState(0);
+  useEffect(()=>{setProdPage(0);},[search,catFilter,martFilter,prodSort]);
+  const prodPageCount=Math.max(1,Math.ceil(filtered.length/PROD_PAGE_SIZE));
+  const prodPageSafe=Math.min(prodPage,prodPageCount-1);
+  const pageStart=prodPageSafe*PROD_PAGE_SIZE;
+  const pageItems=filtered.slice(pageStart,pageStart+PROD_PAGE_SIZE);
+  const prodPager=prodPageCount>1&&(<div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,margin:"6px 0"}}>
+    <button onClick={()=>setProdPage(Math.max(0,prodPageSafe-1))} disabled={prodPageSafe===0} aria-label="Previous page of labels" style={{padding:"7px 12px",minHeight:36,borderRadius:8,background:C.card,border:`1px solid ${C.border}`,color:prodPageSafe===0?C.faint:C.text,fontSize:12,cursor:prodPageSafe===0?"default":"pointer"}}>← Prev</button>
+    <span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textAlign:"center"}}>Page {prodPageSafe+1} of {prodPageCount} · {pageStart+1}–{Math.min(filtered.length,pageStart+PROD_PAGE_SIZE)} of {filtered.length}</span>
+    <button onClick={()=>setProdPage(Math.min(prodPageCount-1,prodPageSafe+1))} disabled={prodPageSafe>=prodPageCount-1} aria-label="Next page of labels" style={{padding:"7px 12px",minHeight:36,borderRadius:8,background:C.card,border:`1px solid ${C.border}`,color:prodPageSafe>=prodPageCount-1?C.faint:C.text,fontSize:12,cursor:prodPageSafe>=prodPageCount-1?"default":"pointer"}}>Next →</button>
+  </div>);
   const supermarkets=[...new Set(products.flatMap(p=>p.supermarkets||(p.supermarket?[p.supermarket]:[])))].sort();
   const uncategorizedCount=products.filter(p=>!(p.categories||[]).length).length;
   const PrepCard=({prep})=>{
@@ -8309,9 +8515,10 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
           <button onClick={()=>{setProducts(prev=>prev.filter((_,j)=>j!==confirmDelete));if(editPIdx===confirmDelete){clearForm();setEditPIdx(null);}setConfirmDelete(null);}} style={{padding:"5px 11px",borderRadius:6,background:"#3a0a0a",border:"1px solid #ff4040",color:"#ff6060",fontWeight:700,cursor:"pointer",fontSize:12}}>Delete</button>
         </div>
       </div>}
-      <div style={{display:"flex",flexDirection:"column",gap:5}}>{filtered.map((p,i)=>{const ri=products.indexOf(p);const pMarkets=p.supermarkets||(p.supermarket?[p.supermarket]:[]);return(<div key={i} style={{background:C.card,border:`1px solid ${editPIdx===ri?C.lime:confirmDelete===ri?"#5a1a1a":C.border}`,borderRadius:10,padding:"9px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div style={{flex:1,marginRight:8,minWidth:0}}><span style={{fontSize:12,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",display:"block"}}>{p.name}</span>{p.subtitle&&<span style={{fontSize:10,color:C.muted,display:"block",marginTop:1}}>{p.subtitle}</span>}<div style={{display:"flex",gap:5,alignItems:"center",marginTop:2,flexWrap:"wrap"}}>{p.alwaysFullPack&&p.packSizeG
+      {prodPager}
+      <div style={{display:"flex",flexDirection:"column",gap:5}}>{pageItems.map((p,i)=>{const ri=products.indexOf(p);const pMarkets=p.supermarkets||(p.supermarket?[p.supermarket]:[]);return(<div key={i} style={{background:C.card,border:`1px solid ${editPIdx===ri?C.lime:confirmDelete===ri?"#5a1a1a":C.border}`,borderRadius:10,padding:"9px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div style={{flex:1,marginRight:8,minWidth:0}}><span style={{fontSize:12,color:C.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",display:"block"}}>{p.name}</span>{p.subtitle&&<span style={{fontSize:10,color:C.muted,display:"block",marginTop:1}}>{p.subtitle}</span>}<div style={{display:"flex",gap:5,alignItems:"center",marginTop:2,flexWrap:"wrap"}}>{p.alwaysFullPack&&p.packSizeG
   ?<span style={{fontSize:10,color:C.lime,fontFamily:"monospace"}} title="Always eaten as a full pack">📦{p.packSizeG}g</span>
-  :(p.servingG||p.packageG)&&<span style={{fontSize:10,color:C.lime,fontFamily:"monospace"}}>🍽{p.servingG||p.packageG}g</span>}{(p.categories||[]).map(cid=>{const cat=catById(cid);return cat?<span key={cid} style={{fontSize:9}} title={cat.label}>{cat.emoji}</span>:null;})}{pMarkets.map(m=>(<span key={m} style={{fontSize:8.5,color:C.blue,fontFamily:"monospace"}}>🏪{m}</span>))}</div></div><div style={{display:"flex",gap:5,alignItems:"center",flexShrink:0}}><div style={{display:"flex",gap:6}}><Chip val={p.kcal} label="k" color={C.lime}/><Chip val={p.p} label="P" color={C.blue}/><Chip val={p.c} label="C" color={C.orange}/><Chip val={p.f} label="F" color={C.purple}/></div><button onClick={()=>startEditP(ri)} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:11,cursor:"pointer",padding:"3px 6px",borderRadius:5,marginLeft:3}}>✎</button><button onClick={()=>setConfirmDelete(confirmDelete===ri?null:ri)} style={{background:"none",border:"none",color:confirmDelete===ri?"#ff4040":C.faint,fontSize:T.body,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div></div>);})}</div></div>}
+  :(p.servingG||p.packageG)&&<span style={{fontSize:10,color:C.lime,fontFamily:"monospace"}}>🍽{p.servingG||p.packageG}g</span>}{(p.categories||[]).map(cid=>{const cat=catById(cid);return cat?<span key={cid} style={{fontSize:9}} title={cat.label}>{cat.emoji}</span>:null;})}{pMarkets.map(m=>(<span key={m} style={{fontSize:8.5,color:C.blue,fontFamily:"monospace"}}>🏪{m}</span>))}</div></div><div style={{display:"flex",gap:5,alignItems:"center",flexShrink:0}}><div style={{display:"flex",gap:6}}><Chip val={p.kcal} label="k" color={C.lime}/><Chip val={p.p} label="P" color={C.blue}/><Chip val={p.c} label="C" color={C.orange}/><Chip val={p.f} label="F" color={C.purple}/></div><button onClick={()=>startEditP(ri)} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:11,cursor:"pointer",padding:"3px 6px",borderRadius:5,marginLeft:3}}>✎</button><button onClick={()=>setConfirmDelete(confirmDelete===ri?null:ri)} style={{background:"none",border:"none",color:confirmDelete===ri?"#ff4040":C.faint,fontSize:T.body,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div></div>);})}</div>{prodPager}</div>}
     </div>
     {/* No more floating corner FAB here — it sat exactly where a thumb lands reaching for the
         product-label "+ Add" button below, so it kept getting hit by accident. Meal-prep
@@ -9631,8 +9838,7 @@ function ImportScreen({onImport,onSkip}){
 // wherever its owning tab happened to be. Renders once at the App shell level so it's the same
 // button and the same six options no matter which tab is on screen.
 const QUICK_LOG_ACTIONS = [
-  {id:"meal", label:"Meal", emoji:"🍽️"},
-  {id:"barcode", label:"Product / Barcode", emoji:"📦"},
+  {id:"meal", label:"Meal", emoji:"🍽️", hint:"photo · barcode · recent"},
   {id:"weight", label:"Weight", emoji:"⚖️"},
   {id:"activity", label:"Activity", emoji:"🏃"},
   {id:"steps", label:"Steps", emoji:"👣"},
@@ -9641,10 +9847,11 @@ const QUICK_LOG_ACTIONS = [
 function QuickLogPicker({onPick,onClose,dueCount}){
   return(<Sheet onClose={onClose} title="Quick Log">
     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:SP.sm}}>
-      {QUICK_LOG_ACTIONS.map(a=>(
-        <button key={a.id} onClick={()=>onPick(a.id)} aria-label={a.label} style={{position:"relative",padding:"18px 10px",borderRadius:R.md,background:C.card,border:`1px solid ${C.border}`,color:C.text,display:"flex",flexDirection:"column",alignItems:"center",gap:8,cursor:"pointer"}}>
+      {QUICK_LOG_ACTIONS.map((a,i)=>(
+        <button key={a.id} onClick={()=>onPick(a.id)} aria-label={a.label} style={{position:"relative",padding:"18px 10px",borderRadius:R.md,background:C.card,border:`1px solid ${C.border}`,color:C.text,display:"flex",flexDirection:"column",alignItems:"center",gap:8,cursor:"pointer",gridColumn:(i===QUICK_LOG_ACTIONS.length-1&&QUICK_LOG_ACTIONS.length%2===1)?"1 / -1":undefined}}>
           <span style={{fontSize:26}} aria-hidden="true">{a.emoji}</span>
           <span style={{fontSize:T.sm,fontWeight:600}}>{a.label}</span>
+          {a.hint&&<span style={{fontSize:T.label,color:C.muted,marginTop:-4}}>{a.hint}</span>}
           {a.id==="supplement"&&dueCount>0&&<span style={{position:"absolute",top:8,right:8,minWidth:18,height:18,borderRadius:9,background:C.orange,color:"#000",fontSize:10,fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 4px"}}>{dueCount}</span>}
         </button>
       ))}
@@ -10121,7 +10328,11 @@ function App(){
     if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode}));}
     else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}));
       const npValid=newProduct&&(newProduct.name||"").trim().length>0&&((newProduct.kcal||0)>0||(newProduct.p||0)>0||(newProduct.c||0)>0||(newProduct.f||0)>0);
-      if(npValid)setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);}
+      if(npValid){
+        const isNewProduct=!products.some(x=>x.name.toLowerCase()===newProduct.name.toLowerCase());
+        setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);
+        if(isNewProduct&&!newProduct.subtitle)fillSubtitleFor(newProduct.name,profile.apiKey,setProducts);
+      }}
   };
   const handleQuickMealAdd=entry=>{addEntryQuick(entry);setQuickAction(null);};
   const quickDueMeds=dueMedReminders(medications,medLog);
@@ -10198,7 +10409,6 @@ function App(){
     </button>}
     {quickAction==="picker"&&<QuickLogPicker dueCount={quickDueMeds.length} onClose={()=>setQuickAction(null)} onPick={id=>setQuickAction(id)}/>}
     {quickAction==="meal"&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleQuickMealAdd} onAddKeepOpen={addEntryQuick} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey} aiPrefs={profile.aiPrefs} initialMode="quick" mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
-    {quickAction==="barcode"&&<BarcodeScanSheet onAdd={handleQuickMealAdd} onAddKeepOpen={addEntryQuick} onClose={()=>setQuickAction(null)} onPickLabels={()=>setQuickAction("meal")} apiKey={profile.apiKey}/>}
     {quickAction==="weight"&&<QuickWeightSheet weights={weights} setWeights={setWeights} onClose={()=>setQuickAction(null)}/>}
     {quickAction==="activity"&&<AddActSheet onAdd={act=>{setDayData(p=>({...p,activities:[...(p.activities||[]),act]}));setQuickAction(null);}} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey} weightKg={latestWeight}/>}
     {quickAction==="steps"&&<QuickStepsSheet dayData={dayData} setDayData={setDayData} onClose={()=>setQuickAction(null)}/>}

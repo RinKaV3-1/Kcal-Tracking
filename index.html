@@ -159,6 +159,21 @@ const catById=id=>PRODUCT_CATEGORIES.find(c=>c.id===id);
 // in setProducts (and once to whatever was already in storage at boot) fixes every consumer at
 // once instead of patching a dozen render sites individually.
 const sortProducts = arr => [...(arr||[])].sort((a,b)=>(a.name||"").localeCompare(b.name||"",undefined,{sensitivity:"base"}));
+// A meal prep that's fully eaten used to just sit in the "Finished" list forever — nothing ever
+// removed it. Stamps `finishedAt` the moment a prep first hits zero remaining (portions or
+// grams, whichever the prep tracks), clears that stamp if it's ever topped back up (editing
+// remaining back above zero un-finishes it), and drops any prep that's been finished for 14+
+// days. Applied both at boot (a prep can go stale while the app is closed) and on every write
+// through setMealPreps, so no single decrement site has to remember to call it.
+const MEAL_PREP_FINISHED_TTL_MS = 14*24*60*60*1000;
+const pruneFinishedPreps = (preps, now=Date.now()) => (preps||[])
+  .map(prep=>{
+    const isFinished = (prep.remaining??prep.targetPortions??1)<=0 || (prep.remainingWeightG!=null && prep.remainingWeightG<=0);
+    if (isFinished && !prep.finishedAt) return {...prep, finishedAt: now};
+    if (!isFinished && prep.finishedAt) return {...prep, finishedAt: null};
+    return prep;
+  })
+  .filter(prep => !(prep.finishedAt && (now-prep.finishedAt) > MEAL_PREP_FINISHED_TTL_MS));
 // Sort choices for the Food tab's product list specifically — name stays the global default
 // (every "pick a label" picker elsewhere in the app relies on `products` already being
 // name-sorted, via sortProducts above), but browsing your own label list benefits from being
@@ -1898,7 +1913,10 @@ function getDT(profile,dayType,weight,extraBurn=0,hasLoggedActivity=false,dailyS
   // for an average adult but is a huge fraction of a small person's day — a −600 cut on a
   // 1400 kcal maintenance is a 43% deficit. Cap the adjustment at 25% of maintenance in
   // either direction so the aggressiveness of a goal scales with the body it applies to.
-  const requested = GOAL_DEFICIT[profile.goalSubmode||profile.goal||"cut"] ?? GOAL_DEFICIT[profile.goal||"cut"] ?? 0;
+  // "custom" is a real submode id (set alongside profile.customDeficit by the Goal Mode card's
+  // own number field), not one of the three fixed presets in GOAL_DEFICIT — resolve it first.
+  const requested = profile.goalSubmode==="custom" ? (profile.customDeficit||0)
+    : GOAL_DEFICIT[profile.goalSubmode||profile.goal||"cut"] ?? GOAL_DEFICIT[profile.goal||"cut"] ?? 0;
   const maxSwing = Math.round(base*0.25);
   const adj = Math.max(-maxSwing, Math.min(maxSwing, requested));
   const kcal = Math.round(base + adj);
@@ -1989,7 +2007,7 @@ function dayHitKcalGoal(log, profile, weightForDay, gymSessions) {
   const consumed = log.meals.reduce((a,m)=>a+(m.kcal||0),0);
   if (consumed <= 0) return false;
   const goal = log.goalMode || profile?.goal || "maintain";
-  const histProfile = {...(profile||{}), goal, goalSubmode: log.goalSubmode || goal};
+  const histProfile = {...(profile||{}), goal, goalSubmode: log.goalSubmode || goal, customDeficit: log.customDeficit ?? profile?.customDeficit};
   const actBurn = (log.activities||[]).reduce((s,a)=>s+(a.kcal||0),0) + (log.burnedExtra||0);
   const target = getDT(histProfile, log.dayType||"rest", weightForDay, actBurn,
                        (log.activities||[]).length>0, log.dailySteps||0, gymSessions).kcal;
@@ -2141,7 +2159,7 @@ function dayXpBreakdown({date, log, profile, weightForDay, gymSessions, medicati
   if (log && dayHitKcalGoal(log, profile, weightForDay, gymSessions)) parts.push({key:"kcal", label:"Calorie target hit", xp:XP.KCAL_GOAL});
   if (log && meals.length){
     const goal = log.goalMode || profile?.goal || "maintain";
-    const histProfile = {...(profile||{}), goal, goalSubmode: log.goalSubmode || goal};
+    const histProfile = {...(profile||{}), goal, goalSubmode: log.goalSubmode || goal, customDeficit: log.customDeficit ?? profile?.customDeficit};
     const actBurn = (log.activities||[]).reduce((s,a)=>s+(a.kcal||0),0) + (log.burnedExtra||0);
     const target = getDT(histProfile, log.dayType||"rest", weightForDay, actBurn, (log.activities||[]).length>0, log.dailySteps||0, gymSessions);
     const protein = meals.reduce((a,m)=>a+(m.protein||0),0);
@@ -2305,7 +2323,7 @@ function dayAdherence(log, date, weights, profile) {
   const dayWeight = weights.find(w=>w.date===date)?.weight;
   const wForDay = dayWeight || weights[0]?.weight || profile?.targetWeightKg || 70;
   const historicalGoal = log.goalMode || profile?.goal || "cut";
-  const histProfile = {...(profile||{}), goal: historicalGoal, goalSubmode: log.goalSubmode || historicalGoal};
+  const histProfile = {...(profile||{}), goal: historicalGoal, goalSubmode: log.goalSubmode || historicalGoal, customDeficit: log.customDeficit ?? profile?.customDeficit};
   const dayTarget = getDT(histProfile, log.dayType||"rest", wForDay, actKcal, (log.activities||[]).length>0, log.dailySteps||0);
   return {kcal:totals.kcal, protein:totals.protein, targetKcal:dayTarget?.kcal||0, targetProtein:dayTarget?.protein||0, hasLog:(log.meals||[]).length>0};
 }
@@ -2727,6 +2745,28 @@ async function aFood(imgs, ps, mt, desc, apiKey) {
   return callAI([{ type:"text", text:prompt }, ...iBlks(compressed)], apiKey, VISION_MODEL, 4096);
 }
 
+// Lighter-weight analyzer for a FEW extra items alongside an already-selected meal prep (or
+// mid-meal add) — reuses the same photo pipeline as aFood but skips its long scale-digit-reading
+// rules and full-pantry context, both built for a precision full-meal breakdown. Those made the
+// giant aFood prompt more likely to come back truncated or empty for what is usually 1-3 small
+// additional items photographed loosely (a sauce jar, a side, ingredients being assembled) rather
+// than each carefully weighed on a scale — this is the flow behind the "Empty response" report
+// from Photo Extras in a meal-prep log. A leaner prompt is a more reliable one.
+async function aExtras(imgs, ps, desc, apiKey) {
+  const c = await prepImgs(imgs);
+  const prompt = "Identify each distinct food item shown across these photo(s)" + (desc ? " and this description: \"" + desc + "\"" : "") + ".\n"
+    + "These are a FEW EXTRA items being added alongside an already-logged meal — not a precision scale-by-scale breakdown, so estimate reasonably from what's visible rather than requiring an exact reading.\n"
+    + "Known products per 100g (use when a package/brand is recognisable): " + pCtx(ps) + "\n\n"
+    + "RULES:\n"
+    + "1. List every distinct item — small additions (sauce, garnish, a side) still count. Skip anything that clearly isn't food (packaging, a scale on its own, hands).\n"
+    + "2. weightG: use a scale reading if one is clearly shown, otherwise a realistic typical portion for that item.\n"
+    + "3. Per item, kcal/protein/carbs/fat MUST be PER-100g reference values (NOT scaled to weight). Match a known product exactly when recognisable, otherwise use standard reference values for that food.\n"
+    + "4. If genuinely nothing food-related is identifiable in the photos, return an empty ingredients array — do not guess an item that isn't there.\n\n"
+    + "Reply ONLY with this JSON:\n"
+    + '{"ingredients":[{"name":"","weightG":0,"kcal":0,"protein":0,"carbs":0,"fat":0}]}';
+  return callAI([{ type:"text", text:prompt }, ...iBlks(c)], apiKey, VISION_MODEL, 2048);
+}
+
 async function aAct(imgs, apiKey) {
   const c = await prepImgs(imgs);
   return callAI([
@@ -2768,6 +2808,7 @@ async function aPrep(imgs, ps, desc, apiKey) {
       + "4. estimatedWeightG = sum of all ingredient weightG.\n"
       + "5. For each ingredient FROM A SCALE PHOTO, include a '_scaleRead' field with the literal digits you saw bright on the scale (e.g. '47', '6', '108'). For a package-only ingredient with no scale, omit _scaleRead or leave it empty — do not invent a scale reading that was never shown.\n"
       + "6. CRITICAL — raw vs cooked, generic vs branded: if the description or photo says 'raw' (e.g. 'raw chicken breast'), use the RAW reference value below — do NOT substitute a cooked or breaded branded product even if its name overlaps. The cooking state the user specifies always wins over name similarity to a known product.\n"
+      + "   MEAT/FISH ON A SCALE — determine the cooking state from what the photo actually shows, not just the description: raw meat is typically pink/red and either in its shop packaging or on a plate/board pre-cook; a scale photo showing meat IN A FRYING PAN, on a baking tray, browned/seared, or already mixed into a cooked dish means it was weighed AFTER cooking — use the COOKED per-100g reference for it, and NAME the ingredient with that cooking word (e.g. 'Fried Beef Mince', 'Grilled Chicken Breast', not bare 'Beef' or 'Chicken') so the weight itself is understood to already be in its finished state, not raw. Guessing 'raw' by default for an ambiguous meat/fish photo is the more common mistake — look for pan/tray/browning cues before defaulting to raw.\n"
       + "   Generic reference per-100g (use when not clearly a specific known branded product):\n"
       + "   • Raw chicken breast (skinless): ~110-120 kcal, 22-23g P, 0g C, 1.5-2.5g F\n"
       + "   • Cooked/grilled chicken breast (no breading): ~160-175 kcal, 30-31g P, 0g C, 3.5-4g F\n"
@@ -2799,16 +2840,42 @@ async function aSubtitle(name, apiKey) {
   ], apiKey, TEXT_MODEL, 100);
   return res?.subtitle || "";
 }
-// Products created from a barcode scan (Open Food Facts has no generic-category tag) used to be
-// saved with no subtitle at all, unlike ones created by scanning a label photo. This fills it in
-// afterwards in the background — same short generic tag ("Beef", "Protein Bar") — and only ever
-// sets it on a product that still has none, so it can't overwrite anything the user typed.
-async function fillSubtitleFor(name, apiKey, setProducts) {
+// Which of the app's own fixed category ids best fits this product — Open Food Facts (barcode
+// lookups) has no category field at all, so a scanned product otherwise landed permanently under
+// "No category" unless the user filed it manually. Returns null (never guesses) rather than an id
+// outside the fixed list, so an unmatched product still safely falls through to uncategorized.
+async function aCategorize(name, apiKey) {
+  const res = await callAI([
+    { type:"text", text:"Given this product name: \"" + name + "\"\n"
+      + "Pick the SINGLE best-fitting category id from this fixed list (id: what it covers):\n"
+      + PRODUCT_CATEGORIES.map(c=>`${c.id}: ${c.label}`).join("\n") + "\n"
+      + "Reply ONLY with JSON, no explanation:\n"
+      + '{"categoryId":""}' }
+  ], apiKey, TEXT_MODEL, 60);
+  const id = res?.categoryId;
+  return PRODUCT_CATEGORIES.some(c => c.id === id) ? id : null;
+}
+// Products created from a barcode scan (Open Food Facts has no generic-category tag, or any
+// category at all) used to be saved with no subtitle AND no category, unlike ones filled in by
+// hand or scanned from a label photo (which at least gets a subtitle). This fills in both in the
+// background — one round-trip, subtitle and category requested together — and only ever sets a
+// field that's still empty, so it can never overwrite anything the user typed or picked.
+async function autoClassifyProduct(name, apiKey, setProducts) {
   if (!name || !apiKey || !setProducts) return;
   try {
-    const s = await aSubtitle(name, apiKey);
-    if (s) setProducts(prev => prev.map(p => (p.name === name && !p.subtitle) ? { ...p, subtitle: s } : p));
-  } catch { /* the subtitle is a nice-to-have, never worth surfacing an error for */ }
+    const [subtitle, categoryId] = await Promise.all([
+      aSubtitle(name, apiKey).catch(() => ""),
+      aCategorize(name, apiKey).catch(() => null),
+    ]);
+    if (!subtitle && !categoryId) return;
+    setProducts(prev => prev.map(p => {
+      if (p.name !== name) return p;
+      const patch = {};
+      if (subtitle && !p.subtitle) patch.subtitle = subtitle;
+      if (categoryId && !(p.categories || []).length) patch.categories = [categoryId];
+      return Object.keys(patch).length ? { ...p, ...patch } : p;
+    }));
+  } catch { /* both are nice-to-haves, never worth surfacing an error for */ }
 }
 
 // Per-ingredient AI estimate: cheap text-only call returning per-100g macros
@@ -3636,7 +3703,13 @@ const COOK_YIELD = [
 ];
 // Already in its finished state — cooked leftovers, canned/tinned goods (already hydrated), or
 // explicitly described as cooked — so no yield adjustment applies.
-const ALREADY_COOKED_RE = /\b(cooked|canned|tinned|pre-?cooked|ready.?to.?eat|leftover)\b/i;
+// "cooked" alone missed the actual report: a fried/grilled/roasted beef mince weighed AFTER
+// cooking (common meal-prep workflow — cook first, then portion into containers) still got the
+// raw-weight shrink factor applied on top of weight that was already in its final, cooked state,
+// understating the finished dish weight twice over. Every specific cooking-method word counts as
+// "already cooked", matching the vocabulary IngredientConfirmPanel's own PREP_WORDS/cookedWords
+// already use to detect a prepared state.
+const ALREADY_COOKED_RE = /\b(cooked|canned|tinned|pre-?cooked|ready.?to.?eat|leftover|fried|pan-?fried|stir-?fried|deep-?fried|grilled|baked|roasted|boiled|steamed|poached|braised|stewed|seared|smoked|breaded)\b/i;
 function cookYieldFactor(name) {
   const n = (name||"").toLowerCase();
   if (!n || ALREADY_COOKED_RE.test(n)) return 1;
@@ -4455,7 +4528,7 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
           <ImgZone imgs={photoImgs} setImgs={setPhotoImgs} compact maxPhotos={15}/>
           <textarea value={photoDesc} onChange={e=>setPhotoDesc(e.target.value)} rows={1} placeholder="Optional description (e.g. 'green beans 100g + soy sauce')" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"7px 10px",color:C.text,fontSize:12,outline:"none",resize:"none",marginTop:7,fontFamily:"inherit"}}/>
           {photoErr&&<div style={{background:"#1e0a0a",border:"1px solid #5a1a1a",borderRadius:6,padding:"6px 9px",fontSize:11,color:"#ff8080",marginTop:7,wordBreak:"break-word"}}>{photoErr}</div>}
-          {photoImgs.length>0&&<button onClick={async()=>{setPhotoLoading(true);setPhotoErr(null);try{const r=await aFood(photoImgs,products,"home",photoDesc,apiKey);if(r?.ingredients?.length){setPhotoIngs(r.ingredients);}else{setPhotoErr("No ingredients detected — try a clearer photo or use Manual.");}}catch(e){setPhotoErr(String(e.message||e));}setPhotoLoading(false);}} disabled={photoLoading} style={{width:"100%",padding:"9px 0",borderRadius:8,background:photoLoading?C.faint:C.blue,color:"#000",fontWeight:700,border:"none",cursor:photoLoading?"default":"pointer",fontSize:12,marginTop:8}}>{photoLoading?"Analyzing…":"🔍 Analyze"}</button>}
+          {photoImgs.length>0&&<button onClick={async()=>{setPhotoLoading(true);setPhotoErr(null);try{const r=await aExtras(photoImgs,products,photoDesc,apiKey);if(r?.ingredients?.length){setPhotoIngs(r.ingredients);}else{setPhotoErr("No ingredients detected — try a clearer photo or use Manual.");}}catch(e){setPhotoErr(String(e.message||e));}setPhotoLoading(false);}} disabled={photoLoading} style={{width:"100%",padding:"9px 0",borderRadius:8,background:photoLoading?C.faint:C.blue,color:"#000",fontWeight:700,border:"none",cursor:photoLoading?"default":"pointer",fontSize:12,marginTop:8}}>{photoLoading?"Analyzing…":"🔍 Analyze"}</button>}
           <AnalyzeProgress active={photoLoading} photoCount={photoImgs.length}/>
         </>):(<>
           <div style={{fontSize:11,color:C.muted,marginBottom:7}}>Confirm what was detected — adjust weights as needed:</div>
@@ -5105,7 +5178,7 @@ function CreatePrepSheet({products,onSave,onClose,apiKey,setProducts}){
       setPickedG(res.servingG?String(res.servingG):"100");
       if(setProducts&&!products.some(p=>p.name.toLowerCase()===res.name.toLowerCase())){
         setProducts(prev=>[...prev,{name:res.name,kcal:res.kcal,p:res.p,c:res.c,f:res.f,packSizeG:res.packSizeG,servingG:res.servingG,barcode:res.barcode,categories:[],addedAt:Date.now()}]);
-        fillSubtitleFor(res.name,apiKey,setProducts);
+        autoClassifyProduct(res.name,apiKey,setProducts);
       }
       setShowPrepScan(false);setPrepScanLooking(false);
     }catch(e){setPrepScanErr(String(e.message||e));setPrepScanLooking(false);}
@@ -5587,8 +5660,8 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
   // Commits one logged entry without closing the sheet — lets a barcode scan keep it open for
   // another item instead of forcing one-at-a-time exits.
   const addEntry=entry=>{
-    if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode}));}
-    else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}));
+    if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode,customDeficit:profile.customDeficit}));}
+    else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode,customDeficit:profile.customDeficit}));
       // Auto-saving whatever the AI put in `newProduct` with no validation let a low-confidence
       // or generic-reference guess (e.g. a bare "Chicken Breast (cooked, boneless, skinless)"
       // instead of an actual brand read off a label) permanently contaminate the pantry — after
@@ -5599,7 +5672,7 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
       if(npValid){
         const isNewProduct=!products.some(x=>x.name.toLowerCase()===newProduct.name.toLowerCase());
         setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);
-        if(isNewProduct&&!newProduct.subtitle)fillSubtitleFor(newProduct.name,profile.apiKey,setProducts);
+        if(isNewProduct&&(!newProduct.subtitle||!(newProduct.categories||[]).length))autoClassifyProduct(newProduct.name,profile.apiKey,setProducts);
       }}
   };
   const handleAdd=entry=>{addEntry(entry);setModal(null);};
@@ -5712,7 +5785,7 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
           {activeDayTypes().map(d=>{
             const active=dayData.dayType===d.id;
             const tKcal=getDT(profile,d.id,latestWeight,0,false,dailySteps,gymSessions).kcal;
-            return(<button key={d.id} onClick={()=>setDayData(p=>({...p,dayType:d.id,goalMode:profile.goal,goalSubmode:profile.goalSubmode}))}
+            return(<button key={d.id} onClick={()=>setDayData(p=>({...p,dayType:d.id,goalMode:profile.goal,goalSubmode:profile.goalSubmode,customDeficit:profile.customDeficit}))}
               className="no-hit"
               style={{flexShrink:0,minWidth:84,minHeight:72,padding:`${SP.sm}px ${SP.md}px`,borderRadius:R.md,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,fontWeight:active?700:500,textAlign:"center"}}>
               <div style={{fontSize:18,lineHeight:1.2}}>{d.icon}</div>
@@ -7323,7 +7396,19 @@ function WeightProgressCard({profile,weights,setWeights,weightPhases,setWeightPh
   const overallDelta=firstW&&latestW?latestW.weight-firstW.weight:null;
   const logWeight=()=>{const w=parseNum(wInput);if(!w)return;const date=wDate||TODAY();const e={date,weight:w};setWeights(p=>[e,...p.filter(x=>x.date!==date)].sort((a,b)=>b.date.localeCompare(a.date)));setWInput("");setWDate(TODAY());};
   const saveEditW=i=>{const w=parseNum(editWVal);if(!w)return;setWeights(p=>{const n=[...p];n[i]={...n[i],weight:w};return n.sort((a,b)=>b.date.localeCompare(a.date));});setEditWIdx(null);};
-  const wSpark=[...weights].reverse().slice(-20);
+  // Graph range: what the trend line covers. "Beginning" (every log ever) used to be the only
+  // option, which mixes whatever a previous phase did (a bulk's rise, say) into a line that's
+  // supposed to read as "how is THIS phase going" — a phase transition looks like a kink in an
+  // otherwise unrelated trend. "Phase" and "Custom" scope the same graph to just the stretch
+  // that's actually relevant right now.
+  const [wRangeMode,setWRangeMode]=useState("beginning"); // "beginning" | "phase" | "custom"
+  const [wRangeCustomDate,setWRangeCustomDate]=useState("");
+  const wActivePhase=(weightPhases||[]).find(p=>!p.endDate)||null;
+  const wRangeStart = wRangeMode==="phase" ? (wActivePhase?.startDate||null)
+    : wRangeMode==="custom" ? (wRangeCustomDate||null)
+    : null;
+  const wRangedWeights = wRangeStart ? weights.filter(w=>w.date>=wRangeStart) : weights;
+  const wSpark=[...wRangedWeights].reverse();
   const wVals=wSpark.map(w=>w.weight);
   const wMin=wVals.length?Math.min(...wVals)-0.5:65;const wMax=wVals.length?Math.max(...wVals)+0.5:70;
   const WW=310,WH=80;
@@ -7411,6 +7496,15 @@ function WeightProgressCard({profile,weights,setWeights,weightPhases,setWeightPh
         {latestW&&<div style={{display:"flex",alignItems:"baseline",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}><span style={{fontFamily:"monospace",fontSize:18,fontWeight:800,color:C.lime}}>{latestW.weight.toFixed(2)}</span><span style={{fontSize:12,color:C.muted}}>kg</span>{overallDelta!==null&&<span style={{fontFamily:"monospace",fontSize:11,color:overallDelta<0?C.lime:C.red}} title={"Total change since first log on "+firstW.date}>{overallDelta<0?"↓":"↑"}{Math.abs(overallDelta).toFixed(2)} since start</span>}</div>}
       </button>
       {weightLogOpen&&(<>
+      {weights.length>=4&&(<div style={{marginBottom:6}}>
+        <div style={{display:"flex",gap:4}}>
+          {[["beginning","Beginning"],["phase",wActivePhase?"This phase":null],["custom","Custom date"]].filter(([,lbl])=>lbl).map(([mode,lbl])=>{
+            const on=wRangeMode===mode;
+            return(<button key={mode} onClick={()=>setWRangeMode(mode)} style={{flex:1,padding:"5px 4px",borderRadius:7,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,fontWeight:on?700:400,cursor:"pointer",fontSize:10}}>{lbl}</button>);
+          })}
+        </div>
+        {wRangeMode==="custom"&&<input type="date" aria-label="Graph range start date" value={wRangeCustomDate} max={TODAY()} onChange={e=>setWRangeCustomDate(e.target.value)} style={{width:"100%",boxSizing:"border-box",marginTop:5,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:7,padding:"6px 9px",color:C.lime,fontSize:12,fontFamily:"monospace",outline:"none"}}/>}
+      </div>)}
       {wSpark.length>=4&&(<svg width={WW} height={WH} style={{display:"block",marginBottom:6,overflow:"visible"}}>
         {wTrend!==null&&wSpark.length>=4&&(()=>{const startV=wSpark[0].weight;const endV=wSpark[wSpark.length-1].weight+(wTrend/7*(wSpark.length-1));return<line x1={0} y1={wpy(startV)} x2={WW} y2={wpy(Math.min(wMax-0.1,Math.max(wMin+0.1,endV)))} stroke={wTrend<0?C.lime+"60":C.red+"60"} strokeWidth={1} strokeDasharray="3 3"/>;})()}
         <polyline points={wSpark.map((d,i)=>wpx(i)+","+wpy(d.weight)).join(" ")} fill="none" stroke={C.lime+"50"} strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round"/>
@@ -8305,9 +8399,14 @@ function FoodTab({mealPreps,setMealPreps,products,setProducts,profile,weights,we
         servingG:res.servingG?String(res.servingG):f.servingG,
         barcode:res.barcode||code}));
       setShowLabelScan(false);setLabelScanLooking(false);
-      // Open Food Facts has no generic category tag, so generate the subtitle here exactly as a
-      // label-photo scan does (background, silent on failure, never overwrites a typed value).
-      if(name&&profile.apiKey){aSubtitle(name,profile.apiKey).then(s=>{if(s)setPForm(f=>(f.name===name&&!f.subtitle)?{...f,subtitle:s}:f);}).catch(()=>{});}
+      // Open Food Facts has no generic category tag or subtitle at all, so both are generated
+      // here in the background (silent on failure, never overwrites a typed value or a category
+      // already picked) — the product this becomes shouldn't be the one that always lands under
+      // "No category" just because it came from a barcode instead of a label photo.
+      if(name&&profile.apiKey){
+        aSubtitle(name,profile.apiKey).then(s=>{if(s)setPForm(f=>(f.name===name&&!f.subtitle)?{...f,subtitle:s}:f);}).catch(()=>{});
+        aCategorize(name,profile.apiKey).then(cid=>{if(cid)setPForm(f=>(f.name===name&&!(f.categories||[]).length)?{...f,categories:[cid]}:f);}).catch(()=>{});
+      }
       const dupIdx=products.findIndex(x=>x.name.trim().toLowerCase()===name.trim().toLowerCase());
       if(dupIdx>=0&&name){const np=buildProductFromForm({name,kcal:res.kcal,p:res.p,c:res.c,f:res.f,servingG:res.servingG?String(res.servingG):"",packSizeG:res.packSizeG?String(res.packSizeG):"",alwaysFullPack:false,categories:[],supermarkets:[],subtitle:"",barcode:res.barcode||code});setSaveToast({type:"duplicate",name,dupIdx,np});}
     }catch(e){setLabelScanErr(String(e.message||e));setLabelScanLooking(false);}
@@ -8971,7 +9070,7 @@ function HistoryTab({weights,setWeights,weightPhases,setWeightPhases,products,pr
         // the user switched modes. Lock goalSubmode too: prefer the day's own stored submode if
         // we have one (future days, once stamped below), else fall back to the historical goal
         // itself so GOAL_DEFICIT[historicalGoal] is used rather than today's submode.
-        const histProfile = {...(profile||{}), goal: historicalGoal, goalSubmode: log.goalSubmode || historicalGoal};
+        const histProfile = {...(profile||{}), goal: historicalGoal, goalSubmode: log.goalSubmode || historicalGoal, customDeficit: log.customDeficit ?? profile?.customDeficit};
         const dayTarget = getDT(histProfile, log.dayType||"rest", wForDay, fullActBurn, (log.activities||[]).length>0, log.dailySteps||0);
         const targetKcal = dayTarget?.kcal || 0;
         // Status: how does today's intake compare to target, given the goal?
@@ -9558,7 +9657,36 @@ function SettingsTab({profile,setProfile,weights,weightPhases,setWeightPhases,la
         }}
       />}
       {(!profile.birthday||!profile.heightCm)?<div style={{fontSize:T.body,color:C.muted}}>Complete Personal Info to enable personalized targets.</div>:(<>
-        <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:12}}>{GOALS.map(g=>{const active=profile.goal===g.id;const col=g.col;return(<div key={g.id}><button onClick={()=>{if(!active)setPendingGoal(g.id);}} style={{width:"100%",padding:"12px 14px",borderRadius:10,border:`1px solid ${active?col:C.border}`,background:active?col+"15":C.bg,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontSize:T.body,fontWeight:active?700:500,color:active?col:C.text}}>{g.emoji} {g.label}</div><div style={{fontSize:11,color:C.muted,marginTop:2}}>{g.desc||g.submodes?.[1]?.desc}</div></div>{active&&<span style={{color:col,fontSize:18}}>✓</span>}</button>{active&&g.submodes&&(<div style={{display:"flex",flexDirection:"column",gap:4,marginTop:4,marginLeft:10}}>{g.submodes.map(sub=>(<button key={sub.id} onClick={()=>setProfile(p=>({...p,goalSubmode:sub.id}))} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${profile.goalSubmode===sub.id?col:C.border}`,background:profile.goalSubmode===sub.id?col+"22":C.bg,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{fontSize:12,fontWeight:profile.goalSubmode===sub.id?700:400,color:profile.goalSubmode===sub.id?col:C.muted}}>{sub.label}</div><div style={{fontSize:T.sm,color:C.muted,marginTop:1}}>{sub.desc}</div></div>{profile.goalSubmode===sub.id&&<span style={{color:col,fontSize:T.body}}>✓</span>}</button>))}</div>)}</div>);})}</div>
+        <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:12}}>{GOALS.map(g=>{
+          const active=profile.goal===g.id;const col=g.col;
+          const isCustom=active&&profile.goalSubmode==="custom";
+          return(<div key={g.id}>
+            <button onClick={()=>{if(!active)setPendingGoal(g.id);}} style={{width:"100%",padding:"12px 14px",borderRadius:10,border:`1px solid ${active?col:C.border}`,background:active?col+"15":C.bg,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div><div style={{fontSize:T.body,fontWeight:active?700:500,color:active?col:C.text}}>{g.emoji} {g.label}</div><div style={{fontSize:11,color:C.muted,marginTop:2}}>{g.desc||g.submodes?.[1]?.desc}</div></div>
+              {active&&<span style={{color:col,fontSize:18}}>✓</span>}
+            </button>
+            {active&&g.submodes&&(<div style={{display:"flex",flexDirection:"column",gap:4,marginTop:4,marginLeft:10}}>
+              {g.submodes.map(sub=>(<button key={sub.id} onClick={()=>setProfile(p=>({...p,goalSubmode:sub.id}))} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${profile.goalSubmode===sub.id?col:C.border}`,background:profile.goalSubmode===sub.id?col+"22":C.bg,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div><div style={{fontSize:12,fontWeight:profile.goalSubmode===sub.id?700:400,color:profile.goalSubmode===sub.id?col:C.muted}}>{sub.label}</div><div style={{fontSize:T.sm,color:C.muted,marginTop:1}}>{sub.desc}</div></div>
+                {profile.goalSubmode===sub.id&&<span style={{color:col,fontSize:T.body}}>✓</span>}
+              </button>))}
+              {/* A custom amount alongside the three fixed presets — someone whose coach/plan
+                  calls for e.g. exactly −350 kcal had no way to land on that number before,
+                  only the nearest preset. Sign follows the goal (cut always subtracts, bulk
+                  always adds) so the field only ever asks for a magnitude. */}
+              <button onClick={()=>setProfile(p=>({...p,goalSubmode:"custom",customDeficit:p.customDeficit||(g.id==="bulk"?300:-400)}))} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${isCustom?col:C.border}`,background:isCustom?col+"22":C.bg,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div><div style={{fontSize:12,fontWeight:isCustom?700:400,color:isCustom?col:C.muted}}>✏️ Custom</div><div style={{fontSize:T.sm,color:C.muted,marginTop:1}}>Set your own {g.id==="bulk"?"surplus":"deficit"} amount</div></div>
+                {isCustom&&<span style={{color:col,fontSize:T.body}}>✓</span>}
+              </button>
+              {isCustom&&(<div style={{display:"flex",alignItems:"center",gap:8,padding:"2px 12px 6px"}}>
+                <span style={{fontSize:13,color:C.muted,fontWeight:700}}>{g.id==="bulk"?"+":"−"}</span>
+                <input type="text" inputMode="numeric" pattern="[0-9]*" value={Math.abs(profile.customDeficit||0)||""}
+                  onChange={e=>{const mag=parseInt(e.target.value.replace(/\D/g,""))||0;setProfile(p=>({...p,customDeficit:g.id==="bulk"?mag:-mag}));}}
+                  placeholder="e.g. 350" style={{width:90,minHeight:36,boxSizing:"border-box",background:C.bg,border:`1px solid ${col}`,borderRadius:6,padding:"6px 9px",color:col,fontSize:T.body,fontFamily:"monospace",fontWeight:700,outline:"none"}}/>
+                <span style={{fontSize:11,color:C.muted}}>kcal/day</span>
+              </div>)}
+            </div>)}
+          </div>);})}</div>
         {profile.temporaryGoal&&<div style={{background:"#141414",border:`1px solid ${C.orange}40`,borderRadius:10,padding:"10px 14px",marginBottom:10}}>
           <div style={{fontSize:12,color:C.orange,fontWeight:600,marginBottom:3}}>🔄 Temporary {profile.goal} active</div>
           <div style={{fontSize:11,color:C.muted}}>Reverts to <b>{profile.temporaryGoal.originalGoal}</b> on {new Date(profile.temporaryGoal.revertDate+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</div>
@@ -10104,7 +10232,9 @@ function App(){
     const bootDefaultDayType = (Array.isArray(gSchedule)?gSchedule:[]).includes(new Date(bootDate+"T12:00:00").getDay()) ? "gym" : "rest";
     const day=await store.get(`fit_day_${bootDate}`,{date:bootDate,dayType:bootDefaultDayType,meals:[],activities:[],burnedExtra:0,tags:[],goalMode:null});
     if(!day.activities)day.activities=[];if(!day.tags)day.tags=[];
-    const wts=await store.get("fit_weights",[]);const preps=await store.get("fit_mealpreps",[]);
+    const wts=await store.get("fit_weights",[]);
+    const rawPreps=await store.get("fit_mealpreps",[]);const preps=pruneFinishedPreps(rawPreps);
+    if(preps.length!==rawPreps.length) store.set("fit_mealpreps",preps); // drop anything that expired while the app was closed
     const prof=await store.get("fit_profile",null)||DEFAULT_PROFILE;const photos=await store.get("fit_photos",[]);
     const phases=await store.get("fit_weight_phases",[]);
     let gTemplates=await store.get("fit_gym_templates",{});
@@ -10206,7 +10336,7 @@ function App(){
   const setDayData=useCallback(upd=>{setDayData_(prev=>{const next=typeof upd==="function"?upd(prev):upd;store.set(`fit_day_${today}`,next);addToIndex(today);return next;});},[today]);
   const setWeights=useCallback(upd=>{setWeights_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_weights",n);return n;});},[]);
   const setProducts=useCallback(upd=>{setProducts_(p=>{const n=sortProducts(typeof upd==="function"?upd(p):upd);store.set("fit_products",n);return n;});},[]);
-  const setMealPreps=useCallback(upd=>{setMealPreps_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_mealpreps",n);return n;});},[]);
+  const setMealPreps=useCallback(upd=>{setMealPreps_(p=>{const n=pruneFinishedPreps(typeof upd==="function"?upd(p):upd);store.set("fit_mealpreps",n);return n;});},[]);
   const setProfile=useCallback(upd=>{setProfile_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_profile",n);return n;});},[]);
   const setProgressPhotos=useCallback(upd=>{setProgressPhotos_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_photos",n);return n;});},[]);
   const setWeightPhases=useCallback(upd=>{setWeightPhases_(p=>{const n=typeof upd==="function"?upd(p):upd;store.set("fit_weight_phases",n);return n;});},[]);
@@ -10325,13 +10455,13 @@ function App(){
   // Commits one logged entry without closing Quick Log — lets a barcode scan (or any future
   // multi-add flow) keep the sheet open for another item instead of forcing one-at-a-time exits.
   const addEntryQuick=entry=>{
-    if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode}));}
-    else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}));
+    if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode,customDeficit:profile.customDeficit}));}
+    else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode,customDeficit:profile.customDeficit}));
       const npValid=newProduct&&(newProduct.name||"").trim().length>0&&((newProduct.kcal||0)>0||(newProduct.p||0)>0||(newProduct.c||0)>0||(newProduct.f||0)>0);
       if(npValid){
         const isNewProduct=!products.some(x=>x.name.toLowerCase()===newProduct.name.toLowerCase());
         setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);
-        if(isNewProduct&&!newProduct.subtitle)fillSubtitleFor(newProduct.name,profile.apiKey,setProducts);
+        if(isNewProduct&&(!newProduct.subtitle||!(newProduct.categories||[]).length))autoClassifyProduct(newProduct.name,profile.apiKey,setProducts);
       }}
   };
   const handleQuickMealAdd=entry=>{addEntryQuick(entry);setQuickAction(null);};
@@ -10394,7 +10524,7 @@ function App(){
     )}
     <div style={{flex:1,overflow:"hidden"}}>
       {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} setProfile={setProfile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("more")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence} progress={progress} gymSessions={gymSessions} gymDayAssign={gymDayAssign} mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
-      {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes} onLogMeal={meal=>setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode}))} gymSessions={gymSessions}/>}
+      {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes} onLogMeal={meal=>setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode,customDeficit:profile.customDeficit}))} gymSessions={gymSessions}/>}
       {viewTab==="training"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymDayAssign={gymDayAssign} setGymDayAssign={setGymDayAssign} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary} onFinishSession={finishGymSession}/>}
       {viewTab==="progress"&&<HistoryTab weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} products={products} profile={profile} medications={medications} medLog={medLog} progress={progress} onLogMed={logMedFor} onUnlogMed={unlogMed}/>}
       {viewTab==="more"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight} medications={medications} setMedications={setMedications} dayTypes={dayTypes} setDayTypes={setDayTypes} onGoToProgress={()=>setTab("progress")}/>}

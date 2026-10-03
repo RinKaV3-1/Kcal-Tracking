@@ -1624,11 +1624,11 @@ function getLastPerformance(exerciseName, gymSessions) {
 }
 // Simple heuristic progression suggestion (no AI call — instant, local).
 // Two branches:
-//  - Weighted exercises: last 2 sessions both cleared a solid rep count (>=10) at the SAME
-//    weight → the weight itself isn't the limiter any more, suggest increasing it. No specific
-//    number is named — "increase the weight" survives a re-read better than a number the app
-//    guessed at, and different equipment (plates vs a pin-select machine) has different
-//    realistic increments anyway.
+//  - Weighted exercises: a rep ladder at the SAME weight (see the comment in the branch) —
+//    3x10 cleared twice → aim for 3x11, clear that → 3x12 … up to a ceiling, after which the
+//    suggestion is to add weight. No weight increment is named — "add weight" survives a
+//    re-read better than a number the app guessed at, and different equipment (plates vs a
+//    pin-select machine) has different realistic increments anyway.
 //  - Bodyweight / no-load exercises (weight never entered, e.g. heel touches, planks): weight
 //    is meaningless here, so the old logic fired the "10+ reps, same weight" message on every
 //    single session (any rep count clears 10, and "" === "" is trivially "the same weight"),
@@ -1658,12 +1658,29 @@ function suggestProgression(exerciseName, gymSessions, method) {
   const isWeighted = lastW > 0 && prevW > 0;
 
   if (isWeighted) {
-    const lastAllStrong = last.sets.every(s => (s.reps||0) >= 10);
-    const sameWeight = lastW === prevW;
-    if (lastAllStrong && sameWeight) {
-      return `Last 2 sessions all cleared 10+ reps at ${lastW}kg — consider increasing the weight or difficulty next time.`;
+    // Double progression: the weight stays put while the REP target climbs one at a time, and
+    // only once the top of the rep range is reached does the load go up. This used to say
+    // "10+ reps twice -> add weight" and then stay silent about reps entirely, so a lifter
+    // moving 3x10 -> 3x11 -> 3x12 got the same weight nag as one stuck at 3x10.
+    //   - Clear the floor (3x10) in two sessions running -> aim for 3x11.
+    //   - Once above the floor, clearing the current target (3x11) once asks for the next rep.
+    //   - "Clear" = EVERY set at or above the target, so the weakest set sets the pace.
+    //   - Past the ceiling, ask for more weight and a rebuild from the floor instead.
+    // A changed weight restarts the ladder (the new load has no history of its own yet), and a
+    // session below the previous one holds the target rather than pushing a regression further.
+    if (lastW !== prevW) return null;
+    const REP_FLOOR = 10, REP_CEILING = 15;
+    const minReps = s => s.sets.length ? Math.min(...s.sets.map(x => x.reps||0)) : 0;
+    const m1 = minReps(last), m2 = minReps(prev);
+    if (m1 < REP_FLOOR || m1 < m2) return null;
+    if (m1 === REP_FLOOR && m2 < REP_FLOOR) return null; // the floor itself needs two clears
+    const nSets = last.sets.length, target = m1 + 1;
+    if (target > REP_CEILING) {
+      return `You've reached ${nSets}×${m1} at ${lastW}kg — the top of the rep range. Next time add weight and rebuild from about ${REP_FLOOR} reps per set.`;
     }
-    return null;
+    return m1 === m2
+      ? `Cleared ${nSets}×${m1} at ${lastW}kg two sessions running — next time aim for ${nSets}×${target} at the same weight.`
+      : `Cleared ${nSets}×${m1} at ${lastW}kg — next time aim for ${nSets}×${target} at the same weight.`;
   }
 
   // Bodyweight branch — total reps across all sets, not the single-set >=10 threshold that
@@ -2628,6 +2645,14 @@ async function callAIText(content, apiKey, model, maxTokens) {
 }
 
 // Food analysis
+// Ingredient-name rule shared by every prompt that returns product names. The app links each
+// returned ingredient to one of the user's saved labels by comparing names; a model that
+// "helpfully" appends a translation or description — "Vilkyškių Liesa Varškė 0.5% (low-fat
+// curd)" — hands that comparison a name that isn't the label's, so a correctly identified
+// product ends up unmatched and has to be picked by hand. (bestMatch also ignores parenthetical
+// glosses now, but not naming them in the first place is the cleaner fix.)
+const NAME_RULE = "NAMING — the 'name' of every ingredient: if it is one of the Known products above, copy that product's name EXACTLY, character for character. If it's a packaged product that isn't in the list, use the name as printed on the package (brand + product name, original language). NEVER add a translation, description or note in parentheses or after a dash — no '(low-fat curd)', no '(toast bread)'. Put any remark in 'notes' instead.";
+
 async function aFood(imgs, ps, mt, desc, apiKey) {
   const compressed = await prepImgs(imgs);
   const ctx = pCtx(ps);
@@ -2679,6 +2704,7 @@ async function aFood(imgs, ps, mt, desc, apiKey) {
       + "3. Estimate weights from what the description says (explicit grams win) or a typical realistic home portion otherwise — do not default everything to 100g.\n"
       + "4. List every ingredient the description implies. Small additions (oil, sauce, seasoning) still count if mentioned.\n"
       + "5. Per ingredient: kcal/protein/carbs/fat MUST be PER-100g reference values (NOT scaled to weight). Top-level kcal/protein/carbs/fat = meal totals: sum of (per-100g × weightG / 100).\n\n"
+      + NAME_RULE + "\n"
       + "6. eatingOut: set true ONLY if the description clearly indicates a restaurant, fast-food chain (e.g. Hesburger, McDonald's, KFC, Burger King), café, takeaway/delivery order or canteen meal rather than something cooked at home; otherwise false.\n\n"
       + "Reply ONLY with this JSON:\n"
       + '{"type":"meal","name":"","kcal":0,"protein":0,"carbs":0,"fat":0,"totalGrams":0,"eatingOut":false,"notes":"estimated from description only","newProduct":null,"ingredients":[{"name":"","weightG":0,"kcal":0,"protein":0,"carbs":0,"fat":0}]}';
@@ -2734,6 +2760,7 @@ async function aFood(imgs, ps, mt, desc, apiKey) {
       + "4. Top-level kcal/protein/carbs/fat = meal totals (already scaled): sum of (per-100g × weightG / 100). totalGrams = sum of weightG.\n"
       + "5. Unknown product: if label visible in photo, read it and populate newProduct with brand name and per-100g macros.\n"
       + "6. For each ingredient include '_scaleRead': the literal bright digits you saw (e.g. '47', '6', '108'). If weightUncertain:true, add a brief note like 'bright digits unclear, estimated from portion'.\n"
+      + NAME_RULE + "\n"
       + "7. eatingOut: set true ONLY if the photos/description clearly show a restaurant, fast-food chain (e.g. Hesburger, McDonald's, KFC), café, takeaway/delivery or canteen meal — branded restaurant packaging, a restaurant plate, a menu/nutrition screenshot from a venue — rather than food prepared at home; otherwise false.\n\n"
       + "Reply ONLY with this JSON:\n"
       + '{"type":"meal","name":"","kcal":0,"protein":0,"carbs":0,"fat":0,"totalGrams":0,"eatingOut":false,"notes":"","newProduct":{"name":"","kcal":0,"p":0,"c":0,"f":0},"ingredients":[{"name":"","weightG":0,"_scaleRead":"","weightUncertain":false,"kcal":0,"protein":0,"carbs":0,"fat":0}]}';
@@ -2761,7 +2788,8 @@ async function aExtras(imgs, ps, desc, apiKey) {
     + "1. List every distinct item — small additions (sauce, garnish, a side) still count. Skip anything that clearly isn't food (packaging, a scale on its own, hands).\n"
     + "2. weightG: use a scale reading if one is clearly shown, otherwise a realistic typical portion for that item.\n"
     + "3. Per item, kcal/protein/carbs/fat MUST be PER-100g reference values (NOT scaled to weight). Match a known product exactly when recognisable, otherwise use standard reference values for that food.\n"
-    + "4. If genuinely nothing food-related is identifiable in the photos, return an empty ingredients array — do not guess an item that isn't there.\n\n"
+    + "4. If genuinely nothing food-related is identifiable in the photos, return an empty ingredients array — do not guess an item that isn't there.\n"
+    + "5. " + NAME_RULE + "\n\n"
     + "Reply ONLY with this JSON:\n"
     + '{"ingredients":[{"name":"","weightG":0,"kcal":0,"protein":0,"carbs":0,"fat":0}]}';
   return callAI([{ type:"text", text:prompt }, ...iBlks(c)], apiKey, VISION_MODEL, 2048);
@@ -2806,6 +2834,7 @@ async function aPrep(imgs, ps, desc, apiKey) {
       + "2. The kcal/protein/carbs/fat fields you return MUST be PER-100g reference values for that ingredient (NOT per-serving, NOT scaled to the weight). If you matched a known product, copy its per-100g values exactly.\n"
       + "3. totalKcal/totalProtein/totalCarbs/totalFat at the top level ARE the meal totals (already scaled): sum of (per-100g × weightG / 100) across all ingredients.\n"
       + "4. estimatedWeightG = sum of all ingredient weightG.\n"
+      + NAME_RULE + "\n"
       + "5. For each ingredient FROM A SCALE PHOTO, include a '_scaleRead' field with the literal digits you saw bright on the scale (e.g. '47', '6', '108'). For a package-only ingredient with no scale, omit _scaleRead or leave it empty — do not invent a scale reading that was never shown.\n"
       + "6. CRITICAL — raw vs cooked, generic vs branded: if the description or photo says 'raw' (e.g. 'raw chicken breast'), use the RAW reference value below — do NOT substitute a cooked or breaded branded product even if its name overlaps. The cooking state the user specifies always wins over name similarity to a known product.\n"
       + "   MEAT/FISH ON A SCALE — determine the cooking state from what the photo actually shows, not just the description: raw meat is typically pink/red and either in its shop packaging or on a plate/board pre-cook; a scale photo showing meat IN A FRYING PAN, on a baking tray, browned/seared, or already mixed into a cooked dish means it was weighed AFTER cooking — use the COOKED per-100g reference for it, and NAME the ingredient with that cooking word (e.g. 'Fried Beef Mince', 'Grilled Chicken Breast', not bare 'Beef' or 'Chicken') so the weight itself is understood to already be in its finished state, not raw. Guessing 'raw' by default for an ambiguous meat/fish photo is the more common mistake — look for pan/tray/browning cues before defaulting to raw.\n"
@@ -3017,13 +3046,21 @@ async function aParseRecipe(text, imgs, apiKey) {
 
 // Generate a brand-new recipe from a description, optionally constrained to the user's own
 // pantry (product labels) and/or a nutritional focus. Used by the "Suggest a Recipe" flow.
-async function aGenerateRecipe({description, fromPantry, focus, products, profile}, apiKey) {
+async function aGenerateRecipe({description, fromPantry, focus, products, profile, ingredients, onlyThese}, apiKey) {
   let prompt = "Generate a complete, realistic, cookable recipe based on this request: \"" + (description||"a tasty meal").trim() + "\"\n\n";
+  const have = (ingredients||"").trim();
+  if (have) {
+    // What's actually in the fridge. "Only these" is a hard limit on main ingredients; otherwise
+    // they're the centre of the dish and a few extras are allowed where the recipe needs them.
+    prompt += onlyThese
+      ? "INGREDIENTS ON HAND: \"" + have + "\"\nBuild the recipe using ONLY these as the main ingredients (basic staples like water, salt, pepper, oil and common dried spices are fine). You don't have to use every one, but do NOT introduce any other main ingredient.\n\n"
+      : "INGREDIENTS THE USER HAS OR WANTS TO USE: \"" + have + "\"\nBuild the recipe around these — they should be the core of the dish. You may add a few extra ingredients where genuinely needed to make it work, but keep these central.\n\n";
+  }
   if (fromPantry && (products||[]).length) {
-    prompt += "CONSTRAINT: Use ONLY ingredients from this list of products the user already has (with per-100g macros for reference — you don't need to use all of them, just don't introduce ingredients outside this list, common staples like water/salt/pepper/oil are OK if needed):\n"
+    prompt += "CONSTRAINT: Use ONLY ingredients from this list of products the user already has" + (have ? " (plus whatever they listed above)" : "") + " (with per-100g macros for reference — you don't need to use all of them, just don't introduce ingredients outside this list, common staples like water/salt/pepper/oil are OK if needed):\n"
       + pCtx(products) + "\n\n";
-  } else {
-    prompt += "You may use any common, realistically available ingredients.\n\n";
+  } else if (!have || !onlyThese) {
+    prompt += "You may use any common, realistically available ingredients" + (have ? " to complement the ones above" : "") + ".\n\n";
   }
   const focusText = {
     high_protein: "Prioritize a high-protein result — favor lean proteins and generous protein-dense ingredients.",
@@ -3812,8 +3849,17 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
   //   5. The candidate can't be mostly made of words the ingredient never mentioned either — a
   //      product name stuffed with extra unrelated specific words (flavor, product line) fails
   //      even if it happens to fully contain the ingredient's (fewer) words.
+  //   6. Parenthetical text is a gloss, not identity. A photo read comes back as e.g.
+  //      "Vilkyškių Liesa Varškė 0.5% (low-fat curd)" or "Toste Duona Skrudinimui (toast
+  //      bread)" — the right product with an English description tacked on — and rule 4 then
+  //      demanded "low", "fat" and "curd" appear in a label that (correctly) has no such words,
+  //      so a byte-identical product never matched and had to be picked by hand every time.
+  //      Identity (rules 4/5, scoring, form words) is therefore judged on the name WITH
+  //      parentheses removed, on both sides; the parenthetical's words still count for the
+  //      raw-vs-cooked/prep checks, because "(raw ground beef)" really does change the product.
   const bestMatch = (ingName) => {
     if (!products?.length) return null;
+    const stripParens = s => (s||"").replace(/\([^)]*\)/g, " ");
     const nl = normName(ingName);
     if (!nl) return null;
     // Pass 1: exact normalized match — but not against a mangled multi-product name (rule 2
@@ -3823,8 +3869,9 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
       if (!looksConcatenated(p.name) && normName(p.name) === nl) return p;
     }
     const tokens = s => s.split(" ").filter(w => w.length > 2);
-    const ingToks = tokens(nl);
-    const ingSpecific = ingToks.filter(w => !STOP_WORDS.has(w));
+    const ingToks = tokens(nl);                                  // full text — prep/cooking cues
+    const ingIdToks = tokens(normName(stripParens(ingName)));    // identity — glosses removed
+    const ingSpecific = ingIdToks.filter(w => !STOP_WORDS.has(w));
     const ingPrep = ingToks.filter(w => PREP_WORDS.has(w));
     const ingCore = ingSpecific.filter(w => !PREP_WORDS.has(w));
     // Fewer than 2 core identity words = not enough to safely auto-match (see rule 3).
@@ -3833,9 +3880,9 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
     let best = null, bestScore = 0;
     for (const p of products) {
       if (looksConcatenated(p.name)) continue;
-      const pl = normName(p.name);
-      const prodToks = tokens(pl);
-      const prodSpecific = prodToks.filter(w => !STOP_WORDS.has(w));
+      const prodToks = tokens(normName(p.name));                       // full text — prep cues
+      const prodIdToks = tokens(normName(stripParens(p.name)));        // identity
+      const prodSpecific = prodIdToks.filter(w => !STOP_WORDS.has(w));
       const prodPrep = prodToks.filter(w => PREP_WORDS.has(w));
       const prodCore = prodSpecific.filter(w => !PREP_WORDS.has(w));
       // Rule 4: full coverage — every core word of the ingredient must appear in the candidate.
@@ -3854,8 +3901,8 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
         }
       }
       // Stop-word overlap = small bonus only
-      for (const w of ingToks) {
-        if (STOP_WORDS.has(w) && prodToks.includes(w)) score += 1;
+      for (const w of ingIdToks) {
+        if (STOP_WORDS.has(w) && prodIdToks.includes(w)) score += 1;
       }
       // Preparation mismatch penalty: if one name has prep words like "minced" / "breaded"
       // and the other doesn't share them, the products are likely distinct.
@@ -3879,8 +3926,8 @@ function IngredientConfirmPanel({ingredients, setIngredients, products, onConfir
       // jam, etc). "Cherry Tomatoes" and "Tomato Sauce" share the noun "tomato" but are not
       // interchangeable — one is fresh produce, the other a cooked/processed product with very
       // different macros. If exactly one side names a form word the other lacks, disqualify.
-      const ingForm = ingToks.filter(w => FORM_WORDS.has(w));
-      const prodForm = prodToks.filter(w => FORM_WORDS.has(w));
+      const ingForm = ingIdToks.filter(w => FORM_WORDS.has(w));
+      const prodForm = prodIdToks.filter(w => FORM_WORDS.has(w));
       if ((ingForm.length > 0) !== (prodForm.length > 0)) {
         score -= 180;
       }
@@ -5729,7 +5776,9 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
         defaultOpen={!todayW}
         subtitle={todayW
           ? `${todayW.weight.toFixed(2)} kg today${wDelta!==null?`  ·  ${wDelta<0?"↓":"↑"}${Math.abs(wDelta).toFixed(2)} vs previous`:""}`
-          : "Not logged today"}>
+          : prevW
+            ? `Not logged today  ·  last ${prevW.weight.toFixed(2)} kg (${new Date(prevW.date+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"})})`
+            : "Not logged today"}>
         <div style={{display:"flex",gap:SP.sm}}>
           <input type="text" inputMode="decimal" pattern="[0-9]*[.]?[0-9]*" step="0.05" aria-label="Weight in kilograms" placeholder={todayW?"Update weight…":"e.g. 75.00"} value={wInput} onChange={e=>{setWInput(e.target.value.replace(",","."));if(wErr)setWErr("");}} onKeyDown={e=>e.key==="Enter"&&logWeight()} style={{flex:1,background:C.bg,border:`1px solid ${wErr?C.red:C.border}`,borderRadius:R.sm,padding:`${SP.sm}px ${SP.md}px`,color:C.text,fontFamily:"monospace",outline:"none",minHeight:44}}/>
           <button onClick={logWeight} style={{padding:`0 ${SP.xl}px`,minHeight:44,borderRadius:R.sm,background:saved?C.dim:C.lime,border:"none",color:saved?C.lime:"#000",fontWeight:700,fontSize:T.body,flexShrink:0}}>{saved?"✓ Saved":"Log"}</button>
@@ -5737,7 +5786,10 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
         {/* Error sits next to the field it belongs to, not in a banner at the top of the
             screen — role=alert so it is announced the moment it appears. */}
         {wErr&&<div role="alert" style={{fontSize:T.sm,color:C.red,marginTop:SP.sm,lineHeight:1.4}}>{wErr}</div>}
-        {weights.slice(1,4).map(e=>(<div key={e.date} style={{display:"flex",justifyContent:"space-between",marginTop:SP.sm}}><span style={{fontSize:T.sm,color:C.muted}}>{new Date(e.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span><span style={{fontFamily:"monospace",fontSize:T.sm,color:C.muted}}>{e.weight.toFixed(2)} kg</span></div>))}
+        {/* "Earlier entries" = everything that isn't today's. This used to be weights.slice(1,4),
+            which assumes today's weight sits at index 0 — when today wasn't logged yet, that
+            skipped the most recent entry entirely, so the list disagreed with the Progress tab. */}
+        {weights.filter(w=>w.date!==TODAY()).slice(0,3).map(e=>(<div key={e.date} style={{display:"flex",justifyContent:"space-between",marginTop:SP.sm}}><span style={{fontSize:T.sm,color:C.muted}}>{new Date(e.date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</span><span style={{fontFamily:"monospace",fontSize:T.sm,color:C.muted}}>{e.weight.toFixed(2)} kg</span></div>))}
       </Collapse>
 
       {!profileOK&&<button onClick={onGoToSettings} style={{width:"100%",marginBottom:10,background:"#1a1400",border:`1px solid ${C.yellow}40`,borderRadius:10,padding:"9px 14px",display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer"}}><span style={{fontSize:12,color:C.yellow}}>Complete profile for personalized targets</span><span style={{color:C.muted,fontSize:12}}>→</span></button>}
@@ -7392,8 +7444,6 @@ function WeightProgressCard({profile,weights,setWeights,weightPhases,setWeightPh
     });
   };
   const latestW=weights[0];
-  const firstW=weights.length>=2?weights[weights.length-1]:null;
-  const overallDelta=firstW&&latestW?latestW.weight-firstW.weight:null;
   const logWeight=()=>{const w=parseNum(wInput);if(!w)return;const date=wDate||TODAY();const e={date,weight:w};setWeights(p=>[e,...p.filter(x=>x.date!==date)].sort((a,b)=>b.date.localeCompare(a.date)));setWInput("");setWDate(TODAY());};
   const saveEditW=i=>{const w=parseNum(editWVal);if(!w)return;setWeights(p=>{const n=[...p];n[i]={...n[i],weight:w};return n.sort((a,b)=>b.date.localeCompare(a.date));});setEditWIdx(null);};
   // Graph range: what the trend line covers. "Beginning" (every log ever) used to be the only
@@ -7401,13 +7451,39 @@ function WeightProgressCard({profile,weights,setWeights,weightPhases,setWeightPh
   // supposed to read as "how is THIS phase going" — a phase transition looks like a kink in an
   // otherwise unrelated trend. "Phase" and "Custom" scope the same graph to just the stretch
   // that's actually relevant right now.
-  const [wRangeMode,setWRangeMode]=useState("beginning"); // "beginning" | "phase" | "custom"
-  const [wRangeCustomDate,setWRangeCustomDate]=useState("");
+  const [wRangeMode,setWRangeModeRaw]=useState("beginning"); // "beginning" | "phase" | "custom"
+  const [wRangeCustomDate,setWRangeCustomDateRaw]=useState("");
+  // The choice sticks: pick "This phase" once and every later visit to this tab opens on it.
+  // Persisted under its own key (not the profile) since it's a view preference, loaded once on
+  // mount — the card renders with the default for a frame before the stored value arrives.
+  useEffect(()=>{
+    let alive=true;
+    store.get("fit_weight_range",null).then(r=>{
+      if(!alive||!r)return;
+      if(["beginning","phase","custom"].includes(r.mode))setWRangeModeRaw(r.mode);
+      if(typeof r.customDate==="string")setWRangeCustomDateRaw(r.customDate);
+    });
+    return()=>{alive=false;};
+  },[]);
+  const setWRangeMode=m=>{setWRangeModeRaw(m);store.set("fit_weight_range",{mode:m,customDate:wRangeCustomDate});};
+  const setWRangeCustomDate=d=>{setWRangeCustomDateRaw(d);store.set("fit_weight_range",{mode:wRangeMode,customDate:d});};
   const wActivePhase=(weightPhases||[]).find(p=>!p.endDate)||null;
-  const wRangeStart = wRangeMode==="phase" ? (wActivePhase?.startDate||null)
-    : wRangeMode==="custom" ? (wRangeCustomDate||null)
+  // "This phase" with no active phase (e.g. the phase was deleted since it was saved) quietly
+  // behaves as "Beginning" rather than leaving a highlighted button that does nothing.
+  const wEffectiveMode = wRangeMode==="phase"&&!wActivePhase ? "beginning" : wRangeMode;
+  const wRangeStart = wEffectiveMode==="phase" ? (wActivePhase?.startDate||null)
+    : wEffectiveMode==="custom" ? (wRangeCustomDate||null)
     : null;
   const wRangedWeights = wRangeStart ? weights.filter(w=>w.date>=wRangeStart) : weights;
+  // The headline change next to the current weight follows the selected range too — it used to
+  // always show the change since the very first log, regardless of what the graph below it was
+  // scoped to, so the two disagreed as soon as a range was picked.
+  const rangeFirstW=wRangedWeights.length>=2?wRangedWeights[wRangedWeights.length-1]:null;
+  const rangeLatestW=wRangedWeights[0]||null;
+  const rangeDelta=rangeFirstW&&rangeLatestW?rangeLatestW.weight-rangeFirstW.weight:null;
+  const rangeLabel = wEffectiveMode==="phase" ? "this phase"
+    : (wEffectiveMode==="custom"&&wRangeStart) ? "since "+new Date(wRangeStart+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"})
+    : "since start";
   const wSpark=[...wRangedWeights].reverse();
   const wVals=wSpark.map(w=>w.weight);
   const wMin=wVals.length?Math.min(...wVals)-0.5:65;const wMax=wVals.length?Math.max(...wVals)+0.5:70;
@@ -7493,17 +7569,17 @@ function WeightProgressCard({profile,weights,setWeights,weightPhases,setWeightPh
     <div style={{background:C.card,border:`1px solid ${weightLogOpen?C.lime:C.border}`,borderRadius:12,padding:"10px 14px",marginBottom:12}}>
       <button onClick={()=>setWeightLogOpen(p=>!p)} style={{width:"100%",background:"none",border:"none",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",padding:0,marginBottom:weightLogOpen?6:0}}>
         <span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Weight Log {weightLogOpen?"▲":"▼"}</span>
-        {latestW&&<div style={{display:"flex",alignItems:"baseline",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}><span style={{fontFamily:"monospace",fontSize:18,fontWeight:800,color:C.lime}}>{latestW.weight.toFixed(2)}</span><span style={{fontSize:12,color:C.muted}}>kg</span>{overallDelta!==null&&<span style={{fontFamily:"monospace",fontSize:11,color:overallDelta<0?C.lime:C.red}} title={"Total change since first log on "+firstW.date}>{overallDelta<0?"↓":"↑"}{Math.abs(overallDelta).toFixed(2)} since start</span>}</div>}
+        {latestW&&<div style={{display:"flex",alignItems:"baseline",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}><span style={{fontFamily:"monospace",fontSize:18,fontWeight:800,color:C.lime}}>{latestW.weight.toFixed(2)}</span><span style={{fontSize:12,color:C.muted}}>kg</span>{rangeDelta!==null&&<span style={{fontFamily:"monospace",fontSize:11,color:rangeDelta<0?C.lime:C.red}} title={"Change since the first log in this range on "+rangeFirstW.date}>{rangeDelta<0?"↓":"↑"}{Math.abs(rangeDelta).toFixed(2)} {rangeLabel}</span>}</div>}
       </button>
       {weightLogOpen&&(<>
       {weights.length>=4&&(<div style={{marginBottom:6}}>
         <div style={{display:"flex",gap:4}}>
           {[["beginning","Beginning"],["phase",wActivePhase?"This phase":null],["custom","Custom date"]].filter(([,lbl])=>lbl).map(([mode,lbl])=>{
-            const on=wRangeMode===mode;
+            const on=wEffectiveMode===mode;
             return(<button key={mode} onClick={()=>setWRangeMode(mode)} style={{flex:1,padding:"5px 4px",borderRadius:7,border:`1px solid ${on?C.lime:C.border}`,background:on?`${C.lime}18`:C.bg,color:on?C.lime:C.muted,fontWeight:on?700:400,cursor:"pointer",fontSize:10}}>{lbl}</button>);
           })}
         </div>
-        {wRangeMode==="custom"&&<input type="date" aria-label="Graph range start date" value={wRangeCustomDate} max={TODAY()} onChange={e=>setWRangeCustomDate(e.target.value)} style={{width:"100%",boxSizing:"border-box",marginTop:5,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:7,padding:"6px 9px",color:C.lime,fontSize:12,fontFamily:"monospace",outline:"none"}}/>}
+        {wEffectiveMode==="custom"&&<input type="date" aria-label="Graph range start date" value={wRangeCustomDate} max={TODAY()} onChange={e=>setWRangeCustomDate(e.target.value)} style={{width:"100%",boxSizing:"border-box",marginTop:5,background:C.bg,border:`1px solid ${C.lime}`,borderRadius:7,padding:"6px 9px",color:C.lime,fontSize:12,fontFamily:"monospace",outline:"none"}}/>}
       </div>)}
       {wSpark.length>=4&&(<svg width={WW} height={WH} style={{display:"block",marginBottom:6,overflow:"visible"}}>
         {wTrend!==null&&wSpark.length>=4&&(()=>{const startV=wSpark[0].weight;const endV=wSpark[wSpark.length-1].weight+(wTrend/7*(wSpark.length-1));return<line x1={0} y1={wpy(startV)} x2={WW} y2={wpy(Math.min(wMax-0.1,Math.max(wMin+0.1,endV)))} stroke={wTrend<0?C.lime+"60":C.red+"60"} strokeWidth={1} strokeDasharray="3 3"/>;})()}
@@ -8095,6 +8171,8 @@ function RecipeLogSheet({recipe, products, apiKey, onLog, onClose}){
 // ── Recipe Suggest Sheet (AI generates a full recipe) ──────────────────────
 function RecipeSuggestSheet({products, profile, onSave, onClose}){
   const [description, setDescription] = useState("");
+  const [ingredients, setIngredients] = useState(""); // what's on hand / wanted, free text
+  const [onlyThese, setOnlyThese] = useState(false);
   const [fromPantry, setFromPantry] = useState(false);
   // Default nutritional focus to something sensible for the user's current goal
   const defaultFocus = profile?.goal==="cut" ? "low_cal" : profile?.goal==="bulk" ? "high_cal" : "balanced";
@@ -8114,7 +8192,7 @@ function RecipeSuggestSheet({products, profile, onSave, onClose}){
   const generate = async () => {
     setGenerating(true); setErr(null);
     try {
-      const res = await aGenerateRecipe({description, fromPantry, focus, products, profile}, profile?.apiKey);
+      const res = await aGenerateRecipe({description, fromPantry, focus, products, profile, ingredients, onlyThese}, profile?.apiKey);
       setResult({
         id: Date.now(),
         name: res.name || "Generated Recipe",
@@ -8154,6 +8232,15 @@ function RecipeSuggestSheet({products, profile, onSave, onClose}){
   return(<Sheet onClose={onClose} title="✨ Suggest a Recipe">
     <div style={{fontSize:11,color:C.muted,marginBottom:12,lineHeight:1.4}}>Describe what you're after and the AI will build a full recipe — ingredients, instructions, timers included.</div>
     <textarea value={description} onChange={e=>setDescription(e.target.value)} rows={3} placeholder="e.g. a quick high-protein pasta dish, or a chocolate dessert that's not too sweet" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:T.body,outline:"none",resize:"none",fontFamily:"inherit",marginBottom:12}}/>
+
+    {/* What's in the fridge — separate from the free-text request above so "a quick dinner" can
+        be combined with "chicken, rice, spinach, feta" instead of having to be typed into one blob. */}
+    <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:6}}>Ingredients I have or want to use</div>
+    <textarea value={ingredients} onChange={e=>setIngredients(e.target.value)} rows={2} aria-label="Ingredients I have or want to use" placeholder="e.g. chicken breast, rice, spinach, feta — optional" style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${ingredients.trim()?C.lime:C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:T.body,outline:"none",resize:"none",fontFamily:"inherit",marginBottom:ingredients.trim()?8:12}}/>
+    {ingredients.trim()&&<label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginBottom:12,padding:"2px 2px"}}>
+      <input type="checkbox" checked={onlyThese} onChange={e=>setOnlyThese(e.target.checked)} style={{accentColor:C.lime,cursor:"pointer"}}/>
+      <span style={{fontSize:12,color:C.text}}>Use <b>only</b> these (plus basics like salt, oil, spices) <span style={{color:C.muted}}>— otherwise they're the core and a few extras are allowed</span></span>
+    </label>}
 
     <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",marginBottom:14,background:C.card,border:`1px solid ${C.border}`,borderRadius:9,padding:"10px 13px"}}>
       <input type="checkbox" checked={fromPantry} onChange={e=>setFromPantry(e.target.checked)} style={{accentColor:C.lime,cursor:"pointer"}}/>
@@ -9582,7 +9669,7 @@ function SettingsTab({profile,setProfile,weights,weightPhases,setWeightPhases,la
   const AGE=calcAge(profile.birthday);
   const saveProfile=()=>{setProfile({...pf,heightCm:parseFloat(pf.heightCm)||null,apiKey:pf.apiKey||""});setEditProf(false);};
   const exportData=async()=>{
-    const keys=["fit_dates","fit_weights","fit_products","fit_mealpreps","fit_profile","fit_photos","fit_weight_phases","fit_seeded_presets","fit_gym_schedule","fit_gym_templates","fit_gym_day_assign","fit_gym_sessions","fit_gym_settings","fit_gym_exercise_library","fit_recipes","fit_medications","fit_med_log","fit_day_types","fit_meal_favorites"];
+    const keys=["fit_dates","fit_weights","fit_products","fit_mealpreps","fit_profile","fit_photos","fit_weight_phases","fit_seeded_presets","fit_gym_schedule","fit_gym_templates","fit_gym_day_assign","fit_gym_sessions","fit_gym_settings","fit_gym_exercise_library","fit_recipes","fit_medications","fit_med_log","fit_day_types","fit_meal_favorites","fit_weight_range"];
     const out={};for(const k of keys){out[k]=await store.get(k,null);}
     const dates=out.fit_dates||[];for(const d of dates){out["fit_day_"+d]=await store.get("fit_day_"+d,null);}
     const blob=new Blob([JSON.stringify(out,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="fitness-data-"+TODAY()+".json";a.click();URL.revokeObjectURL(url);setExportMsg("Exported!");setTimeout(()=>setExportMsg(""),2000);

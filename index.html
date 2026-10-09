@@ -2508,7 +2508,9 @@ async function prepImgs(imgs) {
   // Resize every photo concurrently rather than one at a time — image decode happens off the
   // main thread in every modern browser, so awaiting them sequentially in a loop was paying
   // that decode latency N times over for N photos instead of once. Promise.all preserves order.
-  const resized = await Promise.all(imgs.slice(0, 15).map(img => resizeImg(img.preview)));
+  // (Photos added through ImgZone are already shrunk — re-encoding them would only cost time and
+  // add a second round of JPEG loss.)
+  const resized = await Promise.all(imgs.slice(0, 15).map(img => img.resized ? img.preview : resizeImg(img.preview)));
   return resized.map(r => ({ data: r.split(",")[1], mt: "image/jpeg", preview: r }));
 }
 const iBlks = imgs => imgs.map(i=>({type:"image",source:{type:"base64",media_type:i.mt,data:i.data}}));
@@ -2570,6 +2572,16 @@ const TEXT_MODEL   = "claude-haiku-4-5"; // text-only calls
 // too-short token budget — `truncated` (from the API's own stop_reason) lets the retry loop
 // below ask for a bigger budget next time instead of blindly retrying into the same wall, or
 // worse, handing an obviously-incomplete response to extractJSON.
+//
+// Extended thinking is switched OFF for every call here. Every request in this file is a
+// structured extraction (read a label, list ingredients, return JSON) — none benefits from the
+// model reasoning at length first, and with it left on the heavy photo prompts spent most of
+// their time (30–60s for a handful of photos) thinking before writing a single token of the
+// answer, which also starved max_tokens and produced the "Empty response" failures. The lean
+// Photo Extras prompt, which gives it little to deliberate over, answers the same kind of
+// photos in about five seconds. If the API ever refuses the parameter the call is repeated
+// without it (once, remembered for the session), so this can only make a call faster, never fail.
+let thinkingParamRejected = false;
 async function fetchClaudeOnce(content, apiKey, model, maxTokens) {
   const headers = { "Content-Type": "application/json" };
   if (apiKey && !inClaudeAI()) {
@@ -2577,7 +2589,7 @@ async function fetchClaudeOnce(content, apiKey, model, maxTokens) {
     headers["anthropic-version"] = "2023-06-01";
     headers["anthropic-dangerous-direct-browser-access"] = "true";
   }
-  const body = JSON.stringify({ model: model||VISION_MODEL, max_tokens: maxTokens||1500, messages: [{ role: "user", content }] });
+  const buildBody = noThinking => JSON.stringify({ model: model||VISION_MODEL, max_tokens: maxTokens||1500, ...(noThinking ? { thinking: { type: "disabled" } } : {}), messages: [{ role: "user", content }] });
   // There used to be NO timeout at all: a request that stalled (a mobile connection dropping
   // mid-response is enough) left the UI on "Analyzing… 120s" indefinitely and nothing was ever
   // logged. Every attempt is now aborted after a deadline that scales with how many photos it
@@ -2585,24 +2597,34 @@ async function fetchClaudeOnce(content, apiKey, model, maxTokens) {
   // retried instead of hanging forever.
   const imageCount = Array.isArray(content) ? content.filter(b => b && b.type === "image").length : 0;
   const timeoutMs = Math.min(120000, 40000 + imageCount * 8000);
-  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
-  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
-  let data;
-  try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers, body, ...(ctrl ? { signal: ctrl.signal } : {}) });
-    data = await response.json();
-  } catch(e) {
-    if (e && e.name === "AbortError") throw new Error(`Timed out — no response from the AI service after ${Math.round(timeoutMs/1000)}s`);
-    throw new Error("Connection error: " + e.message);
-  } finally {
-    if (timer) clearTimeout(timer);
+  const post = async body => {
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers, body, ...(ctrl ? { signal: ctrl.signal } : {}) });
+      return await response.json();
+    } catch(e) {
+      if (e && e.name === "AbortError") throw new Error(`Timed out — no response from the AI service after ${Math.round(timeoutMs/1000)}s`);
+      throw new Error("Connection error: " + e.message);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  const t0 = Date.now();
+  let data = await post(buildBody(!thinkingParamRejected));
+  if (data && data.error && !thinkingParamRejected && /thinking/i.test(String(data.error.message || ""))) {
+    thinkingParamRejected = true;
+    data = await post(buildBody(false));
   }
   if (data.error) throw new Error("API: " + (data.error.message || JSON.stringify(data.error)));
   if (!data.content) throw new Error("No content in response: " + JSON.stringify(data).slice(0,100));
   const text = data.content.find(b => b.type === "text")?.text || "";
   if (!text.trim()) throw new Error("Empty response");
-  return { text, truncated: data.stop_reason === "max_tokens" };
+  return { text, truncated: data.stop_reason === "max_tokens", usage: data.usage || null, ms: Date.now() - t0, imageCount };
 }
+// What the most recent successful AI call cost — shown under Settings → AI Connection so a slow
+// analysis can be diagnosed (many photos? huge output? a retry?) instead of guessed at.
+let lastAIStats = null;
 // Shared retry loop for both JSON calls (callAI) and free-text calls (callAIText). Retries up
 // to 2 extra times with a short backoff on: a network hiccup, an empty text block, a response
 // cut short by the token budget (stop_reason max_tokens — bumps the budget before retrying
@@ -2614,16 +2636,20 @@ async function fetchClaudeOnce(content, apiKey, model, maxTokens) {
 // limit) still surfaces immediately — retrying it would just fail the same way three times over.
 async function fetchClaudeWithRetry(content, apiKey, model, maxTokens, parse) {
   const delays = [0, 700, 1500];
-  let lastErr, budget = maxTokens, timeouts = 0;
+  let lastErr, budget = maxTokens, timeouts = 0, attempts = 0;
+  const startedAt = Date.now();
   for (const delay of delays) {
     if (delay) await new Promise(r => setTimeout(r, delay));
     try {
-      const { text, truncated } = await fetchClaudeOnce(content, apiKey, model, budget);
+      attempts++;
+      const { text, truncated, usage, imageCount } = await fetchClaudeOnce(content, apiKey, model, budget);
       if (truncated) {
         budget = Math.min((budget||1500) * 2, 8192);
         throw new Error("Truncated response (ran out of tokens) — retrying with a larger budget");
       }
-      return parse ? parse(text) : text;
+      const result = parse ? parse(text) : text;
+      lastAIStats = { model: model||VISION_MODEL, ms: Date.now() - startedAt, attempts, photos: imageCount||0, inTokens: usage?.input_tokens ?? null, outTokens: usage?.output_tokens ?? null };
+      return result;
     } catch (e) {
       lastErr = e;
       if (/^API:/.test(e.message)) throw e; // not transient — don't burn retries on it
@@ -2740,9 +2766,7 @@ async function aFood(imgs, ps, mt, desc, apiKey) {
       + "  • Bright '1','2','g' → weightG=12 (NOT 20, NOT 21)\n"
       + "  • Bright '1','5','g' → weightG=15 (NOT 6, NOT 51)\n"
       + "  • Blue LCD, small amount visible, bright '6' then 'g' → weightG=6\n\n"
-      + "MANDATORY SELF-CHECK before emitting each weightG:\n"
-      + "  Ask yourself: 'Is this a plausible amount for this ingredient at this meal?' and 'Did I accidentally include a ghost digit?'\n"
-      + "  If the number seems off by more than 2× compared to what's visible in the bowl/plate, set weightUncertain:true and explain in _scaleRead.\n\n"
+      + "HOW TO ANSWER: for each ingredient write '_scaleRead' FIRST (the literal bright digits you see), then set 'weightG' from those digits only. If the digits are unclear, or the number looks implausible for that ingredient (more than 2× off from what's visible in the bowl/plate, or a likely ghost digit), set weightUncertain:true and say why in _scaleRead. Do all of this inside the JSON — no reasoning or commentary outside it.\n\n"
       + "🚫 ABSOLUTELY FORBIDDEN:\n"
       + "  • Setting weightG to 100 as a default/guess.\n"
       + "  • Multiple ingredients at identical round numbers.\n"
@@ -2763,7 +2787,7 @@ async function aFood(imgs, ps, mt, desc, apiKey) {
       + NAME_RULE + "\n"
       + "7. eatingOut: set true ONLY if the photos/description clearly show a restaurant, fast-food chain (e.g. Hesburger, McDonald's, KFC), café, takeaway/delivery or canteen meal — branded restaurant packaging, a restaurant plate, a menu/nutrition screenshot from a venue — rather than food prepared at home; otherwise false.\n\n"
       + "Reply ONLY with this JSON:\n"
-      + '{"type":"meal","name":"","kcal":0,"protein":0,"carbs":0,"fat":0,"totalGrams":0,"eatingOut":false,"notes":"","newProduct":{"name":"","kcal":0,"p":0,"c":0,"f":0},"ingredients":[{"name":"","weightG":0,"_scaleRead":"","weightUncertain":false,"kcal":0,"protein":0,"carbs":0,"fat":0}]}';
+      + '{"type":"meal","name":"","kcal":0,"protein":0,"carbs":0,"fat":0,"totalGrams":0,"eatingOut":false,"notes":"","newProduct":{"name":"","kcal":0,"p":0,"c":0,"f":0},"ingredients":[{"name":"","_scaleRead":"","weightG":0,"weightUncertain":false,"kcal":0,"protein":0,"carbs":0,"fat":0}]}';
   }
   // 4096, not 2500 — a full 15-ingredient breakdown (each with name/weightG/_scaleRead/
   // weightUncertain/kcal/protein/carbs/fat) genuinely needs the room, and running out mid-JSON
@@ -2849,7 +2873,7 @@ async function aPrep(imgs, ps, desc, apiKey) {
       + "   • Tomato-based pasta sauce (jarred): ~35-55 kcal, 1-2g P, 6-9g C, 0.5-2g F\n"
       + "   • Raw whole eggs (shelled): ~143-155 kcal, 12-13g P, 0.5-1g C, 9.5-11g F\n\n"
       + "Reply ONLY with JSON, no explanation:\n"
-      + '{"totalKcal":0,"totalProtein":0,"totalCarbs":0,"totalFat":0,"estimatedWeightG":0,"notes":"","ingredients":[{"name":"","weightG":0,"_scaleRead":"","weightUncertain":false,"kcal":0,"protein":0,"carbs":0,"fat":0}]}' },
+      + '{"totalKcal":0,"totalProtein":0,"totalCarbs":0,"totalFat":0,"estimatedWeightG":0,"notes":"","ingredients":[{"name":"","_scaleRead":"","weightG":0,"weightUncertain":false,"kcal":0,"protein":0,"carbs":0,"fat":0}]}' },
     ...iBlks(c),
   ], apiKey, VISION_MODEL, 4096);
 }
@@ -3546,7 +3570,14 @@ function Field({label,value,onChange,type="text",placeholder="",disabled=false})
 }
 function ImgZone({imgs,setImgs,compact=false,maxPhotos=10}){
   const ref=useRef();
-  const read=files=>Array.from(files).slice(0,maxPhotos).forEach(f=>{const r=new FileReader();r.onload=e=>setImgs(p=>[...p,{data:e.target.result.split(",")[1],mt:f.type,preview:e.target.result}].slice(0,maxPhotos));r.readAsDataURL(f);});
+  // Each photo is shrunk to the size the AI actually receives (1024px) the moment it is added,
+  // while you are still taking the next one — not in one big burst when you press Analyze. A
+  // phone photo is ~12MP: kept as-is it was decoded again for every 52px thumbnail and again at
+  // analysis time, and the full-size base64 sat in state twice over. Batches are appended in the
+  // order they were picked (a scale photo has to stay next to the package it belongs to), not in
+  // whichever order the decodes happen to finish.
+  const readOne=f=>new Promise(resolve=>{const r=new FileReader();r.onload=async e=>{const full=e.target.result;let small=full;try{small=await resizeImg(full);}catch{}const shrunk=small!==full;resolve({data:small.split(",")[1],mt:shrunk?"image/jpeg":f.type,preview:small,resized:shrunk});};r.onerror=()=>resolve(null);r.readAsDataURL(f);});
+  const read=files=>Promise.all(Array.from(files).slice(0,maxPhotos).map(readOne)).then(got=>setImgs(p=>[...p,...got.filter(Boolean)].slice(0,maxPhotos)));
   return(<>
     <div onDrop={e=>{e.preventDefault();read(e.dataTransfer.files);}} onDragOver={e=>e.preventDefault()} onClick={()=>ref.current?.click()}
       style={{border:`2px dashed ${imgs.length?C.lime:C.border}`,borderRadius:10,padding:compact?"10px 12px":"18px 16px",textAlign:"center",cursor:"pointer",background:C.card}}>
@@ -6300,6 +6331,15 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
     if (curId!=null) comboTimeLog[curId] = (comboTimeLog[curId]||0) + spent;
     return {comboEnteredAt: now, comboTimeLog};
   };
+  // The warm-up is a phase of its own with its own clock. It used to run on the session's start
+  // time — which is also commitComboTime's fallback "entered" time for combo 1 — so every minute
+  // of warming up was billed to combo 1. Finishing (or skipping) the warm-up now closes its clock
+  // into warmup.durationSec and starts the current combo's clock from NOW. Reopening it later (to
+  // add warm-up sets) first rolls the running combo's time up, so warm-up minutes land on no combo
+  // in either direction.
+  const warmupSecsSoFar = s => Math.max(0, Math.floor((Date.now() - (s.warmupStartedAt || s.startedAt))/1000)) + (s.warmup?.durationSec||0);
+  const finishWarmup = () => updateAction(s=>({...s, warmup:{...s.warmup, done:true, durationSec:warmupSecsSoFar(s)}, warmupStartedAt:null, comboEnteredAt:Date.now()}));
+  const reopenWarmup = () => updateAction(s=>({...s, ...commitComboTime(s), warmup:{type:"other",fields:{},notes:"",items:[],...(s.warmup||{}),done:false}, warmupStartedAt:Date.now()}));
   const skipCombo = () => {
     updateAction(s=>{
       if (s.currentComboIdx>=s.combos.length-1) return s; // last combo — nothing to skip to, use Finish instead
@@ -6479,7 +6519,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
     return(<div style={{background:C.card,border:`1px solid ${C.orange}`,borderRadius:14,padding:"16px 18px",marginBottom:14}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
         <span style={{fontSize:T.body,fontWeight:700,color:C.orange}}>{machine.emoji} Warmup</span>
-        <span style={{fontFamily:"monospace",fontSize:12,color:C.muted}}>{fmtTime(elapsed)}</span>
+        <span style={{fontFamily:"monospace",fontSize:12,color:C.muted}} title="Warm-up time — counted separately from your combos">{fmtTime(warmupSecsSoFar(session))}</span>
       </div>
       {machine.fields.length>0&&(<div style={{display:"grid",gridTemplateColumns:machine.fields.length===3?"1fr 1fr 1fr":"1fr 1fr",gap:8,marginBottom:9}}>
         {machine.fields.map(f=>(<Field key={f} label={f==="distanceKm"?"Distance km":f==="incline"?"Incline":f==="speed"?"Speed":f==="resistance"?"Resistance":"Level"} value={fields[f]||""} onChange={v=>update(s=>({...s,warmup:{...s.warmup,fields:{...s.warmup.fields,[f]:v}}}))} placeholder="—"/>))}
@@ -6532,9 +6572,9 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
         </div>);
       })()}
       <textarea value={session.warmup.notes||""} onChange={e=>update(s=>({...s,warmup:{...s.warmup,notes:e.target.value}}))} placeholder="Notes (optional)…" rows={2} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:T.body,outline:"none",resize:"none",fontFamily:"inherit",marginBottom:9}}/>
-      <button onClick={()=>updateAction(s=>({...s,warmup:{...s.warmup,done:true}}))} style={{width:"100%",padding:"11px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:T.body}}>✓ Finish Warmup</button>
+      <button onClick={finishWarmup} style={{width:"100%",padding:"11px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",cursor:"pointer",fontSize:T.body}}>✓ Finish Warmup</button>
       <div style={{display:"flex",justifyContent:"center",gap:16,marginTop:8}}>
-        <button onClick={()=>updateAction(s=>({...s,warmup:{...s.warmup,done:true}}))} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:11,textDecoration:"underline"}}>Skip warmup</button>
+        <button onClick={finishWarmup} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:11,textDecoration:"underline"}}>Skip warmup</button>
         <button onClick={tryCancel} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:11}}>Cancel session</button>
       </div>
       {showCancelConfirm&&<CancelConfirmBox onSaveFinish={()=>{setShowCancelConfirm(false);goToFinish();}} onDiscard={onCancel} onKeepGoing={()=>setShowCancelConfirm(false)}/>}
@@ -6601,6 +6641,13 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
   const atRoundStart = session.currentExInRound === 0;
   const roundsDone = Math.max(0, ...(combo.exercises||[]).map(e=>(e.sets||[]).length), 0);
   const targetSets = gymSettings?.targetSetsPerCombo;
+  // Traffic-light on the rest screen, driven by the "Usual sets per combo" setting: until that
+  // many rounds are logged, "Next Combo" is red (not yet) and "Start Next Round" is the normal
+  // primary; once the target is reached "Next Combo" goes green (move on) and "Start Next Round"
+  // goes red (you are past the plan). With no target configured there is nothing to compare
+  // against, so every button keeps its neutral look instead of implying a verdict.
+  const hasSetGoal = Number(targetSets) > 0;
+  const setGoalMet = hasSetGoal && roundsDone >= Number(targetSets);
   const nextCombo = !isLastCombo ? session.combos[session.currentComboIdx+1] : null;
 
   // ── Finish confirmation ──
@@ -6638,7 +6685,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       <button onClick={()=>setShowJumpCombo(p=>!p)} style={{fontSize:10,color:C.muted,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>🔀 jump to another combo</button>
       {/* Warm-up sets can be added even when the plan has no warm-up step (or it was already
           finished/skipped) — this reopens that screen, and "Finish Warmup" returns here. */}
-      <button onClick={()=>updateAction(s=>({...s,warmup:{type:"other",fields:{},notes:"",items:[],...(s.warmup||{}),done:false}}))} style={{fontSize:10,color:C.orange,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>🔥 warm-up sets</button>
+      <button onClick={reopenWarmup} style={{fontSize:10,color:C.orange,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>🔥 warm-up sets</button>
       <button onClick={tryCancel} style={{fontSize:10,color:C.muted,background:"none",border:"none",cursor:"pointer",textDecoration:"underline"}}>cancel session</button>
     </div>
     {showCancelConfirm&&<CancelConfirmBox onSaveFinish={()=>{setShowCancelConfirm(false);goToFinishOrCooldown();}} onDiscard={onCancel} onKeepGoing={()=>setShowCancelConfirm(false)}/>}
@@ -6653,13 +6700,23 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
         whole screen out, so mid-workout you could not see what was still to come. */}
     {session.resting&&(
       <div style={{textAlign:"center",background:C.bg,border:`1px solid ${C.orange}55`,borderRadius:12,padding:"12px 14px",marginBottom:10}}>
-        <div style={{fontSize:T.body,color:C.lime,fontWeight:600,marginBottom:6}}>✅ Set {roundsDone} done for this combo</div>
+        <div style={{fontSize:T.body,color:C.lime,fontWeight:600,marginBottom:6}}>✅ Set {roundsDone}{hasSetGoal?` of ${Number(targetSets)}`:""} done for this combo</div>
         <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",marginBottom:4}}>Resting</div>
         <div style={{fontSize:38,fontWeight:900,fontFamily:"monospace",color:C.orange,marginBottom:10}}>{fmtTime(restElapsed)}</div>
         {targetSets&&roundsDone>=targetSets&&<div style={{background:`${C.yellow}15`,border:`1px solid ${C.yellow}50`,borderRadius:8,padding:"7px 11px",marginBottom:10,fontSize:11,color:C.yellow}}>⚠ You've hit your usual {targetSets} sets — maybe move to the next combo</div>}
-        <button onClick={()=>updateAction(s=>({...s,resting:false}))} style={{width:"100%",padding:"12px 0",borderRadius:10,background:C.orange,color:"#000",fontWeight:700,border:"none",fontSize:T.body}}>▶ Start Next Round</button>
-        {!isLastCombo&&<button onClick={()=>updateAction(s=>({...s,...commitComboTime(s),resting:false,currentComboIdx:s.currentComboIdx+1,currentExInRound:0}))} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12}}>⏭ Next Combo →</button>}
-        {isLastCombo&&<button onClick={goToFinishOrCooldown} style={{width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.lime}60`,color:C.lime,fontSize:12,fontWeight:600}}>🏁 That's it — Wrap Up</button>}
+        <button onClick={()=>updateAction(s=>({...s,resting:false}))} style={{width:"100%",padding:"12px 0",borderRadius:10,background:setGoalMet?C.red:C.orange,color:"#000",fontWeight:700,border:"none",fontSize:T.body}}>▶ Start Next Round</button>
+        {!isLastCombo&&<button onClick={()=>updateAction(s=>({...s,...commitComboTime(s),resting:false,currentComboIdx:s.currentComboIdx+1,currentExInRound:0}))}
+          style={hasSetGoal
+            ? (setGoalMet
+                ? {width:"100%",padding:"12px 0",marginTop:8,borderRadius:10,background:C.lime,border:"none",color:"#000",fontSize:T.body,fontWeight:700}
+                : {width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:`${C.red}1f`,border:`1px solid ${C.red}`,color:C.red,fontSize:12,fontWeight:700})
+            : {width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12}}>⏭ Next Combo →</button>}
+        {isLastCombo&&<button onClick={goToFinishOrCooldown}
+          style={hasSetGoal
+            ? (setGoalMet
+                ? {width:"100%",padding:"12px 0",marginTop:8,borderRadius:10,background:C.lime,border:"none",color:"#000",fontSize:T.body,fontWeight:700}
+                : {width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:`${C.red}1f`,border:`1px solid ${C.red}`,color:C.red,fontSize:12,fontWeight:700})
+            : {width:"100%",padding:"10px 0",marginTop:8,borderRadius:10,background:"none",border:`1px solid ${C.lime}60`,color:C.lime,fontSize:12,fontWeight:600}}>🏁 That's it — Wrap Up</button>}
       </div>
     )}
 
@@ -7314,7 +7371,7 @@ function GymSessionDetailSheet({session, onClose, onDelete}){
 
     {session.warmup&&(session.warmup.notes||fieldSummary(session.warmup.fields)||(session.warmup.items||[]).length>0||(session.warmup.sets||[]).length>0)&&(
       <div style={{background:C.card,border:`1px solid ${C.orange}40`,borderRadius:10,padding:"11px 13px",marginBottom:10}}>
-        <div style={{fontSize:11,fontWeight:700,color:C.orange,marginBottom:5}}>🔥 Warmup</div>
+        <div style={{fontSize:11,fontWeight:700,color:C.orange,marginBottom:5}}>🔥 Warmup{session.warmup.durationSec>=30&&<span style={{fontWeight:400,color:C.muted}}> · {fmtDur(session.warmup.durationSec)}</span>}</div>
         <RoutineSummary items={session.warmup.items}/>
         {(session.warmup.sets||[]).length>0&&<div style={{fontSize:11,color:C.muted,marginBottom:3}}>
           {(session.warmup.sets||[]).map(ws=>`${ws.name} ${ws.weight?`${ws.weight}${ws.unit||"kg"} × `:""}${ws.reps}`).join(" · ")}
@@ -9792,6 +9849,7 @@ function SettingsTab({profile,setProfile,weights,weightPhases,setWeightPhases,la
     <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px",marginBottom:12}}>
       <div style={{fontSize:T.body,fontWeight:600,color:C.text,marginBottom:4}}>AI Connection</div>
       <div style={{fontSize:11,color:C.muted,marginBottom:10}}>Vision: <span style={{fontFamily:"monospace",color:C.lime}}>{VISION_MODEL}</span> · Text: <span style={{fontFamily:"monospace",color:C.muted}}>{TEXT_MODEL}</span> · Running {inClaudeAI()?"inside Claude.ai (proxy auth)":"standalone (needs API key)"}</div>
+      {lastAIStats&&<div style={{fontSize:11,color:C.muted,marginBottom:10,fontFamily:"monospace",lineHeight:1.5}}>Last AI call: {(lastAIStats.ms/1000).toFixed(1)}s · {lastAIStats.photos} photo{lastAIStats.photos===1?"":"s"}{lastAIStats.inTokens!=null?` · ${lastAIStats.inTokens} in / ${lastAIStats.outTokens} out tokens`:""}{lastAIStats.attempts>1?` · ${lastAIStats.attempts} tries`:""}</div>}
       <TestAPIButton apiKey={profile.apiKey}/>
       <div style={{marginTop:10}}><div style={{fontSize:11,color:C.muted,marginBottom:4}}>API Key (standalone only — leave blank in Claude.ai)</div><Field label="" value={profile.apiKey||""} onChange={v=>setProfile(p=>({...p,apiKey:v}))} placeholder="sk-ant-api03-..." type="password"/></div>
     </div>

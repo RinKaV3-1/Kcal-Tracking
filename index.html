@@ -1605,8 +1605,18 @@ function findMissedGymDays(today, gymDayAssign, gymTemplates, gymSessions, dismi
 }
 // Normalize an exercise name for matching across sessions (case/whitespace/accent insensitive).
 const normExName = s => (s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/\s+/g," ").trim();
+// The weight one set was done at. Sets logged since weight became per-set always carry their own
+// `weight` key (null/"" = no load), so that wins; sets from older sessions have no such key and
+// fall back to the exercise-level field.
+const setWeightOf = (set, ex) => (set && Object.prototype.hasOwnProperty.call(set, "weight")) ? set.weight : ex?.weight;
 // Find the most recent completed performance of a named exercise across past sessions.
-// Returns {date, weight, unit, sets:[{reps}]} or null if never logged before.
+// Returns {date, weight, unit, sets:[{reps}], setWeights, mixed, startWeight, topWeight} or null if
+// never logged before. Weight lives ON each set (it is routinely changed between sets), so the
+// per-set list is the truth; `weight` is only the exercise-level field (the last value typed).
+//   setWeights   one entry per set ("" = no load / bodyweight)
+//   mixed        true when the sets did not all use the same weight
+//   startWeight  what the first set used - where the next session should open
+//   topWeight    the heaviest set - the "working weight" used for warm-up suggestions
 function getLastPerformance(exerciseName, gymSessions) {
   const nl = normExName(exerciseName);
   if (!nl || !gymSessions?.length) return null;
@@ -1615,12 +1625,26 @@ function getLastPerformance(exerciseName, gymSessions) {
     for (const combo of (sess.combos||[])) {
       for (const ex of (combo.exercises||[])) {
         if (normExName(ex.name) === nl && ex.sets?.length) {
-          return {date: sess.date, weight: ex.weight, unit: ex.unit||"kg", sets: ex.sets};
+          const setWeights = ex.sets.map(s => { const w = parseFloat(setWeightOf(s, ex)); return w > 0 ? String(w) : ""; });
+          const mixed = new Set(setWeights).size > 1;
+          const nums = setWeights.map(w => parseFloat(w) || 0);
+          return {date: sess.date, weight: ex.weight, unit: ex.unit||"kg", sets: ex.sets, setWeights, mixed,
+            startWeight: setWeights[0] || "", topWeight: Math.max(0, ...nums) || 0};
         }
       }
     }
   }
   return null;
+}
+// "last time" as one line: the weight(s) and the reps of every set, e.g.
+//   uniform  "80kg · 10/10/8"      bodyweight  "bodyweight · 30"
+//   mixed    "60kg×10 · 70kg×8 · 80kg×6"   (each set with the weight it was actually done at)
+function fmtLastPerformance(last, unitFallback) {
+  if (!last) return "";
+  const u = last.unit || unitFallback || "kg";
+  const reps = last.sets.map(s => s.reps);
+  if (last.mixed) return last.sets.map((s, i) => (last.setWeights[i] ? `${last.setWeights[i]}${u}` : "bodyweight") + `×${s.reps}`).join(" · ");
+  return `${last.setWeights[0] ? last.setWeights[0] + u : "bodyweight"} · ${reps.join("/")}`;
 }
 // Simple heuristic progression suggestion (no AI call — instant, local).
 // Two branches:
@@ -1653,9 +1677,16 @@ function suggestProgression(exerciseName, gymSessions, method) {
   // Weight is stored as a string (it comes straight from a text input), so it must be parsed
   // before arithmetic — "80"+2.5 string-concatenates to "802.5", which has no .toFixed and
   // crashed the whole session panel.
-  const lastW = parseFloat(last.weight);
-  const prevW = parseFloat(prev.weight);
+  // The weight is read PER SET (the exercise-level field is only whatever was typed last), so an
+  // exercise done as 60/70/80 is not mistaken for "80kg all sets". One figure only when every
+  // set used the same weight; a session that varied has no single weight to build a ladder on.
+  const setWs = s => s.sets.map(x => parseFloat(setWeightOf(x, s)) || 0);
+  const uniformW = s => { const w = setWs(s); return w.every(v => v === w[0]) ? w[0] : null; };
+  const lastW = uniformW(last), prevW = uniformW(prev);
+  const anyLoad = s => setWs(s).some(v => v > 0);
+  if (lastW === null || prevW === null) return null; // mixed weights within a session: no honest single-weight ladder
   const isWeighted = lastW > 0 && prevW > 0;
+  if (!isWeighted && (anyLoad(last) || anyLoad(prev))) return null; // bodyweight one day, loaded the other: a new load, nothing to compare
 
   if (isWeighted) {
     // Double progression: the weight stays put while the REP target climbs one at a time, and
@@ -1691,8 +1722,15 @@ function suggestProgression(exerciseName, gymSessions, method) {
   const pctChange = prevReps > 0 ? (lastReps - prevReps) / prevReps : 0;
   const plateaued = pctChange < 0.03; // <3% up (or a drop) reads as "stalled", not progress
   if (!plateaued) return null; // still climbing session over session — nothing to flag
-  const avgReps = Math.round((lastReps + prevReps) / 2);
-  return `You've held around ${avgReps} reps for the last 2 sessions — consider increasing the difficulty (added weight, slower tempo, less rest, etc.).`;
+  // Say what was actually done, set by set - "1×30" - never the grand total across both
+  // sessions (which read as "350 reps across the last 2 sessions" and meant nothing).
+  const shape = sets => {
+    const r = sets.map(x => x.reps || 0);
+    return r.every(v => v === r[0]) ? `${r.length}×${r[0]}` : r.join("/");
+  };
+  const lastShape = shape(last.sets), prevShape = shape(prev.sets);
+  const done = lastShape === prevShape ? `${lastShape} reps both times` : `${prevShape}, then ${lastShape} reps`;
+  return `Last 2 sessions at body weight: ${done}. Time to progress — aim for more reps next time, or add weight.`;
 }
 // Alternatives for the "swap this exercise" feature — same muscle group, excluding itself,
 // sorted with custom (user-added) exercises first since those are most likely relevant.
@@ -1743,7 +1781,7 @@ function sessionExerciseSummary(session) {
     // Weight is per set. Sessions logged before that was tracked only have the exercise-level
     // value, so fall back to it. When every set used the same weight show one figure; when it
     // varied, show it per set (that variation is the useful part of the record).
-    const weights = sets.map(s => (s.weight ?? ex.weight) || null);
+    const weights = sets.map(s => setWeightOf(s, ex) || null);
     const uniq = [...new Set(weights.map(w => String(w)))];
     out.push({
       name: ex.name,
@@ -1751,7 +1789,7 @@ function sessionExerciseSummary(session) {
       perSetWeights: uniq.length > 1 ? weights : null,
       unit: ex.unit || "kg",
       reps: sets.map(s => s.reps),
-      volume: sets.reduce((a, s) => a + (parseFloat(s.weight ?? ex.weight) || 0) * (s.reps || 0), 0),
+      volume: sets.reduce((a, s) => a + (parseFloat(setWeightOf(s, ex)) || 0) * (s.reps || 0), 0),
     });
   }));
   return out;
@@ -6560,9 +6598,18 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
       // the exercise. Weight is routinely dropped across sets (or ramped up), and with a
       // single per-exercise field every set after a change silently rewrote history — the
       // saved session showed one weight for the whole exercise.
-      c.exercises=c.exercises.map(x=>x.id===exId&&loggedReps!=null
-        ? {...x, sets:[...(x.sets||[]), {reps:loggedReps, weight:x.weight||null, unit:x.unit||"kg"}]}
-        : x);
+      c.exercises=c.exercises.map(x=>{
+        if(!(x.id===exId&&loggedReps!=null)) return x;
+        const setNo=(x.sets||[]).length; // index of the set being logged
+        // Weight changes between sets are remembered: if last time went 60 -> 70 -> 80 and this set
+        // was done at last time's weight for this set number, the box moves on to last time's
+        // weight for the NEXT set. A set done at a different weight means "I'm doing it my own
+        // way today", so what was typed stays put.
+        let weight=x.weight;
+        const lp=getLastPerformance(x.name, gymSessions);
+        if(lp&&lp.mixed&&lp.setWeights.length>setNo+1&&String(parseFloat(x.weight)||"")===lp.setWeights[setNo]) weight=lp.setWeights[setNo+1];
+        return {...x, weight, sets:[...(x.sets||[]), {reps:loggedReps, weight:x.weight||null, unit:x.unit||"kg"}]};
+      });
       const combos=[...s.combos]; combos[comboIdx]=c;
       const handled = {...(s.roundHandled||{}), [exId]: loggedReps!=null ? "logged" : "skipped"};
       const next = {...s, combos, roundHandled: handled};
@@ -6816,7 +6863,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
         const names = [...new Set((session.combos||[]).flatMap(c=>(c.exercises||[]).map(e=>e.name)))].slice(0,8);
         const suggestWeight = name => {
           const last = getLastPerformance(name, gymSessions);
-          const w = parseFloat(last?.weight);
+          const w = last?.topWeight; // half the heaviest set = the working weight, not whatever was typed last
           return w>0 ? String(Math.max(2.5, Math.round(w*0.5/2.5)*2.5)) : "";
         };
         const addWarmupSet = () => {
@@ -7106,8 +7153,8 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
               {/* Weight is surfaced on completed rows so you can see what you lifted earlier in
                   the session without tapping anything. The active row is skipped — its weight
                   is already in the editable input below. */}
-              {ex.weight&&isDone&&<div style={{fontSize:11,fontFamily:"monospace",color:C.muted,marginBottom:2}}>{ex.weight}{ex.unit||"kg"}</div>}
-              {last&&!isDone&&<div style={{fontSize:11,color:C.muted}}>last: {last.weight}{ex.unit||"kg"} · {last.sets.map(s=>s.reps).join("/")} ({new Date(last.date+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"})})</div>}
+              {ex.weight&&isDone&&new Set((ex.sets||[]).map(s=>String(parseFloat(setWeightOf(s,ex))||0))).size<=1&&<div style={{fontSize:11,fontFamily:"monospace",color:C.muted,marginBottom:2}}>{ex.weight}{ex.unit||"kg"}</div>}
+              {last&&!isDone&&<div style={{fontSize:11,color:C.muted}}>last: {fmtLastPerformance(last,ex.unit)} ({new Date(last.date+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"})})</div>}
               {lib?.note&&!isDone&&<div style={{fontSize:11,color:C.yellow,fontStyle:"italic",marginTop:3}}>📌 {lib.note}</div>}
             </div>
           </div>
@@ -7174,7 +7221,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
                   const altLast=getLastPerformance(a.name,gymSessions);
                   // Writes to `ci`, the row's own combo — rows are no longer guaranteed to be in
                   // the currently-active combo now that the whole plan is on screen.
-                  updateAction(s=>{const cc={...s.combos[ci]};cc.exercises=cc.exercises.map(x=>x.id===ex.id?{...x,name:a.name,weight:altLast?String(altLast.weight):""}:x);const combos=[...s.combos];combos[ci]=cc;return{...s,combos};});
+                  updateAction(s=>{const cc={...s.combos[ci]};cc.exercises=cc.exercises.map(x=>x.id===ex.id?{...x,name:a.name,weight:altLast?altLast.startWeight:""}:x);const combos=[...s.combos];combos[ci]=cc;return{...s,combos};});
                   setSwapOpenFor(null); setSwapSearch("");
                 }}/>
             </div>);
@@ -7185,7 +7232,7 @@ function GymSessionPanel({session, setSession, gymSessions, gymSettings, latestW
           {(ex.sets||[]).length>0&&<div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:loggable?8:0,marginTop:4}}>
             {ex.sets.map((s,si)=>{
               const key=`${ex.id}:${si}`;
-              const setW=s.weight??ex.weight;
+              const setW=setWeightOf(s,ex);
               if(editingSet===key){
                 return(<div key={si} style={{width:"100%",background:C.card,border:`1px solid ${C.lime}`,borderRadius:8,padding:"9px 10px",marginBottom:4}}>
                   <div style={{fontSize:11,color:C.muted,marginBottom:6}}>Set {si+1}</div>
@@ -8012,7 +8059,8 @@ function ActivityTab({dayData,setDayData,profile,weights,setWeights,weightPhases
       id:c.id,
       exercises:(c.exercises||[]).map(ex=>{
         const last=getLastPerformance(ex.name,gymSessions);
-        return {id:ex.id,name:ex.name,type:ex.type||"weighted",weight:last?String(last.weight):"",unit:"kg",sets:[]};
+        // Opens on the weight the first set used last time (an exercise done 60/70/80 starts at 60).
+        return {id:ex.id,name:ex.name,type:ex.type||"weighted",weight:last?last.startWeight:"",unit:"kg",sets:[]};
       }),
     }));
     // Warm-up and cool-down are pre-filled with movements chosen for what THIS session trains,

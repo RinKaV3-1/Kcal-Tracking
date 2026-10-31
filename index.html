@@ -488,7 +488,7 @@ function mealTypeFromContent(text){
   return null;
 }
 // Does this text describe a meal eaten OUT (restaurant / fast-food chain / café / takeaway /
-// canteen) rather than cooked at home? Used to flip "Home cooked" → "Eating Out" automatically
+// canteen) rather than cooked at home? Used to flip "From labels" → "Eating Out" automatically
 // when the user forgot to — the eating-out analysis path reads published nutrition tables and
 // never tries to match the user's own pantry labels, both of which are wrong for a restaurant meal.
 // Word-boundary matching so "pizza" doesn't fire on "pizzazz" and short chain names stay safe.
@@ -3069,6 +3069,20 @@ async function autoClassifyProduct(name, apiKey, setProducts) {
     }));
   } catch { /* both are nice-to-haves, never worth surfacing an error for */ }
 }
+// Saves the `newProduct` a logged meal may carry (a label read off a photo or a barcode) into the
+// pantry. Auto-saving whatever the AI put there with no validation let a low-confidence or
+// generic-reference guess (e.g. a bare "Chicken Breast (cooked, boneless, skinless)" instead of an
+// actual brand read off a label) permanently contaminate the pantry - after which it competes with,
+// and sometimes wins over, the real branded product in every future match. Same bar as manually
+// saving a product label: needs a real name and either a real kcal value or some macro, or it is
+// not saved at all. Shared by logging for today (Today tab, Quick Log) and for a past day (Progress).
+function saveNewProductFromEntry(newProduct, products, setProducts, apiKey) {
+  const valid = newProduct && (newProduct.name||"").trim().length>0 && ((newProduct.kcal||0)>0 || (newProduct.p||0)>0 || (newProduct.c||0)>0 || (newProduct.f||0)>0);
+  if (!valid || !setProducts) return;
+  const isNewProduct = !(products||[]).some(x=>x.name.toLowerCase()===newProduct.name.toLowerCase());
+  setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);
+  if (isNewProduct && (!newProduct.subtitle||!(newProduct.categories||[]).length)) autoClassifyProduct(newProduct.name, apiKey, setProducts);
+}
 
 // Per-ingredient AI estimate: cheap text-only call returning per-100g macros
 async function aEstimateIngredient(name, apiKey) {
@@ -3858,7 +3872,6 @@ function EditMealInline({meal,onSave,onCancel,products,apiKey}){
   </div>);
 }
 function EditActInline({act,onSave,onCancel}){const [label,setLabel]=useState(act.label);const [kcal,setKcal]=useState(String(act.kcal));const [dist,setDist]=useState(String(act.distanceKm||""));const [dur,setDur]=useState(String(act.durationMin||""));return(<div style={{background:C.faint,borderRadius:10,padding:"12px 12px 10px"}}><div style={{display:"flex",flexDirection:"column",gap:8}}><Field label="Label" value={label} onChange={setLabel}/><div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}><Field label="Kcal burned" value={kcal} onChange={setKcal} type="number"/><Field label="Distance km" value={dist} onChange={setDist} type="number"/><Field label="Duration min" value={dur} onChange={setDur} type="number"/></div></div><div style={{display:"flex",gap:7,marginTop:10}}><button onClick={onCancel} style={{flex:1,padding:"8px 0",borderRadius:8,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer",fontSize:12}}>Cancel</button><button onClick={()=>onSave({...act,label,kcal:parseFloat(kcal)||0,distanceKm:parseFloat(dist)||null,durationMin:parseFloat(dur)||null})} style={{flex:1,padding:"8px 0",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Save</button></div></div>);}
-function AddMealManual({onAdd,onCancel}){const [form,setForm]=useState({name:"",kcal:"",protein:"",carbs:"",fat:"",notes:""});const [mealType,setMealType]=useState(mealTypeByTime());return(<div style={{background:C.faint,borderRadius:10,padding:"12px 12px 10px"}}><div style={{display:"flex",gap:4,marginBottom:8}}>{MEAL_TYPES.map(mt=>(<button key={mt.id} onClick={()=>setMealType(mt.id)} style={{flex:1,padding:"5px 2px",borderRadius:7,border:`1px solid ${mealType===mt.id?C.lime:C.border}`,background:mealType===mt.id?`${C.lime}18`:C.bg,color:mealType===mt.id?C.lime:C.muted,cursor:"pointer",fontSize:8.5,textAlign:"center",lineHeight:1.4}}><div style={{fontSize:11}}>{mt.emoji}</div><div>{mt.label}</div></button>))}</div><MacroFields form={form} setForm={setForm}/><div style={{display:"flex",gap:7,marginTop:10}}><button onClick={onCancel} style={{flex:1,padding:"8px 0",borderRadius:8,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer",fontSize:12}}>Cancel</button><button onClick={()=>{if(!form.name&&!form.kcal)return;onAdd({id:Date.now(),name:form.name||"Meal",kcal:parseFloat(form.kcal)||0,protein:parseFloat(form.protein)||0,carbs:parseFloat(form.carbs)||0,fat:parseFloat(form.fat)||0,notes:form.notes,mealType,time:"--:--"});}} style={{flex:1,padding:"8px 0",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Add</button></div></div>);}
 function AddActManual({onAdd,onCancel}){const [type,setType]=useState("run");const [label,setLabel]=useState("");const [kcal,setKcal]=useState("");const [dist,setDist]=useState("");const [dur,setDur]=useState("");return(<div style={{background:C.faint,borderRadius:10,padding:"12px 12px 10px"}}><div style={{display:"flex",gap:5,marginBottom:9}}>{[["🏋️","gym"],["🏃","run"],["🚶","walk"]].map(([ic,t])=>(<button key={t} onClick={()=>setType(t)} style={{flex:1,padding:"7px 4px",borderRadius:8,border:`1px solid ${type===t?C.lime:C.border}`,background:type===t?`${C.lime}20`:C.bg,color:type===t?C.lime:C.muted,fontWeight:type===t?700:500,cursor:"pointer",fontSize:12}}>{ic} {t}</button>))}</div><div style={{display:"flex",flexDirection:"column",gap:8}}><Field label="Label (optional)" value={label} onChange={setLabel} placeholder="auto-generated"/><div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}><Field label="Kcal burned" value={kcal} onChange={setKcal} type="number" placeholder="0"/><Field label="Distance km" value={dist} onChange={setDist} type="number"/><Field label="Duration min" value={dur} onChange={setDur} type="number"/></div></div><div style={{display:"flex",gap:7,marginTop:10}}><button onClick={onCancel} style={{flex:1,padding:"8px 0",borderRadius:8,background:C.card,border:`1px solid ${C.border}`,color:C.text,fontWeight:600,cursor:"pointer",fontSize:12}}>Cancel</button><button onClick={()=>{if(!kcal)return;onAdd({id:Date.now(),type,label:label||(type==="gym"?"Gym Session":`${type==="run"?"Run":"Walk"}${dist?` ${dist}km`:""}`),kcal:parseFloat(kcal)||0,distanceKm:parseFloat(dist)||null,durationMin:parseFloat(dur)||null,time:"--:--"});}} style={{flex:1,padding:"8px 0",borderRadius:8,background:C.lime,border:"none",color:"#000",fontWeight:700,cursor:"pointer",fontSize:12}}>Add</button></div></div>);}
 
 function EditPrepSheet({prep,onSave,onClose}){
@@ -4904,12 +4917,13 @@ function PrepEatPanel({activePreps,setMealPreps,mealType,onAdd,onClose,products,
   </div>);
 }
 
-function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onAddKeepOpen,onClose,apiKey,initialMode,aiPrefs,mealFavorites,setMealFavorites}){
+function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onAddKeepOpen,onClose,apiKey,initialMode,aiPrefs,mealFavorites,setMealFavorites,dateLabel}){
   const mealAnalysisOn = aiPrefs?.mealAnalysis ?? true;
-  // "quick" (Recent + Favourites) is the default landing screen for an unspecified open — the
-  // advanced tools (Photos/Barcode/Labels/Manual/Prep) are one tap away rather than the first
-  // thing shown, since most days the thing being logged was already logged recently.
-  const initial = initialMode || "quick";
+  // Photo / Barcode is the default landing screen - it is what most logging starts with. Recent and
+  // Favourites ("quick") used to pop up first and had to be dismissed every time; they are now one
+  // tap away on the "⭐ Recent" tab instead of being the first thing shown.
+  // `dateLabel` is set when logging into a PAST day (Progress tab), so the sheet says which day.
+  const initial = initialMode || "photos";
   const [mode,setMode]=useState(initial);const [mt,setMt]=useState("home");const [desc,setDesc]=useState("");const [imgs,setImgs]=useState([]);const [result,setResult]=useState(null);const [loading,setLoading]=useState(false);const [err,setErr]=useState(null);const [form,setForm]=useState({name:"",kcal:"",protein:"",carbs:"",fat:"",notes:""});const [mealType,setMealType]=useState(mealTypeByTime());const [mealTypeTouched,setMealTypeTouched]=useState(false);const [gramsEaten,setGramsEaten]=useState("");const [per100,setPer100]=useState(null);const [aiNotes,setAiNotes]=useState("");
   // Recent — derived from the last 14 days of logs (loaded once on mount), grouped by
   // normalized meal name to the most recent occurrence. Not persisted state: it's a read of
@@ -4966,7 +4980,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onAddKeepOpen,onClo
   const [ingConfirmed,setIngConfirmed]=useState(false); // when true, ingredients exist but user has moved past panel
   const analyze=async()=>{setLoading(true);setErr(null);setIngConfirmed(false);try{
     const res=await aFood(imgs,products,mt,desc,apiKey);
-    // The user can forget to flip Home cooked → Eating Out. The description keyword check has
+    // The user can forget to flip From labels → Eating Out. The description keyword check has
     // already covered typed text; this covers photos (branded packaging, a menu screenshot):
     // the model reports `eatingOut`, and unless the user picked a source themselves we follow it.
     const aiSaysEatingOut=res.eatingOut===true&&mt!=="canteen"&&!mtTouched;
@@ -5051,7 +5065,7 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onAddKeepOpen,onClo
   // → log flow (same component the global Quick Log FAB uses) that either logs directly or is
   // backed out of, never a multi-step form living inside this one's own mode machinery.
   const [showBarcode,setShowBarcode]=useState(false);
-  // Home cooked ↔ Eating Out follows the description automatically until the user picks a side
+  // From labels ↔ Eating Out follows the description automatically until the user picks a side
   // themselves (mtTouched) — so "Hesburger tortillas and fries" flips to Eating Out without the
   // toggle having to be remembered, and an explicit tap on either button is never overridden.
   const [mtTouched,setMtTouched]=useState(false);
@@ -5060,19 +5074,19 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onAddKeepOpen,onClo
     if(mtTouched||mt==="canteen")return;
     if(looksLikeEatingOut(desc)){setMt("canteen");setAutoEatingOut(true);}
   },[desc,mtTouched,mt]);
-  return(<Sheet onClose={onClose} title="Log Meal">
+  return(<Sheet onClose={onClose} title={dateLabel?`Log Meal · ${dateLabel}`:"Log Meal"}>
     {/* One tab for anything you point a camera at: a photo of the meal, or a package's barcode
         (scan button inside). They used to be two separate tabs — and two separate Quick Log
-        entries — for what is, from the user's side, the same act of "log this by camera". */}
-    <div style={{display:"flex",gap:5,marginBottom:10,flexWrap:"wrap"}}>{[["📸 Photo / Barcode","photos"],["🏷️ Labels","labels"],["✏️ Manual","manual"],["🍱 Prep","mealprep"]].map(([lbl,m])=>(
-      <button key={m} onClick={()=>{setMode(m);setResult(null);}}
+        entries — for what is, from the user's side, the same act of "log this by camera".
+        "⭐ Recent" opens the Recent + Favourites quick-pick (no longer the first screen). */}
+    <div style={{display:"flex",gap:5,marginBottom:10,flexWrap:"wrap"}}>{[["📸 Photo / Barcode","photos"],["🏷️ Labels","labels"],["✏️ Manual","manual"],["🍱 Prep","mealprep"],["⭐ Recent","quick"]].map(([lbl,m])=>(
+      <button key={m} onClick={()=>{setMode(m);setResult(null);}} aria-label={m==="quick"?"Recent and favourites":undefined}
         style={{flex:m==="photos"?2:1,minWidth:60,padding:"8px 4px",borderRadius:10,border:`1px solid ${mode===m?C.lime:C.border}`,background:mode===m?`${C.lime}20`:C.card,color:mode===m?C.lime:C.muted,fontWeight:mode===m?700:500,cursor:"pointer",fontSize:11}}>{lbl}</button>
     ))}</div>
-    {mode!=="quick"&&<button onClick={()=>setMode("quick")} style={{background:"none",border:"none",color:C.muted,fontSize:T.sm,textDecoration:"underline",cursor:"pointer",padding:0,marginBottom:12}}>← Recent &amp; Favourites</button>}
     {showBarcode&&<BarcodeScanSheet onAdd={onAdd} onAddKeepOpen={onAddKeepOpen||onAdd} onClose={()=>setShowBarcode(false)} onFinish={onClose} onPickLabels={()=>{setShowBarcode(false);setMode("labels");setResult(null);}} apiKey={apiKey}/>}
-    {/* ── Quick pick: Recent + Favourites ── the landing screen for a bare "Log meal" open.
-        Frequently-eaten items are one tap to log again instead of re-running Photos/Labels for
-        the same chicken-and-rice bowl for the third time this week. */}
+    {/* ── Quick pick: Recent + Favourites ── opened from the "⭐ Recent" tab. Frequently-eaten items
+        are one tap to log again instead of re-running Photos/Labels for the same chicken-and-rice
+        bowl for the third time this week. */}
     {mode==="quick"&&(<div style={{marginBottom:14}}>
       <div style={{...eyebrow(),marginBottom:8}}>Favourites</div>
       {(mealFavorites||[]).length===0
@@ -5169,8 +5183,8 @@ function AddMealSheet({products,mealPreps,setMealPreps,onAdd,onAddKeepOpen,onClo
       </div>
     )}
     {mode==="photos"&&mealAnalysisOn&&!result&&(<>
-      <div style={{display:"flex",gap:6,marginBottom:autoEatingOut?6:10}}>{[["Home cooked","home"],["Eating Out","canteen"]].map(([lbl,t])=>(<button key={t} onClick={()=>{setMt(t);setMtTouched(true);setAutoEatingOut(false);}} style={{flex:1,padding:"8px 6px",borderRadius:8,border:`1px solid ${mt===t?C.lime:C.border}`,background:mt===t?`${C.lime}12`:C.bg,color:mt===t?C.lime:C.muted,fontWeight:mt===t?600:400,cursor:"pointer",fontSize:11}}>{lbl}</button>))}</div>
-      {autoEatingOut&&<div style={{fontSize:T.label,color:C.muted,marginBottom:10,lineHeight:1.4}}>🍴 Switched to Eating Out automatically — this reads like a restaurant meal. Tap "Home cooked" to change it back.</div>}
+      <div style={{display:"flex",gap:6,marginBottom:autoEatingOut?6:10}}>{[["From labels","home"],["Eating Out","canteen"]].map(([lbl,t])=>(<button key={t} onClick={()=>{setMt(t);setMtTouched(true);setAutoEatingOut(false);}} style={{flex:1,padding:"8px 6px",borderRadius:8,border:`1px solid ${mt===t?C.lime:C.border}`,background:mt===t?`${C.lime}12`:C.bg,color:mt===t?C.lime:C.muted,fontWeight:mt===t?600:400,cursor:"pointer",fontSize:11}}>{lbl}</button>))}</div>
+      {autoEatingOut&&<div style={{fontSize:T.label,color:C.muted,marginBottom:10,lineHeight:1.4}}>🍴 Switched to Eating Out automatically — this reads like a restaurant meal. Tap "From labels" to change it back.</div>}
       <div style={{marginBottom:10}}>
         <div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>{mt==="canteen"?"Describe the meal (or attach a photo)":"Meal name / description (or attach a photo)"}</div>
         <textarea value={desc} onChange={e=>setDesc(e.target.value)} rows={2} placeholder={mt==="canteen"?"e.g. Hesburger chicken tortilla and fries — attach a screenshot of the venue's nutrition page for exact numbers":"e.g. Overnight oats with banana and peanut butter"} style={{width:"100%",boxSizing:"border-box",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 11px",color:C.text,fontSize:T.body,outline:"none",resize:"none",fontFamily:"inherit"}}/>
@@ -6000,18 +6014,8 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
   const addEntry=entry=>{
     if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode,customDeficit:profile.customDeficit}));}
     else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode,customDeficit:profile.customDeficit}));
-      // Auto-saving whatever the AI put in `newProduct` with no validation let a low-confidence
-      // or generic-reference guess (e.g. a bare "Chicken Breast (cooked, boneless, skinless)"
-      // instead of an actual brand read off a label) permanently contaminate the pantry — after
-      // which it competes with, and sometimes wins over, the real branded product in every
-      // future match. Same bar as manually saving a product label: needs a real name and either
-      // a real kcal value or some macro, or it's not saved at all.
-      const npValid = newProduct && (newProduct.name||"").trim().length>0 && ((newProduct.kcal||0)>0 || (newProduct.p||0)>0 || (newProduct.c||0)>0 || (newProduct.f||0)>0);
-      if(npValid){
-        const isNewProduct=!products.some(x=>x.name.toLowerCase()===newProduct.name.toLowerCase());
-        setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);
-        if(isNewProduct&&(!newProduct.subtitle||!(newProduct.categories||[]).length))autoClassifyProduct(newProduct.name,profile.apiKey,setProducts);
-      }}
+      // Validated before it reaches the pantry - see saveNewProductFromEntry.
+      saveNewProductFromEntry(newProduct,products,setProducts,profile.apiKey);}
   };
   const handleAdd=entry=>{addEntry(entry);setModal(null);};
   const updateMeal=updated=>{setDayData(p=>({...p,meals:p.meals.map(m=>m.id===updated.id?updated:m)}));setEditingMealId(null);};
@@ -6211,7 +6215,7 @@ function TodayTab({dayData,setDayData,mealPreps,setMealPreps,products,setProduct
         from every tab, not just Today) — this sheet mount stays for the empty-state "+ Log your
         first meal" and the active-prep "+ Eat" buttons above, which still need their own route
         into AddMealSheet. */}
-    {(modal==="meal"||modal==="mealprep")&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleAdd} onAddKeepOpen={addEntry} onClose={()=>setModal(null)} apiKey={profile.apiKey} aiPrefs={profile.aiPrefs} initialMode={modal==="mealprep"?"mealprep":"quick"} mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
+    {(modal==="meal"||modal==="mealprep")&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleAdd} onAddKeepOpen={addEntry} onClose={()=>setModal(null)} apiKey={profile.apiKey} aiPrefs={profile.aiPrefs} initialMode={modal==="mealprep"?"mealprep":"photos"} mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
     {showXp&&progress?.xp&&<XpDetailSheet xp={progress.xp} profile={profile} setProfile={setProfile} onClose={()=>setShowXp(false)}/>}
     {levelUp&&<LevelUpToast info={levelUp} xp={progress?.xp} onClose={()=>setLevelUp(null)}/>}
     <UndoToast pending={mealUndo.pending} onUndo={mealUndo.undo}/>
@@ -9407,7 +9411,7 @@ function ProgressCard({progress}){
     </div>
   </div>);
 }
-function HistoryTab({weights,setWeights,weightPhases,setWeightPhases,products,profile,medications,medLog,progress,onLogMed,onUnlogMed}){
+function HistoryTab({weights,setWeights,weightPhases,setWeightPhases,products,setProducts,profile,medications,medLog,progress,onLogMed,onUnlogMed,onDayChanged,mealPreps,setMealPreps,mealFavorites,setMealFavorites}){
   // Overview | Trends | Days | Achievements — History used to do two unrelated jobs at once
   // (gamification progress AND a chronological day archive) with no way to just see "am I
   // actually progressing". This segments them: the day-by-day list is now one view among four
@@ -9431,12 +9435,29 @@ function HistoryTab({weights,setWeights,weightPhases,setWeightPhases,products,pr
     setVisibleCount(next);
   };
   const createDay=async(date)=>{if(!date||logs[date])return;const newLog={date,dayType:"rest",meals:[],activities:[],burnedExtra:0,tags:[]};await store.set(`fit_day_${date}`,newLog);await addToIndex(date);setLogs(p=>({...p,[date]:newLog}));setDates(p=>[date,...p.filter(d=>d!==date)].sort((a,b)=>b.localeCompare(a)));setExpanded(date);setNewDayPicker(false);setNewDayDate("");};
-  const updateLog=async(date,data)=>{await store.set(`fit_day_${date}`,data);setLogs(p=>({...p,[date]:data}));};
+  // Every edit to a past day is also reported to App: streaks and XP are computed there from its own
+  // copy of the recent logs, which used to stay frozen at the pre-edit version - so fixing a day you
+  // had forgotten meals on never turned it into an on-target day until the app was reloaded.
+  const updateLog=async(date,data)=>{await store.set(`fit_day_${date}`,data);setLogs(p=>({...p,[date]:data}));if(onDayChanged)onDayChanged(date,data);};
   const updateMeal=(date,meal)=>{const log=logs[date];updateLog(date,{...log,meals:log.meals.map(m=>m.id===meal.id?meal:m)});setEditMeal(null);};
   const deleteMeal=(date,id)=>{const log=logs[date];updateLog(date,{...log,meals:log.meals.filter(m=>m.id!==id)});};
   const updateAct=(date,act)=>{const log=logs[date];updateLog(date,{...log,activities:(log.activities||[]).map(a=>a.id===act.id?act:a)});setEditAct(null);};
   const deleteAct=(date,id)=>{const log=logs[date];updateLog(date,{...log,activities:(log.activities||[]).filter(a=>a.id!==id)});};
-  const addMeal=(date,meal)=>{const log=logs[date];updateLog(date,{...log,meals:[...log.meals,meal]});setAddMealDate(null);};
+  // Logging into a PAST day uses the same sheet as today (photo / barcode / labels / manual / prep /
+  // recents), so a forgotten meal can be added the way it would have been at the time. Entries are
+  // written to that day's log, not today's. They go through a functional update on the latest log so
+  // several barcode scans in a row (the sheet stays open) all land instead of overwriting each other.
+  const logsRef=useRef(logs);logsRef.current=logs;
+  const addEntryToDay=(date,entry)=>{
+    const log=logsRef.current[date];if(!log)return;
+    const commit=next=>{logsRef.current={...logsRef.current,[date]:next};setLogs(logsRef.current);store.set(`fit_day_${date}`,next);if(onDayChanged)onDayChanged(date,next);};
+    if(entry.type==="activity_from_meal"){commit({...log,burnedExtra:(log.burnedExtra||0)+(entry.burnedKcal||0)});return;}
+    const{newProduct,...meal}=entry;
+    // Entry times describe when it was logged, which for a past day is meaningless - same placeholder
+    // the manual form already uses.
+    commit({...log,meals:[...(log.meals||[]),{...meal,time:"--:--"}]});
+    saveNewProductFromEntry(newProduct,products,setProducts,profile?.apiKey);
+  };
   const addAct=(date,act)=>{const log=logs[date];updateLog(date,{...log,activities:[...(log.activities||[]),act]});setAddActDate(null);};
   const toggleTag=(date,tagId)=>{const log=logs[date];const tags=log.tags||[];updateLog(date,{...log,tags:tags.includes(tagId)?tags.filter(t=>t!==tagId):[...tags,tagId]});};
   // 7-day and 30-day adherence, computed once here and reused by both Overview and Trends so
@@ -9630,7 +9651,7 @@ function HistoryTab({weights,setWeights,weightPhases,setWeightPhases,products,pr
               {(log.dailySteps||0)>0&&(()=>{const adj=stepsKcal(log.dailySteps,profile?.activityLevel||"sedentary",wForDay);return <span style={{fontSize:10,color:adj>0?C.orange:C.muted,fontFamily:"monospace",marginLeft:"auto"}}>{adj===0?"on baseline":`${adj>0?"+":"−"}${Math.abs(adj)}kcal`}</span>;})()}
             </div>
             <div style={{marginBottom:10}}><div style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:6}}>Tags</div><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{DAY_TAGS.map(tag=>{const active=(log.tags||[]).includes(tag.id);return(<button key={tag.id} onClick={()=>toggleTag(date,tag.id)} style={{padding:"5px 10px",borderRadius:20,border:`1px solid ${active?C.lime:C.border}`,background:active?`${C.lime}18`:C.bg,color:active?C.lime:C.muted,cursor:"pointer",fontSize:11}}>{tag.emoji} {tag.label}</button>);})}</div></div>
-            <div style={{marginBottom:10}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}><span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Meals ({log.meals?.length||0})</span><button onClick={()=>setAddMealDate(addMealDate===date?null:date)} style={{fontSize:11,color:C.lime,background:"none",border:`1px solid ${C.lime}`,borderRadius:6,padding:"3px 10px",cursor:"pointer",fontWeight:600}}>+ Add</button></div>{addMealDate===date&&<div style={{marginBottom:8}}><AddMealManual onAdd={meal=>addMeal(date,meal)} onCancel={()=>setAddMealDate(null)}/></div>}<div style={{display:"flex",flexDirection:"column",gap:6}}>{log.meals?.map(m=>{
+            <div style={{marginBottom:10}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}><span style={{fontSize:11,color:C.muted,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.08em"}}>Meals ({log.meals?.length||0})</span><button onClick={()=>setAddMealDate(addMealDate===date?null:date)} style={{fontSize:11,color:C.lime,background:"none",border:`1px solid ${C.lime}`,borderRadius:6,padding:"3px 10px",cursor:"pointer",fontWeight:600}}>+ Add</button></div>{addMealDate===date&&<AddMealSheet products={products} mealPreps={mealPreps||[]} setMealPreps={setMealPreps||(()=>{})} onAdd={entry=>{addEntryToDay(date,entry);setAddMealDate(null);}} onAddKeepOpen={entry=>addEntryToDay(date,entry)} onClose={()=>setAddMealDate(null)} apiKey={profile?.apiKey} aiPrefs={profile?.aiPrefs} initialMode="photos" mealFavorites={mealFavorites} setMealFavorites={setMealFavorites} dateLabel={new Date(date+"T12:00:00").toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}/>}<div style={{display:"flex",flexDirection:"column",gap:6}}>{log.meals?.map(m=>{
               const mtEmoji=["🌅","☀️","🌙","🍎","🥤"][["breakfast","lunch","dinner","snack","drink"].indexOf(m.mealType)]||"";
               return(<div key={m.id}>{editMeal?.date===date&&editMeal?.id===m.id?<EditMealInline meal={m} onSave={meal=>updateMeal(date,meal)} onCancel={()=>setEditMeal(null)} products={products} apiKey={profile?.apiKey}/>:<div style={{background:C.bg,borderRadius:10,padding:"9px 12px"}}><div style={{display:"flex",alignItems:"center",gap:8}}><div style={{flex:1,minWidth:0}}><div style={{display:"flex",alignItems:"baseline",gap:6,marginBottom:3,flexWrap:"wrap"}}><span style={{fontSize:T.body,fontWeight:600,color:C.text,wordBreak:"break-word"}}>{mtEmoji} {m.name}</span><span style={{fontSize:10,color:C.muted,fontFamily:"monospace",flexShrink:0}}>{m.time}</span></div><div style={{display:"flex",gap:8}}><Chip val={m.kcal} label="k" color={C.lime}/><Chip val={m.protein} label="P" color={C.blue}/><Chip val={m.carbs} label="C" color={C.orange}/><Chip val={m.fat} label="F" color={C.purple}/></div></div><button onClick={()=>setEditMeal({date,id:m.id})} style={{background:"none",border:`1px solid ${C.border}`,color:C.muted,fontSize:12,cursor:"pointer",padding:"4px 7px",borderRadius:6,lineHeight:1}}>✎</button><button onClick={()=>deleteMeal(date,m.id)} style={{background:"none",border:"none",color:C.faint,fontSize:16,cursor:"pointer",padding:"0 2px",lineHeight:1}}>×</button></div>{m.notes&&<div style={{fontSize:10,color:C.muted,marginTop:5,lineHeight:1.4,wordBreak:"break-word"}}>📋 {m.notes}</div>}</div>}</div>);
             })}{!log.meals?.length&&<div style={{fontSize:12,color:C.muted,padding:"4px 0"}}>No meals.</div>}</div></div>
@@ -10933,18 +10954,22 @@ function App(){
   const addEntryQuick=entry=>{
     if(entry.type==="activity_from_meal"){setDayData(p=>({...p,burnedExtra:(p.burnedExtra||0)+entry.burnedKcal,goalMode:profile.goal,goalSubmode:profile.goalSubmode,customDeficit:profile.customDeficit}));}
     else{const{newProduct,...meal}=entry;setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode,customDeficit:profile.customDeficit}));
-      const npValid=newProduct&&(newProduct.name||"").trim().length>0&&((newProduct.kcal||0)>0||(newProduct.p||0)>0||(newProduct.c||0)>0||(newProduct.f||0)>0);
-      if(npValid){
-        const isNewProduct=!products.some(x=>x.name.toLowerCase()===newProduct.name.toLowerCase());
-        setProducts(p=>p.find(x=>x.name.toLowerCase()===newProduct.name.toLowerCase())?p:[...p,{...newProduct,addedAt:newProduct.addedAt||Date.now()}]);
-        if(isNewProduct&&(!newProduct.subtitle||!(newProduct.categories||[]).length))autoClassifyProduct(newProduct.name,profile.apiKey,setProducts);
-      }}
+      saveNewProductFromEntry(newProduct,products,setProducts,profile.apiKey);}
   };
   const handleQuickMealAdd=entry=>{addEntryQuick(entry);setQuickAction(null);};
   const quickDueMeds=dueMedReminders(medications,medLog);
   // Today's log lives in `dayData`; mirroring it into the streak window means logging a meal
   // updates the streak immediately instead of only after a reload.
   useEffect(()=>{ if(dayData) setRecentLogs(p=>p[today]===dayData?p:{...p,[today]:dayData}); },[dayData,today]);
+  // The Progress tab edits PAST days straight in storage. Without telling the streak window about
+  // it, a day corrected after the fact (forgotten meals added, a wrong entry fixed) kept its old
+  // verdict: it stayed "off target" and the on-target streak and XP never moved until a reload.
+  // An edit to today's own entry also refreshes the Today tab's copy, so the next log there can't
+  // write the pre-edit version back over it.
+  const onHistoryDayChanged=useCallback((date,log)=>{
+    setRecentLogs(p=>({...p,[date]:log}));
+    if(date===today) setDayData(log);
+  },[today,setDayData]);
   const progress = useMemo(()=>computeProgress({
     logs:recentLogs, today, profile, weights, gymSessions, medications, medLog, gymSchedule,
   }),[recentLogs,today,profile,weights,gymSessions,medications,medLog,gymSchedule]);
@@ -11002,7 +11027,7 @@ function App(){
       {viewTab==="today"&&<TodayTab dayData={dayData} setDayData={setDayData} mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} setProfile={setProfile} latestWeight={latestWeight} weights={weights} setWeights={setWeights} onGoToSettings={()=>setTab("more")} medications={medications} medLog={medLog} onMarkMed={markMedOccurrence} progress={progress} gymSessions={gymSessions} gymDayAssign={gymDayAssign} mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
       {viewTab==="food"&&<FoodTab mealPreps={mealPreps} setMealPreps={setMealPreps} products={products} setProducts={setProducts} profile={profile} weights={weights} weightPhases={weightPhases||[]} recipes={recipes} setRecipes={setRecipes} onLogMeal={meal=>setDayData(p=>({...p,meals:[...p.meals,meal],goalMode:profile.goal,goalSubmode:profile.goalSubmode,customDeficit:profile.customDeficit}))} gymSessions={gymSessions}/>}
       {viewTab==="training"&&<ActivityTab dayData={dayData} setDayData={setDayData} profile={profile} weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} gymSchedule={gymSchedule} setGymSchedule={setGymSchedule} gymTemplates={gymTemplates} setGymTemplates={setGymTemplates} gymDayAssign={gymDayAssign} setGymDayAssign={setGymDayAssign} gymSessions={gymSessions} setGymSessions={setGymSessions} gymSettings={gymSettings} setGymSettings={setGymSettings} gymActiveSession={gymActiveSession} setGymActiveSession={setGymActiveSession} gymExerciseLibrary={gymExerciseLibrary} setGymExerciseLibrary={setGymExerciseLibrary} onFinishSession={finishGymSession}/>}
-      {viewTab==="progress"&&<HistoryTab weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} products={products} profile={profile} medications={medications} medLog={medLog} progress={progress} onLogMed={logMedFor} onUnlogMed={unlogMed}/>}
+      {viewTab==="progress"&&<HistoryTab weights={weights} setWeights={setWeights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} products={products} setProducts={setProducts} profile={profile} medications={medications} medLog={medLog} progress={progress} onLogMed={logMedFor} onUnlogMed={unlogMed} onDayChanged={onHistoryDayChanged} mealPreps={mealPreps} setMealPreps={setMealPreps} mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
       {viewTab==="more"&&<SettingsTab profile={profile} setProfile={setProfile} weights={weights} weightPhases={weightPhases||[]} setWeightPhases={setWeightPhases} latestWeight={latestWeight} medications={medications} setMedications={setMedications} dayTypes={dayTypes} setDayTypes={setDayTypes} onGoToProgress={()=>setTab("progress")}/>}
     </div>
 
@@ -11014,7 +11039,7 @@ function App(){
       <span aria-hidden="true" style={{marginTop:-2,fontWeight:400}}>+</span>
     </button>}
     {quickAction==="picker"&&<QuickLogPicker dueCount={quickDueMeds.length} onClose={()=>setQuickAction(null)} onPick={id=>setQuickAction(id)}/>}
-    {quickAction==="meal"&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleQuickMealAdd} onAddKeepOpen={addEntryQuick} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey} aiPrefs={profile.aiPrefs} initialMode="quick" mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
+    {quickAction==="meal"&&<AddMealSheet products={products} mealPreps={mealPreps} setMealPreps={setMealPreps} onAdd={handleQuickMealAdd} onAddKeepOpen={addEntryQuick} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey} aiPrefs={profile.aiPrefs} initialMode="photos" mealFavorites={mealFavorites} setMealFavorites={setMealFavorites}/>}
     {quickAction==="weight"&&<QuickWeightSheet weights={weights} setWeights={setWeights} onClose={()=>setQuickAction(null)}/>}
     {quickAction==="activity"&&<AddActSheet onAdd={act=>{setDayData(p=>({...p,activities:[...(p.activities||[]),act]}));setQuickAction(null);}} onClose={()=>setQuickAction(null)} apiKey={profile.apiKey} weightKg={latestWeight}/>}
     {quickAction==="steps"&&<QuickStepsSheet dayData={dayData} setDayData={setDayData} onClose={()=>setQuickAction(null)}/>}
